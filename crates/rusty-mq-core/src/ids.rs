@@ -68,9 +68,9 @@ simple_id!(ExchangeId, "ex:");
 simple_id!(QueueId, "q:");
 simple_id!(ChannelGeneration, "chgen:");
 
-#[cfg(test)]
 impl QueueId {
-    /// Deterministic construction for cross-module unit tests only.
+    /// Deterministic construction for white-box tests (also used from
+    /// integration tests in other crates; not used by broker logic).
     pub fn for_test(v: u64) -> Self {
         Self(v)
     }

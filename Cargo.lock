@@ -1406,6 +1406,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "amq-protocol 7.2.3",
  "clap",
+ "futures-lite",
  "lapin",
  "rusty-mq-core",
  "rusty-mq-protocol",

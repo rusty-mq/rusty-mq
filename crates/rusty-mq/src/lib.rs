@@ -3,6 +3,7 @@
 
 pub mod broker;
 pub mod connection;
+pub mod consumers;
 pub mod server;
 
 pub use broker::Broker;

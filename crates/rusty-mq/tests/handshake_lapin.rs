@@ -40,11 +40,15 @@ async fn lapin_handshake_channel_lifecycle_and_close() {
     let ch1 = conn.create_channel().await.expect("channel 1 opens");
     let ch2 = conn.create_channel().await.expect("channel 2 opens");
 
-    // Strict profile: methods not yet implemented close the channel with
-    // 540 NOT_IMPLEMENTED — lapin surfaces this as an error.
+    // basic.qos is implemented (M3): it must succeed now.
     ch2.basic_qos(1, BasicQosOptions::default())
         .await
-        .expect_err("basic.qos must be rejected with 540 until M3");
+        .expect("basic.qos succeeds");
+
+    // Strict profile: deferred methods still close the channel with 540
+    // NOT_IMPLEMENTED (tx.* per the feature matrix) — lapin surfaces this
+    // as an error.
+    ch2.tx_select().await.expect_err("tx.select must be 540");
 
     // ch1 must be unaffected by ch2's channel-scoped error.
     ch1.close(200, "bye".into())

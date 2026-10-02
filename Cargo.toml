@@ -52,6 +52,7 @@ proptest = "1"
 lapin = { version = "4", default-features = false, features = ["tokio"] } # no TLS stack for tests
 tokio-test = "0.4"
 tempfile = "3"
+futures-lite = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid" # PRD §15.2: no unsafe in original protocol/core/storage logic

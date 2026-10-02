@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 lapin = { workspace = true }
 amq-protocol = { workspace = true }
 tokio-test = { workspace = true }
+futures-lite = { workspace = true }
 
 [lints]
 workspace = true

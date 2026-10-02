@@ -16,7 +16,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M0 — contracts | complete (partial evidence) | Workspace, ledger, baseline fixtures, ADRs exist; baseline digest pinning is a standing TODO for the first CI runner with Docker |
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
-| M3 — delivery state | not_started | |
+| M3 — delivery state | in_progress | basic.consume/cancel with push deliveries (round-robin, prefetch credit, no_ack), auto-delete after last consumer, consumer-cancel notify on delete, requeue on connection loss — all lapin-verified. Remaining M3: basic.reject/nack, basic.recover, exclusive-queue edge tests |
 | M4 — durable authority | not_started | Storage crate scaffold only |
 | M5 — confirms and failure safety | not_started | |
 | M6 — storage lifecycle | not_started | |
@@ -82,9 +82,16 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-PUB03 | complete (partial evidence) | nonexistent exchange → 404 at publish | exchange gate in publish handler | |
 | FR-PUB04 | complete (partial evidence) | immediate=true → 540 | gate in publish handler | |
 | FR-C02 | complete (partial evidence) | basic.get with get-ok/get-empty | all get-based tests | |
-| FR-C04 | in_progress | channel-scoped monotonic tags (get path) | manual-ack test | confirm numbering separate (M5) |
-| FR-C05 | in_progress | basic.ack single+multiple implemented | `manual_ack_settles_and_requeues_on_channel_close` | reject/nack land in M3 |
-| FR-C06 | in_progress | requeue on channel close with redelivered hint | same test | connection-loss requeue via teardown path |
+| FR-C01 | complete (partial evidence) | consume/cancel/consume-ok/cancel-ok, server tags, exclusive consumers | `consume_lapin.rs`: push flow, `exclusive_consumer_conflict_is_403`, cancel in push test | |
+| FR-C02 | complete (partial evidence) | basic.get with get-ok/get-empty | all get-based tests | |
+| FR-C03 | complete (partial evidence) | manual-ack + no_ack modes (get and consume) | push + no_ack tests | |
+| FR-C04 | complete (partial evidence) | channel-scoped monotonic tags across get+deliver | push test (distinct tags) | confirm numbering separate (M5) |
+| FR-C05 | in_progress | basic.ack single+multiple implemented | manual-ack + push tests | reject/nack next slice |
+| FR-C06 | complete (partial evidence) | requeue on channel close AND connection loss, redelivered hint | `unacked_redelivers_to_new_consumer_after_connection_loss` | |
+| FR-C07 | complete (partial evidence) | per-consumer prefetch (global=false) + shared channel limit (global=true) | `push_delivery_with_prefetch_and_ack_flow`; registry unit tests incl. shared-limit gating | prefetch_size unrepresentable by codec 7.x (finding) |
+| FR-C09 | complete (partial evidence) | round-robin fair scheduling | `round_robin_across_two_consumers`; registry unit test | |
+| FR-Q05 | complete (partial evidence) | auto-delete after last consumer only if it had one | `auto_delete_queue_dies_after_last_consumer` | |
+| FR-Q09 | complete (partial evidence) | cancel-notify on queue delete, capability-gated | `queue_delete_cancels_consumers` (lapin declares the capability) | not yet advertised in server capabilities |
 
 ### Security (§11), management (§12), CLI/config (§13)
 
@@ -101,10 +108,18 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T05 | in_progress | `topology_lapin.rs`: equivalence, passive, generated names, exclusivity, reclaim |
 | T06 | in_progress | `publish_route_get_roundtrip_with_properties`: bit-identical bodies, typed headers/props |
 | T12 | in_progress | `mandatory_return_frame_level`: return-before-any-success, 312 NO_ROUTE |
-| T07–T11, T13–T30 | not_started | |
+| T07 | in_progress | `consume_lapin.rs`: consume/cancel/no_ack/exclusive-consumer flows |
+| T08/T09 | in_progress | ack paths incl. multiple; prefetch gating (`push_delivery_with_prefetch_and_ack_flow`) |
+| T11 | in_progress | `unacked_redelivers_to_new_consumer_after_connection_loss` (connection-loss requeue) |
+| T10, T13–T30 | not_started | |
 
 ## Client-library findings (evidence-backed)
 
+- **amq-protocol 7.x does not model `basic.qos`'s `prefetch_size` field**:
+  the generated struct only carries `prefetch_count`/`global`, so a nonzero
+  prefetch_size cannot be detected and rejected (FR §6.2 rule 5) at the
+  method layer. Wire bytes still parse consistently; revisit during the
+  codec-version convergence task.
 - **lapin `basic_publish` resolves on write, not on broker outcome**: without
   confirm mode the returned future completes when frames are written, so
   server-side publish rejections (404 exchange, 503 delivery-mode, 540

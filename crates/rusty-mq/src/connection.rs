@@ -31,6 +31,7 @@ use rusty_mq_protocol::{
 };
 
 use crate::broker::Broker;
+use crate::consumers::{Consumer, Job};
 
 /// Bounded outbound queue per connection (frames waiting for the writer).
 const OUTBOUND_CAP: usize = 256;
@@ -39,6 +40,9 @@ const READ_CHUNK: usize = 16 * 1024;
 /// How long to wait for the client's `connection.close-ok` after the server
 /// sent `connection.close`.
 const CLOSE_LINGER: Duration = Duration::from_secs(5);
+/// Bounded consumer-delivery mailbox per connection (ADR-0004; a full
+/// mailbox requeues entries and stops scheduling to that consumer).
+const CONSUMER_MAILBOX_CAP: usize = 256;
 
 /// Handshake phase of the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +73,11 @@ struct ChannelState {
     next_delivery_tag: u64,
     /// Outstanding manual-ack deliveries: tag -> held entry.
     unacked: HashMap<u64, UnackedDelivery>,
+    /// Consumer tags active on this channel (registry mirror).
+    consumers: std::collections::HashSet<String>,
+    /// Prefetch applied to consumers created after a basic.qos(global=false)
+    /// (§6.2 rule 2). None = unlimited.
+    prefetch_new_consumers: Option<u16>,
 }
 
 /// A basic.publish whose content frames are still arriving.
@@ -85,6 +94,9 @@ struct InFlightPublish {
 struct UnackedDelivery {
     queue: QueueId,
     entry: QueueEntry,
+    /// Set when the delivery came from a consumer (credit release on
+    /// settlement).
+    consumer_tag: Option<String>,
 }
 
 /// Owns one accepted connection until it ends.
@@ -97,6 +109,11 @@ pub struct Connection {
     /// these channels are ignored (close-handshake interlude; content may
     /// still be in flight from the client).
     awaiting_close_ok: HashMap<u16, ()>,
+    /// Sender side of this connection's consumer mailbox (registry holds
+    /// clones for dispatch).
+    mailbox_tx: mpsc::Sender<Job>,
+    /// Client declared the consumer_cancel_notify capability (§4.3).
+    client_cancel_notify: bool,
     limits: ProtocolLimits,
     negotiated: Option<NegotiatedLimits>,
     phase: Phase,
@@ -113,6 +130,8 @@ impl Connection {
             .unwrap_or_else(|_| "unknown".into());
         let conn_id = broker.next_connection_id();
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
+        // Consumer mailbox: bounded push-delivery queue (ADR-0004).
+        let (mailbox_tx, mailbox_rx) = mpsc::channel::<Job>(CONSUMER_MAILBOX_CAP);
         let (read_half, write_half) = socket.into_split();
 
         let writer = tokio::spawn(writer_task(write_half, outbound_rx));
@@ -122,6 +141,8 @@ impl Connection {
             conn_id,
             vhost: None,
             awaiting_close_ok: HashMap::new(),
+            mailbox_tx,
+            client_cancel_notify: false,
             limits: ProtocolLimits::default(),
             negotiated: None,
             phase: Phase::AwaitStartOk,
@@ -130,10 +151,22 @@ impl Connection {
         };
 
         tracing::info!(connection = %conn_id, peer = %peer, "connection opened");
-        conn.drive(read_half).await;
+        conn.drive(read_half, mailbox_rx).await;
 
         // Reclaim connection-scoped resources (FR-P09): exclusive queues
         // disappear with their owning connection (FR-Q04).
+        // Deregister every consumer of this connection before general
+        // teardown so no further jobs are scheduled to this mailbox
+        // (consumers die with their connection, FR-C01).
+        {
+            let affected = conn
+                .broker
+                .consumers
+                .lock()
+                .unwrap()
+                .deregister_connection(conn.conn_id);
+            conn.broker.maybe_auto_delete_queues(&affected);
+        }
         conn.drop_all_channel_state();
         if let Some(vhost) = conn.vhost {
             let removed = conn
@@ -156,8 +189,9 @@ impl Connection {
         tracing::info!(connection = %conn_id, peer = %peer, "connection closed");
     }
 
-    /// Main read loop: handshake with deadline, then heartbeat idle detection.
-    async fn drive(&mut self, mut read: OwnedReadHalf) {
+    /// Main loop: handshake with deadline, then socket reads + consumer
+    /// mailbox jobs concurrently (heartbeats idle-detect the socket side).
+    async fn drive(&mut self, mut read: OwnedReadHalf, mut mailbox: mpsc::Receiver<Job>) {
         let handshake_deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.limits.handshake_timeout_seconds as u64);
         let mut reader = FrameReader::new(&self.server_view_limits());
@@ -220,22 +254,36 @@ impl Connection {
                     }
                 }
             }
-            // Then block for more bytes.
+            // Socket reads and consumer jobs run concurrently; the idle
+            // deadline applies to the socket side (heartbeats).
             let idle = self.idle_timeout(handshake_deadline);
-            let n = match tokio::time::timeout(idle, read.read(&mut buf)).await {
-                Ok(Ok(n)) => n,
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    tracing::debug!("idle timeout");
-                    break;
+            tokio::select! {
+                read = tokio::time::timeout(idle, read.read(&mut buf)) => {
+                    let n = match read {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            tracing::debug!("idle timeout");
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        break; // EOF
+                    }
+                    if reader.feed(&buf[..n]).is_err() {
+                        tracing::warn!("reader budget exceeded");
+                        break;
+                    }
                 }
-            };
-            if n == 0 {
-                break; // EOF
-            }
-            if reader.feed(&buf[..n]).is_err() {
-                tracing::warn!("reader budget exceeded");
-                break;
+                job = mailbox.recv() => {
+                    if let Some(job) = job {
+                        if !self.handle_job(job).await {
+                            return;
+                        }
+                    }
+                    // None: all senders dropped (broker teardown); keep
+                    // the socket side alive.
+                }
             }
         }
     }
@@ -369,6 +417,21 @@ impl Connection {
         }
         let user = String::from_utf8_lossy(parts[1]).to_string();
         let pass = String::from_utf8_lossy(parts[2]).to_string();
+        // Extension capabilities the client declared (§4.3 gating).
+        self.client_cancel_notify = start_ok
+            .client_properties
+            .inner()
+            .get("capabilities")
+            .and_then(|v| match v {
+                amq_protocol::types::AMQPValue::FieldTable(t) => Some(t),
+                _ => None,
+            })
+            .is_some_and(|t| {
+                matches!(
+                    t.inner().get("consumer_cancel_notify"),
+                    Some(amq_protocol::types::AMQPValue::Boolean(true))
+                )
+            });
         let expected = &self.broker.test_user;
         if user != expected.username || pass != expected.password {
             tracing::warn!(user = %user, "authentication refused");
@@ -526,6 +589,8 @@ impl Connection {
                         content: None,
                         next_delivery_tag: 1,
                         unacked: HashMap::new(),
+                        consumers: std::collections::HashSet::new(),
+                        prefetch_new_consumers: None,
                     },
                 );
                 let ok = channel::AMQPMethod::OpenOk(channel::OpenOk {});
@@ -583,6 +648,20 @@ impl Connection {
             }
             AMQPClass::Basic(basic::AMQPMethod::Ack(d)) => {
                 self.handle_basic_ack(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Consume(d)) => {
+                self.handle_basic_consume(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Cancel(d)) => {
+                self.handle_basic_cancel(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Qos(d)) => {
+                self.handle_basic_qos(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::CancelOk(_)) => {
+                // Client ack of a server-initiated basic.cancel; the tag was
+                // already removed when the cancel was sent.
+                true
             }
             other => {
                 if !self.channels.contains_key(&channel_id) {
@@ -1080,40 +1159,62 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
-        let outcome: Result<(), ProtocolError> = {
-            let mut topo = self.broker.topology.lock().unwrap();
-            let found = topo.find_queue(vhost, &name);
-            match found {
-                None => Err(ProtocolError::not_found(
-                    format!("no queue '{name}' in vhost"),
-                    CLASS,
-                    method,
-                )),
-                Some(id)
-                    if !topo
-                        .check_exclusive_access(id, self.conn_id)
-                        .unwrap_or(false) =>
-                {
-                    Err(ProtocolError::channel(
+        // Resolve, condition-check, delete, tear down consumers, drain.
+        let outcome: Result<u64, ProtocolError> = {
+            let (found, lock_ok) = {
+                let topo = self.broker.topology.lock().unwrap();
+                let found = topo.find_queue(vhost, &name);
+                let lock_ok = found.is_some_and(|id| {
+                    topo.check_exclusive_access(id, self.conn_id)
+                        .unwrap_or(false)
+                });
+                (found, lock_ok)
+            };
+            let owned = found.filter(|_| lock_ok);
+            if owned.is_none() {
+                let e = if found.is_some() {
+                    ProtocolError::channel(
                         reply_code::RESOURCE_LOCKED,
                         format!(
                             "RESOURCE_LOCKED - queue '{name}' is exclusive to another connection"
                         ),
                         CLASS,
                         method,
-                    ))
-                }
-                Some(_) => {
-                    // Consumer/ready counts come from the scheduler (M3):
-                    // zero for now, so if_unused/if_empty pass trivially.
-                    topo.delete_queue(vhost, &name, d.if_unused, d.if_empty, 0, 0)
-                        .map(|_| ())
-                        .map_err(|e| Self::topology_error(e, CLASS, method))
-                }
+                    )
+                } else {
+                    ProtocolError::not_found(format!("no queue '{name}' in vhost"), CLASS, method)
+                };
+                return self.protocol_error(channel_id, &e).await;
             }
+            let id = owned.expect("checked above");
+            // Real counts for the if_unused/if_empty conditions (FR-Q06)
+            // and the delete-ok reply.
+            let ready = self.broker.store.lock().unwrap().len(id);
+            let consumer_count = self.broker.consumers.lock().unwrap().consumer_count(id);
+            let deleted = self.broker.topology.lock().unwrap().delete_queue(
+                vhost,
+                &name,
+                d.if_unused,
+                d.if_empty,
+                consumer_count,
+                ready,
+            );
+            match deleted {
+                Ok(_) => Ok(()),
+                Err(e) => Err(Self::topology_error(e, CLASS, method)),
+            }
+            .map(|_| {
+                // Tear down consumers: notify capable ones, deregister all
+                // (FR-Q09), then drop stored entries.
+                let jobs = self.broker.cancel_and_deregister_queue(id);
+                for (mailbox, job) in jobs {
+                    let _ = mailbox.try_send(job);
+                }
+                self.broker.store.lock().unwrap().drain(id)
+            })
         };
         match outcome {
-            Ok(()) => {
+            Ok(discarded) => {
                 if let Some(ch) = self.channels.get_mut(&channel_id) {
                     if ch.last_queue.as_deref() == Some(name.as_str()) {
                         ch.last_queue = None;
@@ -1122,7 +1223,9 @@ impl Connection {
                 if d.nowait {
                     true
                 } else {
-                    let ok = queue::AMQPMethod::DeleteOk(queue::DeleteOk { message_count: 0 });
+                    let ok = queue::AMQPMethod::DeleteOk(queue::DeleteOk {
+                        message_count: discarded as u32,
+                    });
                     self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
                         .await
                         .is_ok()
@@ -1289,16 +1392,25 @@ impl Connection {
     // Publishing, content assembly, and polling delivery (M2).
     // ------------------------------------------------------------------
 
-    /// Reclaim a channel's state: requeue unacked manual-ack deliveries
-    /// (FR-C06) and drop any half-assembled publish.
+    /// Reclaim a channel's state: deregister its consumers (auto-delete
+    /// check follows), requeue unacked manual-ack deliveries (FR-C06), and
+    /// drop any half-assembled publish.
     fn drop_channel_state(&mut self, channel_id: u16) {
         if let Some(mut ch) = self.channels.remove(&channel_id) {
             ch.content = None;
-            if !ch.unacked.is_empty() {
+            let affected = {
+                let mut consumers = self.broker.consumers.lock().unwrap();
                 let mut store = self.broker.store.lock().unwrap();
+                let queues = consumers.deregister_channel(self.conn_id, channel_id);
                 for (_, u) in ch.unacked.drain() {
                     store.requeue(u.queue, u.entry);
                 }
+                queues
+            };
+            self.broker.maybe_auto_delete_queues(&affected);
+            // Requeued entries may be deliverable to other consumers.
+            for q in affected {
+                self.broker.dispatch_queue(q);
             }
         }
     }
@@ -1549,7 +1661,8 @@ impl Connection {
             }
         };
 
-        // Admit to every destination under the store budget.
+        // Admit to every destination under the store budget, then dispatch
+        // to waiting consumers.
         for queue in &destinations {
             let admitted = self
                 .broker
@@ -1558,7 +1671,7 @@ impl Connection {
                 .unwrap()
                 .enqueue(*queue, message.clone());
             match admitted {
-                Ok(_) => {}
+                Ok(_) => self.broker.dispatch_queue(*queue),
                 // Never fabricate success on admission failure (§6.4).
                 Err(AdmitError::BudgetExceeded) => {
                     let e = ProtocolError::channel(
@@ -1738,6 +1851,7 @@ impl Connection {
                 UnackedDelivery {
                     queue: queue_id,
                     entry: entry.clone(),
+                    consumer_tag: None, // basic.get, not a consumer
                 },
             );
             tag
@@ -1796,11 +1910,318 @@ impl Connection {
             vec![d.delivery_tag]
         };
         // Positive acknowledgement is terminal: the entry was already held
-        // out of the ready set, so settling just drops it.
+        // out of the ready set, so settling just drops it. Consumer-sourced
+        // deliveries release scheduling credit (§6.2).
+        let mut released: Vec<Option<String>> = Vec::new();
         for tag in settled {
-            ch.unacked.remove(&tag);
+            if let Some(u) = ch.unacked.remove(&tag) {
+                released.push(u.consumer_tag);
+            }
+        }
+        // (channel borrow ends with the match arm scope above)
+        for consumer_tag in released.into_iter().flatten() {
+            self.broker
+                .consumers
+                .lock()
+                .unwrap()
+                .settle(self.conn_id, channel_id, &consumer_tag);
+        }
+        // Freed credit may enable more deliveries.
+        let queues = self
+            .broker
+            .consumers
+            .lock()
+            .unwrap()
+            .queues_with_consumers_on(self.conn_id, channel_id);
+        for q in queues {
+            self.broker.dispatch_queue(q);
         }
         true
+    }
+
+    // ------------------------------------------------------------------
+    // Consumers (M3): basic.consume/cancel/qos and mailbox jobs.
+    // ------------------------------------------------------------------
+
+    async fn handle_basic_consume(&mut self, channel_id: u16, d: basic::Consume) -> bool {
+        const CLASS: u16 = 60;
+        let method = d.get_amqp_method_id();
+        // Deferred features are rejected up front (T22 posture).
+        if d.no_local {
+            let e = ProtocolError::not_implemented("basic.consume no_local=true", CLASS, method);
+            return self.protocol_error(channel_id, &e).await;
+        }
+        if let Err(e) = Self::require_no_arguments(&d.arguments, "consume", CLASS, method) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let Ok(name) = self.resolve_queue_name(channel_id, d.queue.as_str()) else {
+            let e = ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        };
+        let vhost = self.vhost();
+        let prefetch = self
+            .channels
+            .get(&channel_id)
+            .map(|c| c.prefetch_new_consumers)
+            .unwrap_or(None);
+
+        // Fully synchronous resolution: queue, exclusivity, tag generation,
+        // duplicate-tag and exclusive-consumer checks (no guard crosses an
+        // await).
+        let outcome: Result<(QueueId, String), ProtocolError> = {
+            let topo = self.broker.topology.lock().unwrap();
+            let found = topo.find_queue(vhost, &name);
+            let lock_ok = found.is_some_and(|id| {
+                topo.check_exclusive_access(id, self.conn_id)
+                    .unwrap_or(false)
+            });
+            match found {
+                None => Err(ProtocolError::not_found(
+                    format!("no queue '{name}' in vhost"),
+                    CLASS,
+                    method,
+                )),
+                Some(_) if !lock_ok => Err(ProtocolError::channel(
+                    reply_code::RESOURCE_LOCKED,
+                    format!("RESOURCE_LOCKED - queue '{name}' is exclusive to another connection"),
+                    CLASS,
+                    method,
+                )),
+                Some(id) => {
+                    let consumers = self.broker.consumers.lock().unwrap();
+                    // Exclusive consumer: one consumer per queue (FR-C01).
+                    let conflict = d.exclusive && consumers.has_consumers(id);
+                    let tag = if d.consumer_tag.as_str().is_empty() {
+                        self.broker.next_consumer_tag()
+                    } else {
+                        d.consumer_tag.as_str().to_string()
+                    };
+                    let duplicate = consumers.find_by_tag(self.conn_id, &tag).is_some();
+                    drop(consumers);
+                    drop(topo);
+                    if conflict {
+                        Err(ProtocolError::channel(
+                            reply_code::ACCESS_REFUSED,
+                            format!(
+                                "ACCESS_REFUSED - exclusive consumer already active on queue '{name}'"
+                            ),
+                            CLASS,
+                            method,
+                        ))
+                    } else if duplicate {
+                        Err(ProtocolError::precondition_failed(
+                            format!("consumer tag '{tag}' already in use"),
+                            CLASS,
+                            method,
+                        ))
+                    } else {
+                        Ok((id, tag))
+                    }
+                }
+            }
+        };
+        let (queue_id, tag) = match outcome {
+            Ok(x) => x,
+            Err(e) => return self.protocol_error(channel_id, &e).await,
+        };
+
+        // Register the consumer (mailbox back to this connection).
+        {
+            let mut topo = self.broker.topology.lock().unwrap();
+            topo.queue_got_consumer(queue_id); // FR-Q05 auto-delete fact
+        }
+        {
+            let mut consumers = self.broker.consumers.lock().unwrap();
+            consumers.register(
+                queue_id,
+                Consumer::new(
+                    self.conn_id,
+                    channel_id,
+                    tag.clone(),
+                    d.no_ack,
+                    prefetch,
+                    self.client_cancel_notify,
+                    self.mailbox_tx.clone(),
+                ),
+            );
+        }
+        if let Some(ch) = self.channels.get_mut(&channel_id) {
+            ch.consumers.insert(tag.clone());
+        }
+        // A ready backlog is delivered immediately (FR-C09).
+        self.broker.dispatch_queue(queue_id);
+
+        if d.nowait && !d.consumer_tag.as_str().is_empty() {
+            return true;
+        }
+        // consume-ok carries the effective tag (also with nowait when the
+        // server generated it, mirroring queue.declare guidance).
+        let ok = basic::AMQPMethod::ConsumeOk(basic::ConsumeOk {
+            consumer_tag: tag.into(),
+        });
+        self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(ok)))
+            .await
+            .is_ok()
+    }
+
+    async fn handle_basic_cancel(&mut self, channel_id: u16, d: basic::Cancel) -> bool {
+        const CLASS: u16 = 60;
+        let method = d.get_amqp_method_id();
+        // Cancel stops new deliveries; outstanding unacked deliveries stay
+        // with the channel (§6.1, [R3]).
+        let affected = {
+            let mut consumers = self.broker.consumers.lock().unwrap();
+            let id = consumers.find_by_tag(self.conn_id, d.consumer_tag.as_str());
+            match id {
+                Some((id, _queue)) => consumers.deregister(id).into_iter().collect::<Vec<_>>(),
+                None => Vec::new(),
+            }
+        };
+        if affected.is_empty() {
+            let e = ProtocolError::not_found(
+                format!("no consumer tag '{}'", d.consumer_tag),
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
+        if let Some(ch) = self.channels.get_mut(&channel_id) {
+            ch.consumers.remove(d.consumer_tag.as_str());
+        }
+        self.broker.maybe_auto_delete_queues(&affected);
+        if d.nowait {
+            return true;
+        }
+        let ok = basic::AMQPMethod::CancelOk(basic::CancelOk {
+            consumer_tag: d.consumer_tag.clone(),
+        });
+        self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(ok)))
+            .await
+            .is_ok()
+    }
+
+    async fn handle_basic_qos(&mut self, channel_id: u16, d: basic::Qos) -> bool {
+        // NOTE: amq-protocol 7.x does not model basic.qos's reserved
+        // prefetch_size field, so a nonzero value cannot be distinguished
+        // here; recorded in the ledger (codec upgrade task).
+        let limit = if d.prefetch_count == 0 {
+            None // unlimited (§6.2 rule 1)
+        } else {
+            Some(d.prefetch_count)
+        };
+        if d.global {
+            // Shared channel limit (§6.2 rule 3).
+            self.broker.consumers.lock().unwrap().set_shared_prefetch(
+                self.conn_id,
+                channel_id,
+                limit,
+            );
+        } else {
+            // Default for consumers created afterwards (rule 2); existing
+            // consumers keep their assigned limit.
+            if let Some(ch) = self.channels.get_mut(&channel_id) {
+                ch.prefetch_new_consumers = limit;
+            }
+        }
+        // A relaxed limit may release queued work immediately.
+        let queues = self
+            .broker
+            .consumers
+            .lock()
+            .unwrap()
+            .queues_with_consumers_on(self.conn_id, channel_id);
+        for q in queues {
+            self.broker.dispatch_queue(q);
+        }
+        let ok = basic::AMQPMethod::QosOk(basic::QosOk {});
+        self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(ok)))
+            .await
+            .is_ok()
+    }
+
+    /// Handle a job from this connection's consumer mailbox.
+    async fn handle_job(&mut self, job: Job) -> bool {
+        match job {
+            Job::Deliver {
+                consumer_tag,
+                channel: job_channel,
+                queue,
+                no_ack,
+                entry,
+            } => {
+                // Undeliverable (channel closed or consumer cancelled since
+                // dispatch): requeue; the credit was already unwound with
+                // the consumer's deregistration.
+                let deliverable = !self.awaiting_close_ok.contains_key(&job_channel)
+                    && self
+                        .channels
+                        .get(&job_channel)
+                        .is_some_and(|ch| ch.consumers.contains(&consumer_tag));
+                if !deliverable {
+                    self.broker.store.lock().unwrap().requeue(queue, entry);
+                    self.broker.dispatch_queue(queue);
+                    return true;
+                }
+                let mut delivery_tag = 0;
+                if let Some(ch) = self.channels.get_mut(&job_channel) {
+                    delivery_tag = ch.next_delivery_tag;
+                    ch.next_delivery_tag += 1;
+                    if !no_ack {
+                        // no-ack deliveries settle at pop (§9.6); only
+                        // manual-ack deliveries join the unacked set.
+                        ch.unacked.insert(
+                            delivery_tag,
+                            UnackedDelivery {
+                                queue,
+                                entry: entry.clone(),
+                                consumer_tag: Some(consumer_tag.clone()),
+                            },
+                        );
+                    }
+                }
+                let deliver = basic::AMQPMethod::Deliver(basic::Deliver {
+                    consumer_tag: consumer_tag.into(),
+                    delivery_tag,
+                    redelivered: entry.message.redelivered,
+                    exchange: entry.message.exchange.as_str().into(),
+                    routing_key: entry.message.routing_key.as_str().into(),
+                });
+                self.send_content(
+                    job_channel,
+                    AMQPFrame::Method(job_channel, AMQPClass::Basic(deliver)),
+                    &entry.message,
+                )
+                .await
+                .is_ok()
+            }
+            Job::CancelNotify { consumer_tag } => {
+                // The queue this consumer was on was deleted (FR-Q09); sent
+                // only because the client declared the capability. Find the
+                // channel carrying the tag and emit basic.cancel.
+                let Some(channel_id) = self
+                    .channels
+                    .iter()
+                    .find(|(_, ch)| ch.consumers.contains(&consumer_tag))
+                    .map(|(id, _)| *id)
+                else {
+                    return true; // channel already closed: nothing to notify
+                };
+                if let Some(ch) = self.channels.get_mut(&channel_id) {
+                    ch.consumers.remove(&consumer_tag);
+                }
+                let cancel = basic::AMQPMethod::Cancel(basic::Cancel {
+                    consumer_tag: consumer_tag.into(),
+                    nowait: false,
+                });
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(cancel)))
+                    .await
+                    .is_ok()
+            }
+        }
     }
 
     /// Emit the proper close frame for a protocol error (frozen error
