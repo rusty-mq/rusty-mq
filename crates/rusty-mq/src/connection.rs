@@ -672,6 +672,14 @@ impl Connection {
             AMQPClass::Basic(basic::AMQPMethod::Recover(d)) => {
                 self.handle_basic_recover(channel_id, d).await
             }
+            AMQPClass::Channel(channel::AMQPMethod::Flow(d)) => {
+                self.handle_channel_flow(channel_id, d).await
+            }
+            AMQPClass::Channel(channel::AMQPMethod::FlowOk(_)) => {
+                // Response to a server flow method; rusty-mq never sends
+                // one (flow is a documented no-op), so ignore.
+                true
+            }
             AMQPClass::Basic(basic::AMQPMethod::RecoverAsync(_) | basic::AMQPMethod::Return(_)) => {
                 // Obsolete / server-only methods from clients are 540.
                 let e = ProtocolError::not_implemented(
@@ -1889,6 +1897,18 @@ impl Connection {
         )
         .await
         .is_ok()
+    }
+
+    /// channel.flow: deprecated in practice; reply flow-ok(active=true)
+    /// without pausing the channel (RabbitMQ-compatible no-op — documented
+    /// in the protocol profile). A client asking to stop content cannot be
+    /// honored mid-stream in V1; it should stop consuming instead.
+    async fn handle_channel_flow(&mut self, channel_id: u16, d: channel::Flow) -> bool {
+        let ok = channel::AMQPMethod::FlowOk(channel::FlowOk { active: true });
+        let _ = d.active;
+        self.send(AMQPFrame::Method(channel_id, AMQPClass::Channel(ok)))
+            .await
+            .is_ok()
     }
 
     /// Collect the delivery tags a settlement applies to: a single tag, or

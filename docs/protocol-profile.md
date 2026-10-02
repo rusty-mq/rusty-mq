@@ -96,6 +96,11 @@ interlude) are dropped, not escalated — matches RabbitMQ and prevents
 in-flight client content from killing the connection after a publish-time
 rejection.
 
+`channel.flow` is a **no-op**: the server replies `flow-ok(active=true)`
+regardless of the requested state and never pauses content (RabbitMQ's own
+behavior for years; flow is deprecated in practice). Clients should stop
+consuming rather than pause the channel.
+
 ## Error profile
 
 | Condition | Reply code | Scope |

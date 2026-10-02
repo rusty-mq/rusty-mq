@@ -16,7 +16,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M0 — contracts | complete (partial evidence) | Workspace, ledger, baseline fixtures, ADRs exist; baseline digest pinning is a standing TODO for the first CI runner with Docker |
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
-| M3 — delivery state | in_progress | Settlement surface complete: ack/reject/nack (single+multiple, discard vs requeue with original position + redelivered hint), basic.recover(requeue=true) with requeue=false 540, unknown-tag 406; consumers with round-robin + prefetch credit; auto-delete; cancel-notify; requeue on channel/connection loss. Remaining M3: T09 concurrency stress, channel.flow decision |
+| M3 — delivery state | complete (partial evidence) | Full §6 surface lapin-verified: consume/get/cancel, ack/reject/nack (single+multiple, discard vs requeue), recover(requeue=true), prefetch per-consumer + shared, round-robin, auto-delete, cancel-notify, requeue on channel/connection loss; T09 stress proves no-loss/no-duplicate delivery under 4×50 concurrent publishes with 3 competing consumers and prefetch credit held. channel.flow is a documented flow-ok no-op (RabbitMQ-compatible) |
 | M4 — durable authority | not_started | Storage crate scaffold only |
 | M5 — confirms and failure safety | not_started | |
 | M6 — storage lifecycle | not_started | |
@@ -111,7 +111,7 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T12 | in_progress | `mandatory_return_frame_level`: return-before-any-success, 312 NO_ROUTE |
 | T07 | in_progress | `consume_lapin.rs`: consume/cancel/no_ack/exclusive-consumer flows |
 | T08 | in_progress | `settlement_lapin.rs`: reject/nack/multiple/unknown-tag/recover flows |
-| T09 | in_progress | prefetch gating (`push_delivery_with_prefetch_and_ack_flow`); concurrency stress pending |
+| T09 | complete (partial evidence) | `stress_lapin.rs::concurrent_publish_consume_no_loss_no_duplicates` (200 msgs, 4 publishers, 3 consumers, prefetch 7: exact-once totals, zero duplicates, credit bound held) + `shared_prefetch_limits_channel_not_consumers` |
 | T11 | in_progress | `unacked_redelivers_to_new_consumer_after_connection_loss` (connection-loss requeue) |
 | T10, T13–T30 | not_started | |
 
