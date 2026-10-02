@@ -127,21 +127,28 @@ impl JournalWriter {
         fs::create_dir_all(dir).map_err(io_err)?;
         // Validate any existing chain first.
         let chain = scan_segments(dir)?;
-        let (segment_id, previous, next_lsn) = match chain.last() {
+        let (segment_id, previous, next_lsn, tail_to_truncate) = match chain.last() {
             Some(last) => {
                 let (hdr, _) = read_segment_header(dir, *last)?;
                 let mut r = SegmentReader::open(dir, *last)?;
                 let mut max_lsn = 0u64;
                 while let Some(item) = r.next_record()? {
-                    // Torn tail is tolerated by recovery; the writer starts
-                    // after the last intact record.
                     max_lsn = max_lsn.max(item.lsn);
-                    let _ = item;
                 }
-                (hdr.segment_id + 1, hdr.segment_id, max_lsn + 1)
+                // A torn tail would otherwise strand every future append
+                // behind an unreadable region: truncate to the last intact
+                // record boundary before writing (§9.8 rule 4).
+                (
+                    hdr.segment_id,
+                    hdr.previous,
+                    max_lsn + 1,
+                    Some((*last, r.intact_prefix())),
+                )
             }
-            None => (1, 0, 1),
+            None => (1, 0, 1, None),
         };
+        // The writer continues the existing tail segment (not a new one) so
+        // LSNs stay contiguous within it.
         let path = dir.join(segment_file_name(segment_id));
         let file = OpenOptions::new()
             .create(true)
@@ -164,8 +171,25 @@ impl JournalWriter {
                 .map_err(io_err)?;
             w.file.sync_all().map_err(io_err)?;
             sync_dir(dir)?;
+        } else if let Some((seg, prefix)) = tail_to_truncate {
+            let current_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as usize;
+            if prefix < current_len {
+                let tail_path = dir.join(segment_file_name(seg));
+                OpenOptions::new()
+                    .write(true)
+                    .open(&tail_path)
+                    .and_then(|f| f.set_len(prefix as u64))
+                    .map_err(io_err)?;
+                sync_dir(dir)?;
+                tracing::debug!(
+                    segment = seg,
+                    from = current_len,
+                    to = prefix,
+                    "truncated torn tail"
+                );
+            }
+            w.file.seek(SeekFrom::End(0)).map_err(io_err)?;
         } else {
-            // Appending to an existing tail segment: seek to the end.
             w.file.seek(SeekFrom::End(0)).map_err(io_err)?;
         }
         Ok(w)
@@ -327,6 +351,12 @@ enum Step {
 }
 
 impl SegmentReader {
+    /// Byte offset of the end of the last intact record read (the safe
+    /// truncation point after a torn tail).
+    fn intact_prefix(&self) -> usize {
+        self.pos
+    }
+
     fn open(dir: &Path, id: u64) -> Result<Self, FormatError> {
         let mut file = File::open(dir.join(segment_file_name(id))).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len() as usize;
@@ -342,12 +372,9 @@ impl SegmentReader {
     fn next_record(&mut self) -> Result<Option<RawItem>, FormatError> {
         match self.step()? {
             Step::Item(i) => Ok(Some(i)),
-            Step::Truncated => {
-                // Torn tail: report end (callers decide visibility); the
-                // bytes remain on disk untouched.
-                self.pos = self.len;
-                Ok(None)
-            }
+            // Torn tail: report end without advancing — `pos` marks the
+            // start of the torn record, i.e. the safe truncation point.
+            Step::Truncated => Ok(None),
             Step::End => Ok(None),
         }
     }
@@ -711,6 +738,37 @@ mod tests {
         let middle = ids[0];
         fs::remove_file(dir.join(segment_file_name(middle))).unwrap();
         assert!(matches!(recover(&dir), Err(FormatError::ChainBreak(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_after_torn_tail_truncates_and_future_commits_recover() {
+        let dir = tmpdir("truncate");
+        {
+            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            w.commit(&[queue_declare(1, "keep")]).unwrap();
+        }
+        // Crash mid-record: append half a record header (torn).
+        {
+            use std::io::Write;
+            let mut f = File::options()
+                .append(true)
+                .open(dir.join(segment_file_name(1)))
+                .unwrap();
+            f.write_all(&[0x07, 0x00, 0x00]).unwrap();
+        }
+        // Reopen: truncates the torn bytes, then commits new work.
+        let mut w2 = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        w2.commit(&[queue_declare(2, "after-crash")]).unwrap();
+        drop(w2);
+
+        let recovered = recover(&dir).unwrap();
+        assert_eq!(recovered.len(), 2, "both fenced records recover");
+        assert_eq!(
+            recovered[1].record,
+            queue_declare(2, "after-crash"),
+            "the post-crash commit is not stranded behind the torn tail"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

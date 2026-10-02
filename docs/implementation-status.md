@@ -186,9 +186,9 @@ onward as each method path lands.
 1. Journal group-commit batching (2 ms/1 MiB triggers) is not yet in the
    writer API — `commit()` fsyncs immediately (correct, unsophisticated);
    batching lands with broker wiring when confirms arrive (M5).
-2. The torn tail is logically discarded on recovery but not physically
-   truncated; the next writer append after recovery would overlap it —
-   the wiring slice must truncate to the last intact record on open.
+2. ~~Torn-tail physical truncation~~ — fixed in this slice: writer open
+   truncates the tail segment to its last intact record boundary (test:
+   `reopen_after_torn_tail_truncates_and_future_commits_recover`).
 
 1. Pin the RabbitMQ reference release container digest in
    `compatibility/baseline.yaml` (requires first CI runner with container
