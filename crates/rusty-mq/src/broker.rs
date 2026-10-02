@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::consumers::{Consumers, Job};
+use crate::metrics::Metrics;
 use rusty_mq_core::auth::{AuthState, Permissions, Principal, Role};
 use rusty_mq_core::store::MessageStore;
 use rusty_mq_core::topology::{CompatibilitySwitches, Topology};
@@ -156,7 +157,7 @@ pub struct TestUser {
 /// The broker singleton shared by all connections.
 pub struct Broker {
     /// Data directory when persistent (compaction target).
-    data_dir: Option<std::path::PathBuf>,
+    pub(crate) data_dir: Option<std::path::PathBuf>,
     /// Snapshot generation sequence.
     snapshot_generation: AtomicU64,
     /// Journal-size ceiling before inline compaction (test hook).
@@ -171,11 +172,13 @@ pub struct Broker {
     /// advanced after journal commits with the fence LSN (§9.7).
     pub projection: Mutex<Option<rusty_mq_storage::projection::Projection>>,
     /// Last fence LSN committed to the journal (projection target).
-    last_fence_lsn: AtomicU64,
+    pub(crate) last_fence_lsn: AtomicU64,
     /// Consumer registry (M3).
     pub consumers: Mutex<Consumers>,
     /// Principals + permissions (M7); journaled in persistent mode.
     pub auth: Mutex<AuthState>,
+    /// Process metrics (§12.2): bounded-cardinality counters.
+    pub metrics: Metrics,
     /// M1: exactly one test user; M7 replaces this with durable principals.
     pub test_user: TestUser,
     connection_seq: AtomicU64,
@@ -215,6 +218,7 @@ impl Broker {
                 username: user,
                 password,
             },
+            metrics: Metrics::default(),
             connection_seq: AtomicU64::new(1),
             consumer_tag_seq: AtomicU64::new(1),
         }
@@ -391,6 +395,7 @@ impl Broker {
                 username: user,
                 password,
             },
+            metrics: Metrics::default(),
             connection_seq: AtomicU64::new(1),
             consumer_tag_seq: AtomicU64::new(1),
         }

@@ -30,8 +30,11 @@ use rusty_mq_protocol::{
     PROTOCOL_HEADER_0_9_1,
 };
 
+use std::sync::atomic::Ordering;
+
 use crate::broker::Broker;
 use crate::consumers::{Consumer, Job};
+use crate::metrics::Metrics;
 
 /// Bounded outbound queue per connection (frames waiting for the writer).
 const OUTBOUND_CAP: usize = 256;
@@ -158,6 +161,7 @@ impl Connection {
 
         let writer = tokio::spawn(writer_task(write_half, outbound_rx));
 
+        Metrics::inc(&broker.metrics.connections_opened);
         let mut conn = Self {
             broker,
             conn_id,
@@ -2186,6 +2190,7 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         }
 
+        Metrics::inc(&self.broker.metrics.messages_published);
         // Admit to every destination under the store budget, then dispatch
         // to waiting consumers.
         for queue in &destinations {
@@ -2266,6 +2271,7 @@ impl Connection {
     }
 
     /// basic.return with the full message content (FR-PUB02).
+    #[allow(clippy::too_many_arguments)]
     async fn send_return(
         &mut self,
         channel_id: u16,
@@ -2273,6 +2279,7 @@ impl Connection {
         text: &str,
         message: &StoredMessage,
     ) -> bool {
+        Metrics::inc(&self.broker.metrics.messages_returned);
         let ret = basic::AMQPMethod::Return(basic::Return {
             reply_code: code,
             reply_text: text.into(),
@@ -2436,6 +2443,7 @@ impl Connection {
             tag
         };
 
+        Metrics::inc(&self.broker.metrics.messages_delivered);
         let get_ok = basic::AMQPMethod::GetOk(basic::GetOk {
             delivery_tag,
             redelivered: entry.message.redelivered,
@@ -2516,6 +2524,7 @@ impl Connection {
         requeue: bool,
         ack_kind: SettlementKind,
     ) {
+        let settled_count = tags.len();
         let mut requeued_queues: Vec<QueueId> = Vec::new();
         let mut released: Vec<Option<String>> = Vec::new();
         let mut journal_records: Vec<rusty_mq_storage::Record> = Vec::new();
@@ -2557,6 +2566,20 @@ impl Connection {
                         // dropping it from unacked completes the settlement.
                     }
                 }
+            }
+        }
+        match ack_kind {
+            SettlementKind::Ack => {
+                self.broker
+                    .metrics
+                    .messages_acked
+                    .fetch_add(settled_count as u64, Ordering::Relaxed);
+            }
+            SettlementKind::Discard => {
+                self.broker
+                    .metrics
+                    .messages_nacked
+                    .fetch_add(settled_count as u64, Ordering::Relaxed);
             }
         }
         if !journal_records.is_empty() && self.broker.journal_commit(&journal_records).is_err() {
@@ -2989,6 +3012,7 @@ impl Connection {
                         );
                     }
                 }
+                Metrics::inc(&self.broker.metrics.messages_delivered);
                 let deliver = basic::AMQPMethod::Deliver(basic::Deliver {
                     consumer_tag: consumer_tag.into(),
                     delivery_tag,
@@ -3037,6 +3061,9 @@ impl Connection {
     /// switch the connection to a bounded `Closing` linger.
     async fn protocol_error(&mut self, channel_id: u16, e: &ProtocolError) -> bool {
         tracing::debug!(channel = channel_id, error = %e, "protocol error");
+        if e.reply_code == reply_code::ACCESS_REFUSED {
+            Metrics::inc(&self.broker.metrics.auth_refusals);
+        }
         match e.scope {
             rusty_mq_protocol::error::ErrorScope::Channel => {
                 let close = channel::AMQPMethod::Close(channel::Close {

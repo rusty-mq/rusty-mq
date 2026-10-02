@@ -31,6 +31,9 @@ enum Command {
         /// development mode (no persistence claim).
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
+        /// Native HTTP management listener (§12.1; None disables).
+        #[arg(long)]
+        management_listen: Option<std::net::SocketAddr>,
         /// Development username for SASL PLAIN (M1 test auth only).
         #[arg(long, default_value = "guest")]
         user: String,
@@ -74,6 +77,7 @@ fn main() {
         Command::Serve {
             listen,
             data_dir,
+            management_listen,
             user,
             password,
         } => {
@@ -86,11 +90,29 @@ fn main() {
                 Some(dir) => rusty_mq::Broker::open_persistent(user, password, dir),
                 None => rusty_mq::Broker::new(user, password),
             };
+            let broker = std::sync::Arc::new(broker);
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            if let Err(e) = runtime.block_on(rusty_mq::server::serve(listen, broker)) {
+            if let Some(addr) = management_listen {
+                let broker = broker.clone();
+                runtime.spawn(async move {
+                    let app = rusty_mq_management::router(broker);
+                    let listener = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!("management bind {addr}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    tracing::info!(%addr, "management API listening");
+                    if let Err(e) = axum::serve(listener, app).await {
+                        tracing::error!("management server failed: {e}");
+                    }
+                });
+            }
+            if let Err(e) = runtime.block_on(rusty_mq::server::serve_shared(listen, broker)) {
                 tracing::error!("server failed: {e}");
                 std::process::exit(1);
             }

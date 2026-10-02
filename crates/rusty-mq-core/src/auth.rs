@@ -92,6 +92,20 @@ impl AuthState {
         self.principals.get(username)
     }
 
+    /// Usernames (sorted for stable listings).
+    pub fn principal_names(&self) -> impl Iterator<Item = &String> {
+        let mut names: Vec<&String> = self.principals.keys().collect();
+        names.sort();
+        names.into_iter()
+    }
+
+    /// Direct permissions read (management listings).
+    pub fn get_permissions(&self, username: &str, vhost: &str) -> Option<Permissions> {
+        self.permissions
+            .get(&(username.to_string(), vhost.to_string()))
+            .cloned()
+    }
+
     pub fn upsert_principal(&mut self, principal: Principal) {
         self.version += 1;
         self.principals

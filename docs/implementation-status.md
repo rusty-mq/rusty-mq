@@ -20,7 +20,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M4 — durable authority | in_progress | Journal engine + broker wiring complete: durable declares/deletes/binds/unbinds/purges commit before their replies; persistent publishes journal pre-assigned destination sequences under the store lock; terminal settlements journaled (INV-02); restart replays the journal into live topology+store with id stability and mint-bumping; `serve --data-dir` enables persistence (memory mode makes no persistence claim). lapin kill/restart round trip proves: topology + bindings survive, surviving set exactly {unacked-at-kill, ready, post-restart}, settled entries never resurrect. Remaining M4: delivery-attempt markers (§9.6, with M5 failpoints), redb projection |
 | M5 — confirms and failure safety | in_progress | Confirms live (see FR-PUB05/06). §9.6 delivery-safety wired and lapin-verified: Delivered markers journaled BEFORE manual-ack exposure (redelivered hint survives kill/restart), no-ack terminal dequeues journaled BEFORE exposure (never redelivered), both on the consumer-job and basic.get paths; journal failpoints injectable at runtime (T13: injected fsync failure → no positive confirm, channel closes 506). Pending: disk-failure quiesce/alarms (FR-R04), redb projection, extended T14 kill matrix |
 | M6 — storage lifecycle | in_progress | §9.9 snapshot/manifest/reclaim lifecycle live (see storage rows). §9.10 offline backup/verify/restore + LOCK landed: pid-based cross-process single-writer lock (stale LOCK tolerated; same-pid takeover is the documented abort-restart path), backup copies the recovery chain (LOCK/tmp excluded), verify replays the copy through the real recovery fold, restore refuses nonempty targets and verifies first. CLI: backup create/verify/restore. Remaining M6: redb projection, backup checksums file (T23 tail) |
-| M7 — secure operations | in_progress | Auth slice 1 live: Argon2id principals (PHC strings, unit-tested roundtrip; dev mode uses flagged plaintext with no persistence claim), journaled principal/permission records replayed through the recovery chain (auth state rebuilt from the journal), first-run bootstrap admin, vhost gate at connection.open (INV-08), §11.2 permission enforcement on declare/delete/publish/consume/get/bind/unbind with default-exchange normalization to amq.default, versioned auth state (FR-S08 token). lapin T21 slice: bootstrap+restart, §11.2 table, revocation. Pending M7: TLS, native HTTP API, metrics, alarms, CLI admin surface, auth throttling |
+| M7 — secure operations | in_progress | Auth (M7-1) live as below. M7-2: native HTTP API live — health/live+ready, /v1/status, /v1/capabilities (never advertising unsupported), queue rows with real ready counts + purge + delete (journaled), users CRUD + credential rotation + permissions CRUD over the durable store, all behind Basic-auth with role floors (Monitor reads / Admin mutations, FR-S04); Prometheus /metrics from a bounded-cardinality registry (counters wired at connect/publish/deliver/ack/nack/return/403 + ready/queues/journal-bytes gauges); serve --management-listen. Pending M7: TLS, alarms (FR-R03/04), CLI admin commands, connection close endpoint |
 | M8 — migration and interoperability | not_started | |
 | M9 — release qualification | not_started | |
 
@@ -77,7 +77,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-M04 | complete (partial evidence) | user_id mismatch → 403 | unit-level gate in `admit_properties` | dedicated lapin test pending |
 | FR-S01 | complete (partial evidence) | Argon2id PHC verify; dev-mode flagged plaintext | `argon2_roundtrip` unit; `bootstrap_admin_works_and_wrong_password_fails` (incl. restart) | auth throttling pending (dummy-verify anti-enumeration in place) |
 | FR-S03 | complete (partial evidence) | §11.2 checks on all listed operations + vhost gate | `permissions_enforce_the_11_2_table`; core auth unit tests | |
-| FR-S08 | in_progress | version token on every mutation; revocation immediate on the AMQP plane | `vhost_isolation_and_revocation` | live-connection close on principal deletion lands with the HTTP API |
+| FR-S08 | in_progress | version token on every mutation; revocation immediate on the AMQP plane | `vhost_isolation_and_revocation` | live-connection close on principal deletion pending (connection registry) |
 | FR-M05 | complete (partial evidence) | expiration property → 540 | `expiration_property_is_rejected` | |
 | FR-M06 | in_progress | priority preserved as property; FIFO scheduling | property roundtrip test | priority-queue args still 540 ✓ |
 | FR-PUB01 | complete (partial evidence) | publish+envelope on delivery | roundtrip tests | |
@@ -121,7 +121,17 @@ Updated: 2026-10-02 (M0/M1 development start).
 
 ### Security (§11), management (§12), CLI/config (§13)
 
-All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constraint).
+| ID | Status | Implementation | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| FR-S04 | complete (partial evidence) | role floors on the HTTP surface (Basic auth → principal role; Monitor reads, Admin mutations) | `management_http.rs`: reads_require_monitor_role, lifecycle role checks | |
+| §12.1 health | complete (partial evidence) | /health/live, /health/ready (honest single bit: alarms refine) | health_and_capabilities_are_public | |
+| §12.1 status/capabilities | complete (partial evidence) | version/persistence/auth-version/LSN summary; feature matrix from implemented set | same + capabilities test (quorum_queues=false asserted) | |
+| §12.1 queues | complete (partial evidence) | list with ready/consumer counts, purge (real counts), delete (journaled for durable) | queues_listing_and_purge_with_real_counts | opaque-id registry deferred; names as ids documented |
+| §12.1 users/permissions | complete (partial evidence) | create/list/delete, credential rotation (Argon2id), permissions get/set/delete with regex validation at set time; hashes never in responses | user_lifecycle_credentials_and_permissions | |
+| §12.2 metrics | in_progress | /metrics Prometheus text; 7 counters + 3 gauges, bounded labels by construction | metrics_text_endpoint; metrics unit test | queue-label metrics remain opt-out |
+| CLI admin | not_started | | | |
+
+Pre-M7 binaries bind loopback only (PRD early safety constraint).
 
 ## Acceptance test ledger (§17.1)
 

@@ -14,6 +14,7 @@ argon2 = { workspace = true }
 rand = { workspace = true }
 rusty-mq-protocol = { workspace = true }
 rusty-mq-core = { workspace = true }
+rusty-mq-management = { workspace = true }
 rusty-mq-storage = { workspace = true }
 amq-protocol = { workspace = true }
 tokio = { workspace = true }
@@ -22,8 +23,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
+axum = { workspace = true }
+serde_json = { workspace = true }
+
 [dev-dependencies]
+base64 = "0.22"
 lapin = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
 amq-protocol = { workspace = true }
 tokio-test = { workspace = true }
 futures-lite = { workspace = true }

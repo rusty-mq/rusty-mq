@@ -42,6 +42,9 @@ argon2 = "0.5"
 rand = "0.8"
 # Permission patterns: documented Rust regex subset (§11.2).
 regex = "1"
+# Native HTTP management API (§12.1; MIT OR Apache-2.0).
+axum = "0.8"
+serde_json = "1"
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
@@ -57,6 +60,9 @@ clap = { version = "4", features = ["derive"] }
 
 # Testing
 proptest = "1"
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+http-body-util = "0.1"
 lapin = { version = "4", default-features = false, features = ["tokio"] } # no TLS stack for tests
 tokio-test = "0.4"
 tempfile = "3"

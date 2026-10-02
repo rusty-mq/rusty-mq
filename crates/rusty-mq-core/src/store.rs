@@ -141,6 +141,11 @@ impl MessageStore {
         self.total_bytes += size;
     }
 
+    /// Total ready entries across queues (metrics gauge; no labels).
+    pub fn total_ready_entries(&self) -> u64 {
+        self.queues.values().map(|q| q.entries.len() as u64).sum()
+    }
+
     /// Aggregate ready bytes (budget accounting and metrics).
     pub fn total_bytes(&self) -> usize {
         self.total_bytes

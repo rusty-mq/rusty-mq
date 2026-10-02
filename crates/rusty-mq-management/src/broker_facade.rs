@@ -1,0 +1,91 @@
+//! The broker surface the management API needs, as a trait implemented by
+//! the real broker in the `rusty-mq` crate (keeps the dependency direction
+//! one-way: management defines, the binary implements).
+
+use rusty_mq_core::auth::{Permissions, Role};
+use rusty_mq_core::topology::TopologyError;
+
+pub trait BrokerHandle: Send + Sync + 'static {
+    fn authenticate(&self, user: &str, pass: &str) -> bool;
+    fn role_of(&self, user: &str) -> Option<Role>;
+    /// Recovery complete and admissions available (readiness).
+    fn is_ready(&self) -> bool;
+    /// Prometheus text for /metrics.
+    fn render_metrics(&self) -> String;
+    /// Version/uptime/storage/alarm summary for /v1/status.
+    fn status_summary(&self) -> serde_json::Value;
+    fn list_vhosts(&self) -> Vec<serde_json::Value>;
+    /// Queue rows with name, ready count, consumer count.
+    fn list_queues(&self, vhost: &str) -> Vec<serde_json::Value>;
+    fn purge_queue(&self, vhost: &str, queue: &str) -> Result<u64, TopologyError>;
+    fn delete_queue(&self, vhost: &str, queue: &str) -> Result<(), TopologyError>;
+    fn create_user(&self, username: &str, password: &str, role: Role) -> Result<(), String>;
+    /// (username, role) rows — never password material.
+    fn list_users(&self) -> Vec<serde_json::Value>;
+    fn rotate_credentials(&self, username: &str, password: &str) -> Result<bool, String>;
+    fn delete_user(&self, username: &str) -> Result<bool, String>;
+    fn get_permissions(&self, username: &str, vhost: &str) -> Option<Permissions>;
+    fn set_permissions(
+        &self,
+        username: &str,
+        vhost: &str,
+        perms: Permissions,
+    ) -> Result<(), String>;
+    fn delete_permissions(&self, username: &str, vhost: &str) -> Result<bool, String>;
+}
+
+impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
+    fn authenticate(&self, user: &str, pass: &str) -> bool {
+        (**self).authenticate(user, pass)
+    }
+    fn role_of(&self, user: &str) -> Option<Role> {
+        (**self).role_of(user)
+    }
+    fn is_ready(&self) -> bool {
+        (**self).is_ready()
+    }
+    fn render_metrics(&self) -> String {
+        (**self).render_metrics()
+    }
+    fn status_summary(&self) -> serde_json::Value {
+        (**self).status_summary()
+    }
+    fn list_vhosts(&self) -> Vec<serde_json::Value> {
+        (**self).list_vhosts()
+    }
+    fn list_queues(&self, vhost: &str) -> Vec<serde_json::Value> {
+        (**self).list_queues(vhost)
+    }
+    fn purge_queue(&self, vhost: &str, queue: &str) -> Result<u64, TopologyError> {
+        (**self).purge_queue(vhost, queue)
+    }
+    fn delete_queue(&self, vhost: &str, queue: &str) -> Result<(), TopologyError> {
+        (**self).delete_queue(vhost, queue)
+    }
+    fn create_user(&self, username: &str, password: &str, role: Role) -> Result<(), String> {
+        (**self).create_user(username, password, role)
+    }
+    fn list_users(&self) -> Vec<serde_json::Value> {
+        (**self).list_users()
+    }
+    fn rotate_credentials(&self, username: &str, password: &str) -> Result<bool, String> {
+        (**self).rotate_credentials(username, password)
+    }
+    fn delete_user(&self, username: &str) -> Result<bool, String> {
+        (**self).delete_user(username)
+    }
+    fn get_permissions(&self, username: &str, vhost: &str) -> Option<Permissions> {
+        (**self).get_permissions(username, vhost)
+    }
+    fn set_permissions(
+        &self,
+        username: &str,
+        vhost: &str,
+        perms: Permissions,
+    ) -> Result<(), String> {
+        (**self).set_permissions(username, vhost, perms)
+    }
+    fn delete_permissions(&self, username: &str, vhost: &str) -> Result<bool, String> {
+        (**self).delete_permissions(username, vhost)
+    }
+}

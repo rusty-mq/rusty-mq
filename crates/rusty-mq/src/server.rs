@@ -19,6 +19,14 @@ pub async fn serve(listen: SocketAddr, broker: Broker) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Serve with a shared broker handle (the management API holds one too).
+pub async fn serve_shared(listen: SocketAddr, broker: Arc<Broker>) -> std::io::Result<()> {
+    let listener = TcpListener::bind(listen).await?;
+    tracing::info!(%listen, "rusty-mq listening (AMQP 0-9-1)");
+    serve_listener_shared(listener, broker).await;
+    Ok(())
+}
+
 /// Accept loop over an already-bound, shared broker (tests that need a
 /// live handle for failpoint control).
 pub async fn serve_listener_shared(listener: TcpListener, broker: Arc<Broker>) {

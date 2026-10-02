@@ -11,6 +11,11 @@ authors.workspace = true
 [dependencies]
 rusty-mq-core = { workspace = true }
 thiserror = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
