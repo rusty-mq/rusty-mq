@@ -16,7 +16,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M0 — contracts | complete (partial evidence) | Workspace, ledger, baseline fixtures, ADRs exist; baseline digest pinning is a standing TODO for the first CI runner with Docker |
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
-| M3 — delivery state | in_progress | basic.consume/cancel with push deliveries (round-robin, prefetch credit, no_ack), auto-delete after last consumer, consumer-cancel notify on delete, requeue on connection loss — all lapin-verified. Remaining M3: basic.reject/nack, basic.recover, exclusive-queue edge tests |
+| M3 — delivery state | in_progress | Settlement surface complete: ack/reject/nack (single+multiple, discard vs requeue with original position + redelivered hint), basic.recover(requeue=true) with requeue=false 540, unknown-tag 406; consumers with round-robin + prefetch credit; auto-delete; cancel-notify; requeue on channel/connection loss. Remaining M3: T09 concurrency stress, channel.flow decision |
 | M4 — durable authority | not_started | Storage crate scaffold only |
 | M5 — confirms and failure safety | not_started | |
 | M6 — storage lifecycle | not_started | |
@@ -86,7 +86,8 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-C02 | complete (partial evidence) | basic.get with get-ok/get-empty | all get-based tests | |
 | FR-C03 | complete (partial evidence) | manual-ack + no_ack modes (get and consume) | push + no_ack tests | |
 | FR-C04 | complete (partial evidence) | channel-scoped monotonic tags across get+deliver | push test (distinct tags) | confirm numbering separate (M5) |
-| FR-C05 | in_progress | basic.ack single+multiple implemented | manual-ack + push tests | reject/nack next slice |
+| FR-C05 | complete (partial evidence) | ack/reject/nack incl. multiple settlement | `settlement_lapin.rs`: discard/requeue reject, nack multiple | |
+| FR-C08 | complete (partial evidence) | recover(requeue=true) → recover-ok + redelivery; requeue=false 540; recover-async 540 | `recover_requeues_channel_deliveries_to_consumer`, `recover_without_requeue_is_540` | |
 | FR-C06 | complete (partial evidence) | requeue on channel close AND connection loss, redelivered hint | `unacked_redelivers_to_new_consumer_after_connection_loss` | |
 | FR-C07 | complete (partial evidence) | per-consumer prefetch (global=false) + shared channel limit (global=true) | `push_delivery_with_prefetch_and_ack_flow`; registry unit tests incl. shared-limit gating | prefetch_size unrepresentable by codec 7.x (finding) |
 | FR-C09 | complete (partial evidence) | round-robin fair scheduling | `round_robin_across_two_consumers`; registry unit test | |
@@ -109,7 +110,8 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T06 | in_progress | `publish_route_get_roundtrip_with_properties`: bit-identical bodies, typed headers/props |
 | T12 | in_progress | `mandatory_return_frame_level`: return-before-any-success, 312 NO_ROUTE |
 | T07 | in_progress | `consume_lapin.rs`: consume/cancel/no_ack/exclusive-consumer flows |
-| T08/T09 | in_progress | ack paths incl. multiple; prefetch gating (`push_delivery_with_prefetch_and_ack_flow`) |
+| T08 | in_progress | `settlement_lapin.rs`: reject/nack/multiple/unknown-tag/recover flows |
+| T09 | in_progress | prefetch gating (`push_delivery_with_prefetch_and_ack_flow`); concurrency stress pending |
 | T11 | in_progress | `unacked_redelivers_to_new_consumer_after_connection_loss` (connection-loss requeue) |
 | T10, T13–T30 | not_started | |
 

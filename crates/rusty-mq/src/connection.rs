@@ -663,6 +663,24 @@ impl Connection {
                 // already removed when the cancel was sent.
                 true
             }
+            AMQPClass::Basic(basic::AMQPMethod::Reject(d)) => {
+                self.handle_basic_reject(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Nack(d)) => {
+                self.handle_basic_nack(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Recover(d)) => {
+                self.handle_basic_recover(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::RecoverAsync(_) | basic::AMQPMethod::Return(_)) => {
+                // Obsolete / server-only methods from clients are 540.
+                let e = ProtocolError::not_implemented(
+                    "method (client-initiated basic.recover-async/return)",
+                    60,
+                    0,
+                );
+                self.protocol_error(channel_id, &e).await
+            }
             other => {
                 if !self.channels.contains_key(&channel_id) {
                     return self
@@ -1873,52 +1891,67 @@ impl Connection {
         .is_ok()
     }
 
-    async fn handle_basic_ack(&mut self, channel_id: u16, d: basic::Ack) -> bool {
-        const CLASS: u16 = 60;
-        let method = d.get_amqp_method_id();
-        let Some(ch) = self.channels.get_mut(&channel_id) else {
-            return self
-                .protocol_error(
-                    channel_id,
-                    &ProtocolError::connection(
-                        reply_code::CHANNEL_ERROR,
-                        format!("channel {channel_id} is not open"),
-                    ),
-                )
-                .await;
+    /// Collect the delivery tags a settlement applies to: a single tag, or
+    /// all outstanding (multiple with tag 0) / all ≤ tag (multiple with a
+    /// tag). Unknown single tags are 406 (§6.1).
+    fn settlement_tags(
+        &self,
+        channel_id: u16,
+        delivery_tag: u64,
+        multiple: bool,
+        class_id: u16,
+        method_id: u16,
+    ) -> Result<Vec<u64>, ProtocolError> {
+        let Some(ch) = self.channels.get(&channel_id) else {
+            return Err(ProtocolError::connection(
+                reply_code::CHANNEL_ERROR,
+                format!("channel {channel_id} is not open"),
+            ));
         };
-        let settled: Vec<u64> = if d.multiple {
-            if d.delivery_tag == 0 {
-                ch.unacked.keys().copied().collect()
+        if multiple {
+            if delivery_tag == 0 {
+                Ok(ch.unacked.keys().copied().collect())
             } else {
-                ch.unacked
+                Ok(ch
+                    .unacked
                     .keys()
                     .copied()
-                    .filter(|t| *t <= d.delivery_tag)
-                    .collect()
+                    .filter(|t| *t <= delivery_tag)
+                    .collect())
             }
+        } else if ch.unacked.contains_key(&delivery_tag) {
+            Ok(vec![delivery_tag])
         } else {
-            if !ch.unacked.contains_key(&d.delivery_tag) {
-                // Invalid/duplicate settlement is a protocol error (§6.1).
-                let e = ProtocolError::precondition_failed(
-                    format!("unknown delivery tag {}", d.delivery_tag),
-                    CLASS,
-                    method,
-                );
-                return self.protocol_error(channel_id, &e).await;
-            }
-            vec![d.delivery_tag]
-        };
-        // Positive acknowledgement is terminal: the entry was already held
-        // out of the ready set, so settling just drops it. Consumer-sourced
-        // deliveries release scheduling credit (§6.2).
+            Err(ProtocolError::precondition_failed(
+                format!("unknown delivery tag {delivery_tag}"),
+                class_id,
+                method_id,
+            ))
+        }
+    }
+
+    /// Apply a settlement to `tags`: drop (ack/nack without requeue —
+    /// terminal discard in V1, DLX is deferred) or requeue (original
+    /// relative position, redelivered hint). Releases consumer credit and
+    /// re-dispatched freed queues.
+    fn apply_settlement(&mut self, channel_id: u16, tags: Vec<u64>, requeue: bool) {
+        let mut requeued_queues: Vec<QueueId> = Vec::new();
         let mut released: Vec<Option<String>> = Vec::new();
-        for tag in settled {
-            if let Some(u) = ch.unacked.remove(&tag) {
-                released.push(u.consumer_tag);
+        if let Some(ch) = self.channels.get_mut(&channel_id) {
+            for tag in tags {
+                if let Some(u) = ch.unacked.remove(&tag) {
+                    released.push(u.consumer_tag);
+                    if requeue {
+                        self.broker.store.lock().unwrap().requeue(u.queue, u.entry);
+                        if !requeued_queues.contains(&u.queue) {
+                            requeued_queues.push(u.queue);
+                        }
+                    }
+                    // else: terminal discard — the entry was already held
+                    // out of the ready set, so dropping it is enough.
+                }
             }
         }
-        // (channel borrow ends with the match arm scope above)
         for consumer_tag in released.into_iter().flatten() {
             self.broker
                 .consumers
@@ -1926,17 +1959,91 @@ impl Connection {
                 .unwrap()
                 .settle(self.conn_id, channel_id, &consumer_tag);
         }
-        // Freed credit may enable more deliveries.
-        let queues = self
+        // Freed credit and requeued entries may enable deliveries.
+        let mut queues = self
             .broker
             .consumers
             .lock()
             .unwrap()
             .queues_with_consumers_on(self.conn_id, channel_id);
+        for q in requeued_queues {
+            if !queues.contains(&q) {
+                queues.push(q);
+            }
+        }
         for q in queues {
             self.broker.dispatch_queue(q);
         }
+    }
+
+    async fn handle_basic_ack(&mut self, channel_id: u16, d: basic::Ack) -> bool {
+        const CLASS: u16 = 60;
+        let tags = match self.settlement_tags(
+            channel_id,
+            d.delivery_tag,
+            d.multiple,
+            CLASS,
+            d.get_amqp_method_id(),
+        ) {
+            Ok(tags) => tags,
+            Err(e) => return self.protocol_error(channel_id, &e).await,
+        };
+        self.apply_settlement(channel_id, tags, false);
         true
+    }
+
+    async fn handle_basic_reject(&mut self, channel_id: u16, d: basic::Reject) -> bool {
+        const CLASS: u16 = 60;
+        let tags = match self.settlement_tags(
+            channel_id,
+            d.delivery_tag,
+            false,
+            CLASS,
+            d.get_amqp_method_id(),
+        ) {
+            Ok(tags) => tags,
+            Err(e) => return self.protocol_error(channel_id, &e).await,
+        };
+        self.apply_settlement(channel_id, tags, d.requeue);
+        true
+    }
+
+    async fn handle_basic_nack(&mut self, channel_id: u16, d: basic::Nack) -> bool {
+        const CLASS: u16 = 60;
+        let tags = match self.settlement_tags(
+            channel_id,
+            d.delivery_tag,
+            d.multiple,
+            CLASS,
+            d.get_amqp_method_id(),
+        ) {
+            Ok(tags) => tags,
+            Err(e) => return self.protocol_error(channel_id, &e).await,
+        };
+        self.apply_settlement(channel_id, tags, d.requeue);
+        true
+    }
+
+    async fn handle_basic_recover(&mut self, channel_id: u16, d: basic::Recover) -> bool {
+        const CLASS: u16 = 60;
+        let method = d.get_amqp_method_id();
+        if !d.requeue {
+            // FR-C08: only requeue=true is in the V1 subset.
+            let e = ProtocolError::not_implemented("basic.recover requeue=false", CLASS, method);
+            return self.protocol_error(channel_id, &e).await;
+        }
+        // Requeue every outstanding delivery on this channel; they become
+        // redeliverable to any consumer (§6.1 recover).
+        let tags: Vec<u64> = self
+            .channels
+            .get(&channel_id)
+            .map(|ch| ch.unacked.keys().copied().collect())
+            .unwrap_or_default();
+        self.apply_settlement(channel_id, tags, true);
+        let ok = basic::AMQPMethod::RecoverOk(basic::RecoverOk {});
+        self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(ok)))
+            .await
+            .is_ok()
     }
 
     // ------------------------------------------------------------------
