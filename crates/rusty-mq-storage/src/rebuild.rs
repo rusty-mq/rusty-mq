@@ -15,6 +15,8 @@ use crate::record::Record;
 pub struct Rebuilt {
     pub topology: Topology,
     pub store: MessageStore,
+    /// Principals + permissions replayed from the journal (§11).
+    pub auth: rusty_mq_core::auth::AuthState,
     /// Count of records replayed (observability; §12 telemetry).
     pub replayed: usize,
     /// Highest restored entity id (id-mint bump safety).
@@ -38,6 +40,7 @@ fn apply_record(
     max_entity_id: &mut u64,
     record: &Record,
 ) {
+    let _ = ();
     let vhost = vhost_of(topology);
     match record {
         Record::QueueDeclare(q) => {
@@ -121,6 +124,44 @@ fn apply_record(
                 store.discard(QueueId::from_raw(*queue), *seq);
             }
         }
+        // Auth records fold into the auth state (wired by the caller via
+        // apply_auth_record); the data fold ignores them.
+        Record::PrincipalUpsert(_)
+        | Record::PrincipalDelete { .. }
+        | Record::PermissionSet(_)
+        | Record::PermissionDelete { .. } => {}
+    }
+}
+
+/// Fold auth records into the auth state (same idempotency class).
+pub fn apply_auth_record(auth: &mut rusty_mq_core::auth::AuthState, record: &Record) {
+    use rusty_mq_core::auth::{Permissions, Principal, Role};
+    match record {
+        Record::PrincipalUpsert(p) => {
+            auth.upsert_principal(Principal {
+                username: p.username.clone(),
+                password_phc: p.password_phc.clone(),
+                role: Role::from_u8(p.role).unwrap_or(Role::Ordinary),
+            });
+        }
+        Record::PrincipalDelete { username } => {
+            auth.delete_principal(username);
+        }
+        Record::PermissionSet(p) => {
+            auth.set_permissions(
+                &p.username,
+                &p.vhost,
+                Permissions {
+                    configure: p.configure.clone(),
+                    write: p.write.clone(),
+                    read: p.read.clone(),
+                },
+            );
+        }
+        Record::PermissionDelete { username, vhost } => {
+            auth.delete_permissions(username, vhost);
+        }
+        _ => {}
     }
 }
 
@@ -166,6 +207,7 @@ pub fn rebuild(
     let records = crate::journal::recover_with_options(dir, manifest.is_some())?;
     let mut topology = Topology::new(CompatibilitySwitches::default());
     let mut store = MessageStore::new(byte_budget);
+    let mut auth = rusty_mq_core::auth::AuthState::new();
 
     let mut replayed = 0usize;
     let mut max_entity_id = 0u64;
@@ -173,6 +215,7 @@ pub fn rebuild(
     for record in &snapshot_records {
         replayed += 1;
         apply_record(&mut topology, &mut store, &mut max_entity_id, record);
+        apply_auth_record(&mut auth, record);
     }
     for item in &records {
         if item.lsn <= covered_lsn {
@@ -180,12 +223,14 @@ pub fn rebuild(
         }
         replayed += 1;
         apply_record(&mut topology, &mut store, &mut max_entity_id, &item.record);
+        apply_auth_record(&mut auth, &item.record);
     }
     // Freshly minted ids must never collide with restored identities.
     bump_past(max_entity_id);
     Ok(Rebuilt {
         topology,
         store,
+        auth,
         replayed,
         max_entity_id,
     })
@@ -205,14 +250,18 @@ pub fn open_persistent_with_projection(
         MessageStore,
         crate::projection::Projection,
         JournalWriter,
+        rusty_mq_core::auth::AuthState,
     ),
     crate::record::FormatError,
 > {
     std::fs::create_dir_all(dir).map_err(|e| crate::record::FormatError::Io(e.to_string()))?;
+    // The authoritative replay carries the auth state (principals +
+    // permissions fold from the journal).
+    let rebuilt = rebuild(dir, byte_budget)?;
     let (topology, store, projection, _status) =
         crate::projection::recover_with_projection(dir, byte_budget)?;
     let writer = JournalWriter::open(dir, config)?;
-    Ok((topology, store, projection, writer))
+    Ok((topology, store, projection, writer, rebuilt.auth))
 }
 
 /// Open a persistent broker backend: recover first (rebuild live state),

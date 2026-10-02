@@ -18,6 +18,10 @@ pub mod kind {
     pub const SETTLE_DISCARD: u8 = 0x22;
     pub const DELIVERED: u8 = 0x23;
     pub const PURGE: u8 = 0x30;
+    pub const PRINCIPAL_UPSERT: u8 = 0x40;
+    pub const PRINCIPAL_DELETE: u8 = 0x41;
+    pub const PERMISSION_SET: u8 = 0x42;
+    pub const PERMISSION_DELETE: u8 = 0x43;
     pub const END_MARKER: u8 = 0xF1;
 }
 
@@ -54,6 +58,35 @@ pub enum Record {
         queue: u64,
         seqs: Vec<u64>,
     },
+    /// A principal: username + Argon2id password hash (PHC string) + role.
+    PrincipalUpsert(PrincipalRecord),
+    PrincipalDelete {
+        username: String,
+    },
+    /// Permissions for (user, vhost): configure/write/read regex patterns.
+    PermissionSet(PermissionRecord),
+    PermissionDelete {
+        username: String,
+        vhost: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrincipalRecord {
+    pub username: String,
+    /// Argon2id PHC string (params + salt + hash); never a plaintext.
+    pub password_phc: String,
+    /// 0 = ordinary, 1 = monitor, 2 = operator, 3 = admin.
+    pub role: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionRecord {
+    pub username: String,
+    pub vhost: String,
+    pub configure: String,
+    pub write: String,
+    pub read: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +146,10 @@ impl Record {
             Record::SettleDiscard { .. } => kind::SETTLE_DISCARD,
             Record::Delivered { .. } => kind::DELIVERED,
             Record::Purge { .. } => kind::PURGE,
+            Record::PrincipalUpsert(_) => kind::PRINCIPAL_UPSERT,
+            Record::PrincipalDelete { .. } => kind::PRINCIPAL_DELETE,
+            Record::PermissionSet(_) => kind::PERMISSION_SET,
+            Record::PermissionDelete { .. } => kind::PERMISSION_DELETE,
         }
     }
 
@@ -168,6 +205,23 @@ impl Record {
                 for s in seqs {
                     b.u64(*s);
                 }
+            }
+            Record::PrincipalUpsert(p) => {
+                b.str(&p.username);
+                b.str(&p.password_phc);
+                b.u8(p.role);
+            }
+            Record::PrincipalDelete { username } => b.str(username),
+            Record::PermissionSet(p) => {
+                b.str(&p.username);
+                b.str(&p.vhost);
+                b.str(&p.configure);
+                b.str(&p.write);
+                b.str(&p.read);
+            }
+            Record::PermissionDelete { username, vhost } => {
+                b.str(username);
+                b.str(vhost);
             }
         }
         b.0
@@ -256,6 +310,29 @@ impl Record {
                 let seq = r.u64()?;
                 Record::Delivered { queue, seq }
             }
+            kind::PRINCIPAL_UPSERT => Record::PrincipalUpsert(PrincipalRecord {
+                username: r.str()?,
+                password_phc: r.str()?,
+                role: {
+                    let role = r.u8()?;
+                    if role > 3 {
+                        return Err(FormatError::Corruption(format!("role {role}")));
+                    }
+                    role
+                },
+            }),
+            kind::PRINCIPAL_DELETE => Record::PrincipalDelete { username: r.str()? },
+            kind::PERMISSION_SET => Record::PermissionSet(PermissionRecord {
+                username: r.str()?,
+                vhost: r.str()?,
+                configure: r.str()?,
+                write: r.str()?,
+                read: r.str()?,
+            }),
+            kind::PERMISSION_DELETE => Record::PermissionDelete {
+                username: r.str()?,
+                vhost: r.str()?,
+            },
             kind::PURGE => {
                 let queue = r.u64()?;
                 let count = r.u32()? as usize;

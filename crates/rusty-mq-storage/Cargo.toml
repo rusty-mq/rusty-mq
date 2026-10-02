@@ -9,6 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+argon2 = { workspace = true }
+rand = { workspace = true }
 redb = { workspace = true }
 rusty-mq-core = { workspace = true }
 thiserror = { workspace = true }

@@ -203,6 +203,13 @@ impl Projection {
                         delivered.remove((*queue, *seq)).map_err(io_err)?;
                     }
                 }
+                // Auth records are outside the data projection's scope:
+                // the authoritative auth state replays from the journal
+                // (§9.1 — one source of truth); applied_lsn still advances.
+                Record::PrincipalUpsert(_)
+                | Record::PrincipalDelete { .. }
+                | Record::PermissionSet(_)
+                | Record::PermissionDelete { .. } => {}
             }
         }
         let mut meta = tx.open_table(META).map_err(io_err)?;

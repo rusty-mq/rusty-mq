@@ -23,7 +23,10 @@ pub mod snapshot;
 pub use journal::{
     recover, JournalConfig, JournalWriter, RecoveredRecord, FORMAT_MAJOR, FORMAT_MINOR,
 };
-pub use record::{Binding, Enqueue, ExchangeRecord, FormatError, QueueRecord, Record};
+pub use record::{
+    Binding, Enqueue, ExchangeRecord, FormatError, PermissionRecord, PrincipalRecord, QueueRecord,
+    Record,
+};
 
 /// Reasons durable operations are refused before M4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

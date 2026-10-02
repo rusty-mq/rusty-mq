@@ -7,3 +7,4 @@ pub mod consumers;
 pub mod server;
 
 pub use broker::Broker;
+pub use rusty_mq_core::{Permissions, Principal, Role};

@@ -20,7 +20,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M4 — durable authority | in_progress | Journal engine + broker wiring complete: durable declares/deletes/binds/unbinds/purges commit before their replies; persistent publishes journal pre-assigned destination sequences under the store lock; terminal settlements journaled (INV-02); restart replays the journal into live topology+store with id stability and mint-bumping; `serve --data-dir` enables persistence (memory mode makes no persistence claim). lapin kill/restart round trip proves: topology + bindings survive, surviving set exactly {unacked-at-kill, ready, post-restart}, settled entries never resurrect. Remaining M4: delivery-attempt markers (§9.6, with M5 failpoints), redb projection |
 | M5 — confirms and failure safety | in_progress | Confirms live (see FR-PUB05/06). §9.6 delivery-safety wired and lapin-verified: Delivered markers journaled BEFORE manual-ack exposure (redelivered hint survives kill/restart), no-ack terminal dequeues journaled BEFORE exposure (never redelivered), both on the consumer-job and basic.get paths; journal failpoints injectable at runtime (T13: injected fsync failure → no positive confirm, channel closes 506). Pending: disk-failure quiesce/alarms (FR-R04), redb projection, extended T14 kill matrix |
 | M6 — storage lifecycle | in_progress | §9.9 snapshot/manifest/reclaim lifecycle live (see storage rows). §9.10 offline backup/verify/restore + LOCK landed: pid-based cross-process single-writer lock (stale LOCK tolerated; same-pid takeover is the documented abort-restart path), backup copies the recovery chain (LOCK/tmp excluded), verify replays the copy through the real recovery fold, restore refuses nonempty targets and verifies first. CLI: backup create/verify/restore. Remaining M6: redb projection, backup checksums file (T23 tail) |
-| M7 — secure operations | not_started | |
+| M7 — secure operations | in_progress | Auth slice 1 live: Argon2id principals (PHC strings, unit-tested roundtrip; dev mode uses flagged plaintext with no persistence claim), journaled principal/permission records replayed through the recovery chain (auth state rebuilt from the journal), first-run bootstrap admin, vhost gate at connection.open (INV-08), §11.2 permission enforcement on declare/delete/publish/consume/get/bind/unbind with default-exchange normalization to amq.default, versioned auth state (FR-S08 token). lapin T21 slice: bootstrap+restart, §11.2 table, revocation. Pending M7: TLS, native HTTP API, metrics, alarms, CLI admin surface, auth throttling |
 | M8 — migration and interoperability | not_started | |
 | M9 — release qualification | not_started | |
 
@@ -74,7 +74,10 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-M01 | complete (partial evidence) | arbitrary bodies incl. zero bytes and 0xCE octets | `publish_route_get_roundtrip_with_properties` | zero-length via assembler unit tests |
 | FR-M02 | complete (partial evidence) | properties preserved as encoded blobs through store | same test (typed headers/props roundtrip) | |
 | FR-M03 | complete (partial evidence) | absent=transient, 1/2 valid, else 503 | `invalid_delivery_mode_is_rejected` | |
-| FR-M04 | complete (partial evidence) | user_id mismatch → 403 | unit-level gate in `admit_properties` | dedicated lapin test pending (M7 auth suite) |
+| FR-M04 | complete (partial evidence) | user_id mismatch → 403 | unit-level gate in `admit_properties` | dedicated lapin test pending |
+| FR-S01 | complete (partial evidence) | Argon2id PHC verify; dev-mode flagged plaintext | `argon2_roundtrip` unit; `bootstrap_admin_works_and_wrong_password_fails` (incl. restart) | auth throttling pending (dummy-verify anti-enumeration in place) |
+| FR-S03 | complete (partial evidence) | §11.2 checks on all listed operations + vhost gate | `permissions_enforce_the_11_2_table`; core auth unit tests | |
+| FR-S08 | in_progress | version token on every mutation; revocation immediate on the AMQP plane | `vhost_isolation_and_revocation` | live-connection close on principal deletion lands with the HTTP API |
 | FR-M05 | complete (partial evidence) | expiration property → 540 | `expiration_property_is_rejected` | |
 | FR-M06 | in_progress | priority preserved as property; FIFO scheduling | property roundtrip test | priority-queue args still 540 ✓ |
 | FR-PUB01 | complete (partial evidence) | publish+envelope on delivery | roundtrip tests | |
@@ -135,7 +138,8 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T08 | in_progress | `settlement_lapin.rs`: reject/nack/multiple/unknown-tag/recover flows |
 | T09 | complete (partial evidence) | `stress_lapin.rs::concurrent_publish_consume_no_loss_no_duplicates` (200 msgs, 4 publishers, 3 consumers, prefetch 7: exact-once totals, zero duplicates, credit bound held) + `shared_prefetch_limits_channel_not_consumers` |
 | T11 | in_progress | `unacked_redelivers_to_new_consumer_after_connection_loss` (connection-loss requeue) |
-| T10, T15–T22, T24–T30 | not_started | |
+| T10, T15–T20, T22, T24–T30 | not_started | |
+| T21 | in_progress | `auth_lapin.rs`: two users, §11.2 refusals, vhost isolation, revocation-on-live-connection |
 | T23 | complete (partial evidence) | storage backup tests: offline create + verify + restore into empty dir with state equivalence and post-restore appends; nonempty target refused; tampered backup fails verify |
 | T13 | complete (partial evidence) | `no_positive_confirm_when_journal_fsync_fails`: before-sync failpoint → confirm future errors (channel close 506), failpoint provably fired; storage-level `failpoint_before_sync_leaves_unfenced_tail` proves commit() never returns Ok without sync
 

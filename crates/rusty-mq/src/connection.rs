@@ -133,6 +133,9 @@ pub struct Connection {
     mailbox_tx: mpsc::Sender<Job>,
     /// Client declared the consumer_cancel_notify capability (§4.3).
     client_cancel_notify: bool,
+    /// Authenticated principal (set at start-ok; empty never — auth is
+    /// required before tune).
+    username: String,
     limits: ProtocolLimits,
     negotiated: Option<NegotiatedLimits>,
     phase: Phase,
@@ -162,6 +165,7 @@ impl Connection {
             awaiting_close_ok: HashMap::new(),
             mailbox_tx,
             client_cancel_notify: false,
+            username: String::new(),
             limits: ProtocolLimits::default(),
             negotiated: None,
             phase: Phase::AwaitStartOk,
@@ -449,6 +453,19 @@ impl Connection {
         }
         let user = String::from_utf8_lossy(parts[1]).to_string();
         let pass = String::from_utf8_lossy(parts[2]).to_string();
+        if !self.broker.authenticate(&user, &pass) {
+            tracing::warn!(user = %user, "authentication refused");
+            return self
+                .protocol_error(
+                    0,
+                    &ProtocolError::connection(
+                        reply_code::ACCESS_REFUSED,
+                        "ACCESS_REFUSED - login refused for user",
+                    ),
+                )
+                .await;
+        }
+        self.username = user.clone();
         // Extension capabilities the client declared (§4.3 gating).
         self.client_cancel_notify = start_ok
             .client_properties
@@ -464,20 +481,6 @@ impl Connection {
                     Some(amq_protocol::types::AMQPValue::Boolean(true))
                 )
             });
-        let expected = &self.broker.test_user;
-        if user != expected.username || pass != expected.password {
-            tracing::warn!(user = %user, "authentication refused");
-            return self
-                .protocol_error(
-                    0,
-                    &ProtocolError::connection(
-                        rusty_mq_protocol::error::reply_code::ACCESS_REFUSED,
-                        "ACCESS_REFUSED - login refused for user",
-                    ),
-                )
-                .await;
-        }
-
         // Offer server tune values; client tune-ok completes negotiation.
         let tune = connection::AMQPMethod::Tune(connection::Tune {
             channel_max: self.limits.max_channel_max,
@@ -544,6 +547,27 @@ impl Connection {
             let topo = self.broker.topology.lock().unwrap();
             topo.find_vhost(open.virtual_host.as_str())
         };
+        if vhost.is_some()
+            && !self
+                .broker
+                .auth
+                .lock()
+                .unwrap()
+                .may_access_vhost(&self.username, open.virtual_host.as_str())
+        {
+            return self
+                .protocol_error(
+                    0,
+                    &ProtocolError::connection(
+                        reply_code::ACCESS_REFUSED,
+                        format!(
+                            "ACCESS_REFUSED - user '{}' has no access to vhost '{}'",
+                            self.username, open.virtual_host
+                        ),
+                    ),
+                )
+                .await;
+        }
         if vhost.is_none() {
             return self
                 .protocol_error(
@@ -791,6 +815,46 @@ impl Connection {
     // is alive across an await (the future must stay Send).
     // ------------------------------------------------------------------
 
+    /// §11.2 permission check for this connection's authenticated user.
+    /// Err carries the 403 close; Ok(()) proceeds.
+    fn require_access(
+        &self,
+        vhost: VhostId,
+        vhost_name: &str,
+        access: rusty_mq_core::auth::Access,
+        resource: &str,
+        class_id: u16,
+        method_id: u16,
+    ) -> Result<(), ProtocolError> {
+        let allowed =
+            self.broker
+                .auth
+                .lock()
+                .unwrap()
+                .check(&self.username, vhost_name, access, resource);
+        if allowed {
+            Ok(())
+        } else {
+            Err(ProtocolError::channel(
+                reply_code::ACCESS_REFUSED,
+                format!(
+                    "ACCESS_REFUSED - {} access to '{resource}' refused for user '{}'",
+                    match access {
+                        rusty_mq_core::auth::Access::Configure => "configure",
+                        rusty_mq_core::auth::Access::Write => "write",
+                        rusty_mq_core::auth::Access::Read => "read",
+                    },
+                    self.username
+                ),
+                class_id,
+                method_id,
+            ))
+        }
+        .map(|_| {
+            let _ = vhost;
+        })
+    }
+
     /// Vhost bound at open; Running-phase handlers may assume it.
     fn vhost(&self) -> VhostId {
         self.vhost
@@ -1021,6 +1085,17 @@ impl Connection {
             };
         }
 
+        // Active declare: §11.2 configure on the named exchange.
+        if let Err(e) = self.require_access(
+            vhost,
+            "/",
+            rusty_mq_core::auth::Access::Configure,
+            d.exchange.as_str(),
+            CLASS,
+            method,
+        ) {
+            return self.protocol_error(channel_id, &e).await;
+        }
         // Active declare.
         let kind = match rusty_mq_core::routing::ExchangeType::from_wire_name(d.kind.as_str()) {
             Some(k) => k,
@@ -1095,6 +1170,17 @@ impl Connection {
         const CLASS: u16 = 40;
         let method = d.get_amqp_method_id();
         let vhost = self.vhost();
+        // §11.2: delete requires configure on the exchange.
+        if let Err(e) = self.require_access(
+            vhost,
+            "/",
+            rusty_mq_core::auth::Access::Configure,
+            d.exchange.as_str(),
+            CLASS,
+            method,
+        ) {
+            return self.protocol_error(channel_id, &e).await;
+        }
         let outcome: Result<(), ProtocolError> = {
             let mut topo = self.broker.topology.lock().unwrap();
             let found = topo.find_exchange(vhost, d.exchange.as_str());
@@ -1211,6 +1297,17 @@ impl Connection {
             };
         }
 
+        // Active declare: §11.2 configure on the queue name.
+        if let Err(e) = self.require_access(
+            vhost,
+            "/",
+            rusty_mq_core::auth::Access::Configure,
+            d.queue.as_str(),
+            CLASS,
+            method,
+        ) {
+            return self.protocol_error(channel_id, &e).await;
+        }
         // Active declare.
         let declared: Result<String, rusty_mq_core::topology::DeclareQueueError> = {
             let mut topo = self.broker.topology.lock().unwrap();
@@ -1320,7 +1417,19 @@ impl Connection {
                 };
                 return self.protocol_error(channel_id, &e).await;
             }
+            // §11.2: delete requires configure on the queue (computed in
+            // the outcome so the block's value carries the refusal).
             let id = owned.expect("checked above");
+            let access_denied = self
+                .require_access(
+                    vhost,
+                    "/",
+                    rusty_mq_core::auth::Access::Configure,
+                    &name,
+                    CLASS,
+                    method,
+                )
+                .err();
             // Real counts for the if_unused/if_empty conditions (FR-Q06)
             // and the delete-ok reply.
             let ready = self.broker.store.lock().unwrap().len(id);
@@ -1334,12 +1443,15 @@ impl Connection {
                 .is_some_and(|r| r.profile.durable);
             // Durable deletes commit to the journal BEFORE the live removal:
             // a failed commit leaves everything intact (§6.4).
+            let denied_error = access_denied;
             let journal_ok = !durable
                 || self
                     .broker
                     .journal_commit(&[rusty_mq_storage::Record::QueueDelete { id: id.to_raw() }])
                     .is_ok();
-            if !journal_ok {
+            if let Some(e) = denied_error {
+                Err(e)
+            } else if !journal_ok {
                 Err(ProtocolError::channel(
                     reply_code::RESOURCE_ERROR,
                     "RESOURCE_ERROR - durable journal commit failed",
@@ -1407,6 +1519,48 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
+        // §11.2: bind/unbind = write on the destination queue + read on the
+        // source exchange (names resolved in a guard-free prelude).
+        {
+            // Scoped: the guard ends on every path before any await.
+            let denied = {
+                let topo = self.broker.topology.lock().unwrap();
+                topo.find_queue(vhost, &queue_name)
+                    .zip(topo.find_exchange(vhost, d.exchange.as_str()))
+                    .and_then(|(q, e)| {
+                        let q_name = topo
+                            .queue_record(q)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        let ex_name = topo
+                            .exchange_record(e)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        self.require_access(
+                            vhost,
+                            "/",
+                            rusty_mq_core::auth::Access::Write,
+                            &q_name,
+                            CLASS,
+                            method,
+                        )
+                        .and_then(|()| {
+                            self.require_access(
+                                vhost,
+                                "/",
+                                rusty_mq_core::auth::Access::Read,
+                                &ex_name,
+                                CLASS,
+                                method,
+                            )
+                        })
+                        .err()
+                    })
+            };
+            if let Some(err) = denied {
+                return self.protocol_error(channel_id, &err).await;
+            }
+        }
         let outcome: Result<(), ProtocolError> = {
             let mut topo = self.broker.topology.lock().unwrap();
             let queue_id = topo.find_queue(vhost, &queue_name);
@@ -1478,6 +1632,48 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
+        // §11.2: bind/unbind = write on the destination queue + read on the
+        // source exchange (names resolved in a guard-free prelude).
+        {
+            // Scoped: the guard ends on every path before any await.
+            let denied = {
+                let topo = self.broker.topology.lock().unwrap();
+                topo.find_queue(vhost, &queue_name)
+                    .zip(topo.find_exchange(vhost, d.exchange.as_str()))
+                    .and_then(|(q, e)| {
+                        let q_name = topo
+                            .queue_record(q)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        let ex_name = topo
+                            .exchange_record(e)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        self.require_access(
+                            vhost,
+                            "/",
+                            rusty_mq_core::auth::Access::Write,
+                            &q_name,
+                            CLASS,
+                            method,
+                        )
+                        .and_then(|()| {
+                            self.require_access(
+                                vhost,
+                                "/",
+                                rusty_mq_core::auth::Access::Read,
+                                &ex_name,
+                                CLASS,
+                                method,
+                            )
+                        })
+                        .err()
+                    })
+            };
+            if let Some(err) = denied {
+                return self.protocol_error(channel_id, &err).await;
+            }
+        }
         let outcome: Result<(), ProtocolError> = {
             let mut topo = self.broker.topology.lock().unwrap();
             let queue_id = topo.find_queue(vhost, &queue_name);
@@ -1724,6 +1920,25 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         }
         let vhost = self.vhost();
+        // §11.2: publish requires write on the exchange; the default
+        // exchange normalizes to amq.default.
+        {
+            let perm_name = if d.exchange.as_str().is_empty() {
+                rusty_mq_core::auth::AuthState::DEFAULT_EXCHANGE_PERMISSION_NAME
+            } else {
+                d.exchange.as_str()
+            };
+            if let Err(e) = self.require_access(
+                vhost,
+                "/",
+                rusty_mq_core::auth::Access::Write,
+                perm_name,
+                CLASS,
+                d.get_amqp_method_id(),
+            ) {
+                return self.protocol_error(channel_id, &e).await;
+            }
+        }
         // FR-PUB03: publishing to a nonexistent exchange is a channel error.
         let exchange_check = {
             let topo = self.broker.topology.lock().unwrap();
@@ -2474,6 +2689,17 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
+        // §11.2: consume requires read on the queue.
+        if let Err(e) = self.require_access(
+            vhost,
+            "/",
+            rusty_mq_core::auth::Access::Read,
+            &name,
+            CLASS,
+            method,
+        ) {
+            return self.protocol_error(channel_id, &e).await;
+        }
         let prefetch = self
             .channels
             .get(&channel_id)

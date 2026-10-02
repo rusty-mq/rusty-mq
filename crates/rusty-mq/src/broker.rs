@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::consumers::{Consumers, Job};
+use rusty_mq_core::auth::{AuthState, Permissions, Principal, Role};
 use rusty_mq_core::store::MessageStore;
 use rusty_mq_core::topology::{CompatibilitySwitches, Topology};
 use rusty_mq_core::ConnectionId;
@@ -19,6 +20,35 @@ use rusty_mq_storage::{journal::JournalConfig, JournalWriter};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("journal commit failed")]
 pub struct JournalCommitError;
+
+/// Argon2id hash of a fresh password (PHC string with a random salt).
+pub fn argon2_hash(password: &str) -> Result<String, String> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use argon2::Argon2;
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Verify a password against a PHC string.
+fn argon2_verify(phc: &str, password: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+    PasswordHash::new(phc)
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+        .unwrap_or(false)
+}
+
+/// A precomputed PHC string for unknown-user dummy verifies (bounded cost,
+/// anti-enumeration timing; FR-S05). The password is unguessable and the
+/// hash is public-by-construction.
+const DUMMY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$cnVzdHktbXEtZHVtbXk$5vYjHSJlzlPmIGPQeVMAmNFaDXpoHkUqyEqHkwYF2/Q";
 
 /// The durable live state expressed as journal records (snapshot payload,
 /// §9.9 step 1): durable topology, bindings between durable endpoints,
@@ -144,6 +174,8 @@ pub struct Broker {
     last_fence_lsn: AtomicU64,
     /// Consumer registry (M3).
     pub consumers: Mutex<Consumers>,
+    /// Principals + permissions (M7); journaled in persistent mode.
+    pub auth: Mutex<AuthState>,
     /// M1: exactly one test user; M7 replaces this with durable principals.
     pub test_user: TestUser,
     connection_seq: AtomicU64,
@@ -153,7 +185,23 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(user: String, password: String) -> Self {
+        let mut auth = AuthState::new();
+        auth.upsert_principal(Principal {
+            username: user.clone(),
+            password_phc: format!("dev-plaintext:{}", password.clone()),
+            role: Role::Admin,
+        });
+        auth.set_permissions(
+            &user,
+            "/",
+            Permissions {
+                configure: ".*".into(),
+                write: ".*".into(),
+                read: ".*".into(),
+            },
+        );
         Self {
+            auth: Mutex::new(auth),
             data_dir: None,
             snapshot_generation: AtomicU64::new(0),
             compact_threshold: std::sync::atomic::AtomicU64::new(COMPACT_THRESHOLD_BYTES),
@@ -180,17 +228,150 @@ impl Broker {
         self.connection_seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Verify credentials for SASL PLAIN. Dev mode accepts the flagged
+    /// plaintext pair; persistent mode verifies Argon2id PHC strings.
+    /// Bounded-cost verify (FR-S05): Argon2id parameters are fixed by the
+    /// PHC string stored at creation; unknown users still pay a dummy
+    /// verify to avoid a user-enumeration timing signal.
+    pub fn authenticate(&self, username: &str, password: &str) -> bool {
+        let auth = self.auth.lock().unwrap();
+        match auth.principal(username) {
+            Some(principal) => {
+                if let Some(phc) = principal.password_phc.strip_prefix("dev-plaintext:") {
+                    return phc == password;
+                }
+                argon2_verify(&principal.password_phc, password)
+            }
+            None => {
+                // Dummy verify: constant-ish cost whether or not the user
+                // exists.
+                argon2_verify(DUMMY_PHC, password)
+            }
+        }
+    }
+
+    /// Journaled principal upsert; memory mode mutates only.
+    pub fn upsert_principal(
+        &self,
+        principal: Principal,
+        password_for_hash: Option<&str>,
+    ) -> Result<(), String> {
+        // Hash when a raw password is supplied (CLI admin path).
+        let principal = match password_for_hash {
+            Some(pw) => {
+                let phc = argon2_hash(pw).map_err(|e| e.to_string())?;
+                Principal {
+                    password_phc: phc,
+                    ..principal
+                }
+            }
+            None => principal,
+        };
+        let record = rusty_mq_storage::Record::PrincipalUpsert(rusty_mq_storage::PrincipalRecord {
+            username: principal.username.clone(),
+            password_phc: principal.password_phc.clone(),
+            role: principal.role.as_u8(),
+        });
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        self.auth.lock().unwrap().upsert_principal(principal);
+        Ok(())
+    }
+
+    /// Journaled permission set (also used at bootstrap).
+    pub fn set_permissions(
+        &self,
+        username: &str,
+        vhost: &str,
+        perms: Permissions,
+    ) -> Result<(), String> {
+        let record = rusty_mq_storage::Record::PermissionSet(rusty_mq_storage::PermissionRecord {
+            username: username.to_string(),
+            vhost: vhost.to_string(),
+            configure: perms.configure.clone(),
+            write: perms.write.clone(),
+            read: perms.read.clone(),
+        });
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        self.auth
+            .lock()
+            .unwrap()
+            .set_permissions(username, vhost, perms);
+        Ok(())
+    }
+
+    /// Journaled principal deletion (revocation; live connections are
+    /// closed by the caller when the HTTP API lands — FR-S08's full path).
+    pub fn delete_principal(&self, username: &str) -> Result<bool, String> {
+        let record = rusty_mq_storage::Record::PrincipalDelete {
+            username: username.to_string(),
+        };
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        Ok(self
+            .auth
+            .lock()
+            .unwrap()
+            .delete_principal(username)
+            .is_some())
+    }
+
     /// Open a persistent broker on a data directory: recover the journal
     /// into live state first (the journal is the only source of truth,
     /// ADR-0002), then open the writer for appends.
     pub fn open_persistent(user: String, password: String, data_dir: &std::path::Path) -> Self {
-        let (topology, store, projection, writer) =
+        let (topology, store, projection, writer, auth) =
             rusty_mq_storage::rebuild::open_persistent_with_projection(
                 data_dir,
                 MESSAGE_BYTE_BUDGET,
                 JournalConfig::default(),
             )
             .expect("recovery must succeed or startup must fail explicitly");
+        let mut auth = auth;
+        let mut writer = writer;
+        if auth.principal(&user).is_none() && auth.principal("admin").is_none() {
+            // First run bootstrap: the flagged credentials become the
+            // durable admin (clearly logged; rotatable via the CLI).
+            tracing::warn!(
+                user = %user,
+                "no durable principals found; bootstrapping the flagged credentials as admin"
+            );
+            let phc = argon2_hash(&password).expect("argon2 hashing is infallible in-process");
+            auth.upsert_principal(Principal {
+                username: user.clone(),
+                password_phc: phc,
+                role: Role::Admin,
+            });
+            auth.set_permissions(
+                &user,
+                "/",
+                Permissions {
+                    configure: ".*".into(),
+                    write: ".*".into(),
+                    read: ".*".into(),
+                },
+            );
+            // Persist the bootstrap before serving (direct commit; the
+            // broker isn't shared yet, ordering is construction-local).
+            let bootstrap = vec![
+                rusty_mq_storage::Record::PrincipalUpsert(rusty_mq_storage::PrincipalRecord {
+                    username: user.clone(),
+                    password_phc: auth.principal(&user).unwrap().password_phc.clone(),
+                    role: Role::Admin.as_u8(),
+                }),
+                rusty_mq_storage::Record::PermissionSet(rusty_mq_storage::PermissionRecord {
+                    username: user.clone(),
+                    vhost: "/".into(),
+                    configure: ".*".into(),
+                    write: ".*".into(),
+                    read: ".*".into(),
+                }),
+            ];
+            let fence = writer
+                .commit(&bootstrap)
+                .expect("bootstrap journal commit must succeed");
+            let _ = projection.apply(&bootstrap, fence).inspect_err(|e| {
+                tracing::warn!(error = %e, "bootstrap projection apply failed; will rebuild");
+            });
+        }
         tracing::info!(
             data_dir = %data_dir.display(),
             "recovered durable state (journal + projection)"
@@ -199,6 +380,7 @@ impl Broker {
             data_dir: Some(data_dir.to_path_buf()),
             snapshot_generation: AtomicU64::new(0),
             compact_threshold: std::sync::atomic::AtomicU64::new(COMPACT_THRESHOLD_BYTES),
+            auth: Mutex::new(auth),
             topology: Mutex::new(topology),
             store: Mutex::new(store),
             journal: Mutex::new(Some(writer)),
@@ -392,5 +574,18 @@ impl Broker {
         let jobs = consumers.cancel_notify_jobs(queue);
         consumers.deregister_queue(queue);
         jobs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argon2_roundtrip() {
+        let phc = argon2_hash("app-pass").unwrap();
+        assert!(phc.starts_with("$argon2id$"));
+        assert!(argon2_verify(&phc, "app-pass"), "correct password verifies");
+        assert!(!argon2_verify(&phc, "wrong"), "wrong password fails");
     }
 }

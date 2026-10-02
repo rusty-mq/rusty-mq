@@ -10,6 +10,8 @@ authors.workspace = true
 default-run = "rusty-mq"
 
 [dependencies]
+argon2 = { workspace = true }
+rand = { workspace = true }
 rusty-mq-protocol = { workspace = true }
 rusty-mq-core = { workspace = true }
 rusty-mq-storage = { workspace = true }

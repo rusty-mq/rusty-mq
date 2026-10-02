@@ -7,11 +7,13 @@
 //! M2 status: in-memory topology and routing are implemented; persistence
 //! arrives in M4 via `rusty-mq-storage`.
 
+pub mod auth;
 pub mod ids;
 pub mod routing;
 pub mod store;
 pub mod topology;
 
+pub use auth::{Access, AuthState, Permissions, Principal, Role};
 pub use ids::{ChannelGeneration, ConnectionId, ExchangeId, QueueId, VhostId};
 pub use routing::{route_message, ExchangeType};
 pub use store::{AdmitError, MessageStore, QueueEntry, StoredMessage};
