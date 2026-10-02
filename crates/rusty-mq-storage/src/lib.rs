@@ -13,6 +13,7 @@
 //! capability (PRD early safety constraint: an in-memory backend must never
 //! positively claim persistence).
 
+pub mod backup;
 pub mod journal;
 pub mod rebuild;
 pub mod record;

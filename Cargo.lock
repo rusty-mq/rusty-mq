@@ -1450,6 +1450,7 @@ dependencies = [
 name = "rusty-mq-storage"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "libc",
  "rusty-mq-core",
  "thiserror",
  "tracing",

@@ -55,7 +55,7 @@ tempfile = "3"
 futures-lite = "2"
 
 [workspace.lints.rust]
-unsafe_code = "forbid" # PRD §15.2: no unsafe in original protocol/core/storage logic
+unsafe_code = "deny" # PRD §15.2: no unsafe in original protocol/core/storage logic (single documented exception: storage liveness probe)
 
 [profile.release]
 lto = "thin"

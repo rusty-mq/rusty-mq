@@ -131,6 +131,22 @@ bytes exceed a ceiling; the capture uses try_lock, so a contended round
 defers to the next commit instead of deadlocking against callers that hold
 state locks across `journal_commit` (the persistent publish path).
 
+## Offline backup and the LOCK (§9.10, M6)
+
+`LOCK` holds the writer's pid (session state; never part of backups).
+Locking is cross-process: a live foreign pid refuses writer open and any
+backup/restore; a lock carrying the current process's pid is taken over
+(an aborted in-process writer cannot run Drop and restart must succeed —
+the documented same-process limitation until OS-level flock arrives); a
+stale lock (dead pid) is tolerated. PID reuse is a known limitation.
+
+`backup create` copies the recovery chain (segments, `snapshots/`,
+`MANIFEST`; `LOCK`/`MANIFEST.tmp` excluded) into a fresh output directory
+and refuses while a live writer holds the source. `backup verify` replays
+the copy through the real recovery fold — a backup that cannot be
+recovered is not valid. `backup restore` verifies first and refuses a
+nonempty target; it never merges or overwrites.
+
 ## Implementation status
 
 Writer, reader, broker wiring (durable declarations, persistent enqueue,

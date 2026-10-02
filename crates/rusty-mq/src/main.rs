@@ -38,6 +38,26 @@ enum Command {
         #[arg(long, default_value = "guest")]
         password: String,
     },
+    /// Offline backup of a stopped broker's data directory (§9.10).
+    BackupCreate {
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+        /// Output directory; must not exist.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify a backup is a complete, recoverable recovery root.
+    BackupVerify {
+        #[arg(long)]
+        input: std::path::PathBuf,
+    },
+    /// Restore a backup into an empty data directory.
+    BackupRestore {
+        #[arg(long)]
+        input: std::path::PathBuf,
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+    },
     /// Print version information.
     Version,
 }
@@ -73,6 +93,42 @@ fn main() {
             if let Err(e) = runtime.block_on(rusty_mq::server::serve(listen, broker)) {
                 tracing::error!("server failed: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::BackupCreate { data_dir, output } => {
+            match rusty_mq_storage::backup::create(&data_dir, &output) {
+                Ok(()) => println!(
+                    "backup created: {} (verify with `rusty-mq backup verify --input {}`)",
+                    output.display(),
+                    output.display()
+                ),
+                Err(e) => {
+                    eprintln!("backup create failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::BackupVerify { input } => match rusty_mq_storage::backup::verify(&input) {
+            Ok(summary) => println!(
+                "backup verified: {} records replayed, {} durable queues",
+                summary.replayed, summary.queues
+            ),
+            Err(e) => {
+                eprintln!("backup verify failed: {e}");
+                std::process::exit(1);
+            }
+        },
+        Command::BackupRestore { input, data_dir } => {
+            match rusty_mq_storage::backup::restore(&input, &data_dir) {
+                Ok(()) => println!(
+                    "restored into {} (start the broker with --data-dir {})",
+                    data_dir.display(),
+                    data_dir.display()
+                ),
+                Err(e) => {
+                    eprintln!("backup restore failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Version => {

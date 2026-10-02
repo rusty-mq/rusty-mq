@@ -120,11 +120,71 @@ pub struct JournalWriter {
     durable_lsn: u64,
 }
 
+/// Data-directory lock: the writer records its pid in `LOCK`; a live pid
+/// means an active writer (backups and restores must refuse); a stale LOCK
+/// (crashed writer, dead pid) is tolerated and taken over. PID reuse is a
+/// documented V1 limitation of this simple scheme.
+pub fn writer_lock_alive(dir: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(dir.join("LOCK")) else {
+        return false;
+    };
+    let Ok(pid) = content.trim().parse::<i32>() else {
+        return false; // unparseable lock: not evidence of a live writer
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // Own pid counts as alive for callers like backup: the writer is in
+    // THIS process. signal 0: pure liveness probe.
+    pid == std::process::id() as i32 || process_alive(pid)
+}
+
+/// Safety: `kill(pid, 0)` is a pure liveness probe — no signal is
+/// delivered; the only contract is a valid pid argument, which the caller
+/// checked. Narrowly scoped per PRD §15.2 (documented exception).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: i32) -> bool {
+    // Conservative fallback: assume alive (refuse rather than corrupt).
+    true
+}
+
+fn take_writer_lock(dir: &Path) -> Result<(), FormatError> {
+    // Single-writer enforcement is cross-process: a live FOREIGN pid holds
+    // the directory. A lock carrying our own pid is taken over — an
+    // aborted writer in this process cannot run Drop, and restart must
+    // succeed (documented limitation: same-process double-open is not
+    // distinguished; OS-level flock arrives with the multi-process work).
+    let own = std::process::id() as i32;
+    if let Ok(content) = fs::read_to_string(dir.join("LOCK")) {
+        if let Ok(pid) = content.trim().parse::<i32>() {
+            if pid != own && pid > 0 && process_alive(pid) {
+                return Err(FormatError::Io(
+                    "data directory is held by a live writer".into(),
+                ));
+            }
+        }
+    }
+    std::fs::write(dir.join("LOCK"), own.to_string())
+        .map_err(|e| FormatError::Io(e.to_string()))?;
+    Ok(())
+}
+
+fn release_writer_lock(dir: &Path) {
+    let _ = fs::remove_file(dir.join("LOCK"));
+}
+
 impl JournalWriter {
     /// Open (creating if absent) a journal directory. Fails explicitly on
     /// inconsistent storage; never initializes over a foreign layout.
     pub fn open(dir: &Path, config: JournalConfig) -> Result<Self, FormatError> {
         fs::create_dir_all(dir).map_err(io_err)?;
+        take_writer_lock(dir)?;
         // Validate any existing chain first.
         let chain = scan_segments(dir)?;
         let (segment_id, previous, next_lsn, tail_to_truncate) = match chain.last() {
@@ -292,6 +352,11 @@ impl JournalWriter {
         self.config.failpoint = fp;
     }
 
+    /// Release the data-directory lock (idempotent; also runs on Drop).
+    pub fn release_lock(&self) {
+        release_writer_lock(&self.dir);
+    }
+
     pub fn durable_lsn(&self) -> u64 {
         self.durable_lsn
     }
@@ -303,6 +368,14 @@ impl JournalWriter {
     /// Current segment id (reclaim keeps this one).
     pub fn current_segment_id(&self) -> u64 {
         self.segment_id
+    }
+}
+
+impl Drop for JournalWriter {
+    fn drop(&mut self) {
+        // Best effort: a crashed writer leaves a stale LOCK, tolerated by
+        // the next open (pid no longer alive).
+        release_writer_lock(&self.dir);
     }
 }
 
