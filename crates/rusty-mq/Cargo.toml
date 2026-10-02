@@ -26,11 +26,17 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
 
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 base64 = "0.22"
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 lapin = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }

@@ -17,8 +17,8 @@ use amq_protocol::frame::{AMQPContentHeader, AMQPFrame};
 use amq_protocol::protocol::basic::{self, parse_properties, AMQPProperties};
 use amq_protocol::protocol::{channel, connection, exchange, queue, AMQPClass};
 use amq_protocol::types::{FieldTable, LongString};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 use rusty_mq_core::store::{AdmitError, QueueEntry, StoredMessage};
@@ -150,18 +150,17 @@ pub struct Connection {
 
 impl Connection {
     /// Run a connection to completion. Never panics on socket errors.
-    pub async fn run(socket: tokio::net::TcpStream, broker: Arc<Broker>) {
-        let peer = socket
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".into());
+    pub async fn run<S>(socket: S, peer: String, broker: Arc<Broker>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let conn_id = broker.next_connection_id();
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
         // Consumer mailbox: bounded push-delivery queue (ADR-0004).
         let (mailbox_tx, mailbox_rx) = mpsc::channel::<Job>(CONSUMER_MAILBOX_CAP);
         // Control channel: alarm notifications (FR-R07), bounded.
         let (control_tx, control_rx) = mpsc::channel::<crate::broker::Control>(8);
-        let (read_half, write_half) = socket.into_split();
+        let (read_half, write_half) = tokio::io::split(socket);
 
         let writer = tokio::spawn(writer_task(write_half, outbound_rx));
 
@@ -231,7 +230,7 @@ impl Connection {
     /// mailbox jobs concurrently (heartbeats idle-detect the socket side).
     async fn drive(
         &mut self,
-        mut read: OwnedReadHalf,
+        mut read: ReadHalf<impl AsyncRead + AsyncWrite + Unpin>,
         mut mailbox: mpsc::Receiver<Job>,
         mut control: mpsc::Receiver<crate::broker::Control>,
     ) {
@@ -3308,7 +3307,10 @@ fn self_unregister(broker: &Arc<Broker>, id: ConnectionId) {
 }
 
 /// Writer task: sole owner of the socket write half (FR-P07, ADR-0003).
-async fn writer_task(mut write: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn writer_task(
+    mut write: WriteHalf<impl AsyncWrite + Unpin>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
     while let Some(bytes) = rx.recv().await {
         if write.write_all(&bytes).await.is_err() {
             break;

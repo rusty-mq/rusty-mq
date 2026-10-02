@@ -8,6 +8,7 @@ pub mod consumers;
 pub mod management_impl;
 pub mod metrics;
 pub mod server;
+pub mod tls;
 
 pub use broker::Broker;
 pub use rusty_mq_core::{Permissions, Principal, Role};

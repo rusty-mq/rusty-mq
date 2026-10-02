@@ -34,6 +34,13 @@ enum Command {
         /// Native HTTP management listener (§12.1; None disables).
         #[arg(long)]
         management_listen: Option<std::net::SocketAddr>,
+        /// TLS AMQP listener (FR-S02). Requires --tls-cert/--tls-key.
+        #[arg(long, requires_all = ["tls_cert", "tls_key"])]
+        tls_listen: Option<std::net::SocketAddr>,
+        #[arg(long, requires = "tls_listen")]
+        tls_cert: Option<std::path::PathBuf>,
+        #[arg(long, requires = "tls_listen")]
+        tls_key: Option<std::path::PathBuf>,
         /// Development username for SASL PLAIN (M1 test auth only).
         #[arg(long, default_value = "guest")]
         user: String,
@@ -78,6 +85,9 @@ fn main() {
             listen,
             data_dir,
             management_listen,
+            tls_listen,
+            tls_cert,
+            tls_key,
             user,
             password,
         } => {
@@ -110,6 +120,30 @@ fn main() {
                     if let Err(e) = axum::serve(listener, app).await {
                         tracing::error!("management server failed: {e}");
                     }
+                });
+            }
+            if let Some(tls_addr) = tls_listen {
+                let broker = broker.clone();
+                let acceptor = match rusty_mq::tls::load(
+                    tls_cert.as_ref().expect("clap requires"),
+                    tls_key.as_ref().expect("clap requires"),
+                ) {
+                    Ok(setup) => setup.acceptor,
+                    Err(e) => {
+                        eprintln!("TLS material error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                runtime.spawn(async move {
+                    let listener = match tokio::net::TcpListener::bind(tls_addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!("tls bind {tls_addr}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    tracing::info!(%tls_addr, "rusty-mq TLS listener up");
+                    rusty_mq::server::serve_tls_shared(listener, broker, acceptor).await;
                 });
             }
             if let Err(e) = runtime.block_on(rusty_mq::server::serve_shared(listen, broker)) {

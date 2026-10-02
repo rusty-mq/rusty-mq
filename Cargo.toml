@@ -45,6 +45,10 @@ regex = "1"
 # Native HTTP management API (§12.1; MIT OR Apache-2.0).
 axum = "0.8"
 serde_json = "1"
+# TLS listener (FR-S02; Apache-2.0/MIT/ISC family).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
@@ -60,6 +64,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Testing
 proptest = "1"
+rcgen = "0.13"
 tower = { version = "0.5", features = ["util"] }
 http = "1"
 http-body-util = "0.1"
