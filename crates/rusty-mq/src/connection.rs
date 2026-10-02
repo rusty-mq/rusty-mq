@@ -43,6 +43,10 @@ const CLOSE_LINGER: Duration = Duration::from_secs(5);
 /// Bounded consumer-delivery mailbox per connection (ADR-0004; a full
 /// mailbox requeues entries and stops scheduling to that consumer).
 const CONSUMER_MAILBOX_CAP: usize = 256;
+/// Outstanding unconfirmed publishes per channel (FR-PUB07 protective
+/// ceiling; exceeding it closes the channel with 506 rather than letting a
+/// publisher monopolize server bookkeeping).
+const MAX_PENDING_CONFIRMS: u64 = 10_000;
 
 /// Handshake phase of the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +79,13 @@ struct ChannelState {
     unacked: HashMap<u64, UnackedDelivery>,
     /// Consumer tags active on this channel (registry mirror).
     consumers: std::collections::HashSet<String>,
+    /// Confirm mode (confirm.select): publishes get sequenced confirms.
+    confirm_mode: bool,
+    /// Next publish sequence (confirm namespace, FR-C04: independent of
+    /// delivery tags).
+    publish_seq: u64,
+    /// Outstanding unconfirmed publishes (cap: FR-PUB07).
+    pending_confirms: u64,
     /// Prefetch applied to consumers created after a basic.qos(global=false)
     /// (§6.2 rule 2). None = unlimited.
     prefetch_new_consumers: Option<u16>,
@@ -88,6 +99,8 @@ struct InFlightPublish {
     property_bytes: Vec<u8>,
     persistent: bool,
     assembler: MessageAssembler,
+    /// Confirm sequence when the channel is in confirm mode (0 otherwise).
+    confirm_seq: u64,
 }
 
 /// Which terminal settlement a journal record represents.
@@ -326,10 +339,23 @@ impl Connection {
             "version".into(),
             amq_protocol::types::AMQPValue::LongString(env!("CARGO_PKG_VERSION").into()),
         );
-        // M1: no extension capabilities advertised (ADR-0005/§4.3).
+        // §4.3: only implemented and tested capabilities are advertised.
+        let mut caps = FieldTable::default();
+        caps.insert(
+            "publisher_confirms".into(),
+            amq_protocol::types::AMQPValue::Boolean(true),
+        );
+        caps.insert(
+            "basic.nack".into(),
+            amq_protocol::types::AMQPValue::Boolean(true),
+        );
+        caps.insert(
+            "consumer_cancel_notify".into(),
+            amq_protocol::types::AMQPValue::Boolean(true),
+        );
         props.insert(
             "capabilities".into(),
-            amq_protocol::types::AMQPValue::FieldTable(FieldTable::default()),
+            amq_protocol::types::AMQPValue::FieldTable(caps),
         );
         props.insert(
             "platform".into(),
@@ -597,6 +623,9 @@ impl Connection {
                         unacked: HashMap::new(),
                         consumers: std::collections::HashSet::new(),
                         prefetch_new_consumers: None,
+                        confirm_mode: false,
+                        publish_seq: 1,
+                        pending_confirms: 0,
                     },
                 );
                 let ok = channel::AMQPMethod::OpenOk(channel::OpenOk {});
@@ -677,6 +706,18 @@ impl Connection {
             }
             AMQPClass::Basic(basic::AMQPMethod::Recover(d)) => {
                 self.handle_basic_recover(channel_id, d).await
+            }
+            AMQPClass::Confirm(amq_protocol::protocol::confirm::AMQPMethod::Select(_d)) => {
+                // Confirm mode is per-channel (FR-PUB05).
+                if let Some(ch) = self.channels.get_mut(&channel_id) {
+                    ch.confirm_mode = true;
+                }
+                let ok = amq_protocol::protocol::confirm::AMQPMethod::SelectOk(
+                    amq_protocol::protocol::confirm::SelectOk {},
+                );
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Confirm(ok)))
+                    .await
+                    .is_ok()
             }
             AMQPClass::Channel(channel::AMQPMethod::Flow(d)) => {
                 self.handle_channel_flow(channel_id, d).await
@@ -1729,6 +1770,29 @@ impl Connection {
             .with_fatal();
             return self.protocol_error(channel_id, &e).await;
         }
+        if ch.pending_confirms >= MAX_PENDING_CONFIRMS {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                format!(
+                    "RESOURCE_ERROR - outstanding publisher confirms exceed the ceiling ({MAX_PENDING_CONFIRMS})"
+                ),
+                rusty_mq_protocol::error::class_id::BASIC,
+                40, // basic.publish
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
+        // Confirm-mode sequencing (FR-PUB05); the sequence is reserved at
+        // method time and resolved (ack/nack) when the publish completes or
+        // is rejected.
+        let confirm_seq = if ch.confirm_mode {
+            ch.pending_confirms += 1;
+            ch.publish_seq
+        } else {
+            0
+        };
+        if ch.confirm_mode {
+            ch.publish_seq += 1;
+        }
         ch.content = Some(InFlightPublish {
             exchange: d.exchange.as_str().to_string(),
             routing_key: d.routing_key.as_str().to_string(),
@@ -1736,6 +1800,7 @@ impl Connection {
             property_bytes: Vec::new(),
             persistent: false,
             assembler: MessageAssembler::new(self.limits.max_message_bytes),
+            confirm_seq,
         });
         true
     }
@@ -1763,12 +1828,16 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         if let Err(e) = inflight.assembler.start(header.class_id, header.body_size) {
-            return self.protocol_error(channel_id, &e).await;
+            let seq = inflight.confirm_seq;
+            return self.reject_publish(channel_id, seq, &e).await;
         }
         let (blob, persistent) =
             match Self::admit_properties(&header.properties, &self.broker.test_user.username, 60) {
                 Ok(x) => x,
-                Err(e) => return self.protocol_error(channel_id, &e).await,
+                Err(e) => {
+                    let seq = inflight.confirm_seq;
+                    return self.reject_publish(channel_id, seq, &e).await;
+                }
             };
         inflight.property_bytes = blob;
         inflight.persistent = persistent;
@@ -1928,11 +1997,57 @@ impl Connection {
 
         // FR-PUB02: mandatory + zero destinations returns the message.
         if destinations.is_empty() && inflight.mandatory {
-            return self
+            let sent = self
                 .send_return(channel_id, reply_code::NO_ROUTE, "NO_ROUTE", &message)
                 .await;
+            // The return serializes BEFORE the positive confirm (§6.3).
+            return sent
+                && self
+                    .emit_confirm(channel_id, inflight.confirm_seq, true)
+                    .await;
         }
-        true
+        // INV-01: the positive confirm is emitted only after every selected
+        // destination's admission completed — durable destinations already
+        // crossed the journal commit boundary above.
+        self.emit_confirm(channel_id, inflight.confirm_seq, true)
+            .await
+    }
+
+    /// A publish was rejected before admission: in confirm mode the
+    /// reserved sequence is nacked first (§6.4 "nack where safe"), then
+    /// the channel error closes as usual (outcomes for later publishes
+    /// are explicitly uncertain).
+    async fn reject_publish(&mut self, channel_id: u16, seq: u64, e: &ProtocolError) -> bool {
+        if seq != 0 {
+            let _ = self.emit_confirm(channel_id, seq, false).await;
+        }
+        self.protocol_error(channel_id, e).await
+    }
+
+    /// Emit a publisher confirm (basic.ack in the confirm namespace,
+    /// FR-C04) or nack; no-op outside confirm mode (seq 0).
+    async fn emit_confirm(&mut self, channel_id: u16, seq: u64, positive: bool) -> bool {
+        if seq == 0 {
+            return true;
+        }
+        if let Some(ch) = self.channels.get_mut(&channel_id) {
+            ch.pending_confirms = ch.pending_confirms.saturating_sub(1);
+        }
+        let method = if positive {
+            basic::AMQPMethod::Ack(basic::Ack {
+                delivery_tag: seq,
+                multiple: false,
+            })
+        } else {
+            basic::AMQPMethod::Nack(basic::Nack {
+                delivery_tag: seq,
+                multiple: false,
+                requeue: false,
+            })
+        };
+        self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(method)))
+            .await
+            .is_ok()
     }
 
     /// basic.return with the full message content (FR-PUB02).

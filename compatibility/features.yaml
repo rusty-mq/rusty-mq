@@ -11,10 +11,11 @@ features:
     requirement: FR-P01
     tests: ["framing unit tests", "T01 (lapin) partial"]
   publisher_confirms:
-    status: planned
+    status: in_progress
     target_release: "1.0"
     requirement: FR-PUB05
-    tests: []
+    tests: ["confirms_lapin.rs (select, ordering, return-before-confirm, nack-on-reject)"]
+    notes: "positive confirms emitted after admission; durable boundary wired via the M4 journal; failpoint matrix (T13) pending
   basic_nack:
     status: planned
     target_release: "1.0"

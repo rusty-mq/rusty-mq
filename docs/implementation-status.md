@@ -18,7 +18,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
 | M3 — delivery state | complete (partial evidence) | Full §6 surface lapin-verified: consume/get/cancel, ack/reject/nack (single+multiple, discard vs requeue), recover(requeue=true), prefetch per-consumer + shared, round-robin, auto-delete, cancel-notify, requeue on channel/connection loss; T09 stress proves no-loss/no-duplicate delivery under 4×50 concurrent publishes with 3 competing consumers and prefetch credit held. channel.flow is a documented flow-ok no-op (RabbitMQ-compatible) |
 | M4 — durable authority | in_progress | Journal engine + broker wiring complete: durable declares/deletes/binds/unbinds/purges commit before their replies; persistent publishes journal pre-assigned destination sequences under the store lock; terminal settlements journaled (INV-02); restart replays the journal into live topology+store with id stability and mint-bumping; `serve --data-dir` enables persistence (memory mode makes no persistence claim). lapin kill/restart round trip proves: topology + bindings survive, surviving set exactly {unacked-at-kill, ready, post-restart}, settled entries never resurrect. Remaining M4: delivery-attempt markers (§9.6, with M5 failpoints), redb projection |
-| M5 — confirms and failure safety | not_started | |
+| M5 — confirms and failure safety | in_progress | confirm.select/acks live: per-channel publish sequences (independent namespace, FR-C04), positive confirms after admission (INV-01 order: journal commit → live apply → confirm), FIFO confirm ordering, mandatory return serialized BEFORE the confirm, nack on header-time publish rejection, 10k pending-confirm ceiling, capabilities advertised (publisher_confirms/basic.nack/consumer_cancel_notify). Pending: delivery-attempt markers, failpoint crash matrix (T13/T14), disk-failure quiesce |
 | M6 — storage lifecycle | not_started | |
 | M7 — secure operations | not_started | |
 | M8 — migration and interoperability | not_started | |
@@ -81,6 +81,9 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-PUB02 | complete (partial evidence) | mandatory NO_ROUTE return + content | `mandatory_return_frame_level` | lapin surfaces returns only in confirm mode |
 | FR-PUB03 | complete (partial evidence) | nonexistent exchange → 404 at publish | exchange gate in publish handler | |
 | FR-PUB04 | complete (partial evidence) | immediate=true → 540 | gate in publish handler | |
+| FR-PUB05 | complete (partial evidence) | confirm.select/select-ok; per-channel sequences | `confirm_select_yields_positive_confirms` | |
+| FR-PUB06 | complete (partial evidence) | positive confirm after admission; durable boundary ordered before it (INV-01) | `confirms_arrive_in_publish_order` + M4 restart test (journaled messages recovered after confirm path) | failpoint proof of no-confirm-before-sync is the T13 pending item |
+| FR-PUB07 | in_progress | pending-confirm ceiling 10k/channel closes 506; outbound frames bounded by writer queue | unit-level ceiling only | slow-publisher interaction (blocked connections) pending |
 | FR-C02 | complete (partial evidence) | basic.get with get-ok/get-empty | all get-based tests | |
 | FR-C01 | complete (partial evidence) | consume/cancel/consume-ok/cancel-ok, server tags, exclusive consumers | `consume_lapin.rs`: push flow, `exclusive_consumer_conflict_is_403`, cancel in push test | |
 | FR-C02 | complete (partial evidence) | basic.get with get-ok/get-empty | all get-based tests | |
@@ -124,12 +127,13 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T04 | in_progress | `topology_lapin.rs` roundtrip + `publish_lapin.rs` routing matrix (direct/topic/fanout/default, INV-05) |
 | T05 | in_progress | `topology_lapin.rs`: equivalence, passive, generated names, exclusivity, reclaim |
 | T06 | in_progress | `publish_route_get_roundtrip_with_properties`: bit-identical bodies, typed headers/props |
-| T12 | in_progress | `mandatory_return_frame_level`: return-before-any-success, 312 NO_ROUTE |
+| T12 | complete (partial evidence) | `mandatory_return_frame_level` + `mandatory_unroutable_returns_then_confirms` (return serialized before the confirm, lapin-verified) |
 | T07 | in_progress | `consume_lapin.rs`: consume/cancel/no_ack/exclusive-consumer flows |
 | T08 | in_progress | `settlement_lapin.rs`: reject/nack/multiple/unknown-tag/recover flows |
 | T09 | complete (partial evidence) | `stress_lapin.rs::concurrent_publish_consume_no_loss_no_duplicates` (200 msgs, 4 publishers, 3 consumers, prefetch 7: exact-once totals, zero duplicates, credit bound held) + `shared_prefetch_limits_channel_not_consumers` |
 | T11 | in_progress | `unacked_redelivers_to_new_consumer_after_connection_loss` (connection-loss requeue) |
-| T10, T13–T30 | not_started | |
+| T10, T14–T30 | not_started | |
+| T13 | not_started | injected-sync-failure matrix: no positive confirm before successful fsync |
 
 ## Client-library findings (evidence-backed)
 
