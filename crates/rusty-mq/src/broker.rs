@@ -28,6 +28,12 @@ pub struct JournalCommitError;
 pub enum Control {
     Blocked(String),
     Unblocked,
+    /// Server-initiated connection.close (operator action or revocation,
+    /// FR-S08); the connection performs the close handshake then ends.
+    Close {
+        reply_code: u16,
+        reason: String,
+    },
 }
 
 /// A registered live connection (alarm fan-out target).
@@ -332,12 +338,17 @@ impl Broker {
             username: username.to_string(),
         };
         self.journal_commit(&[record]).map_err(|e| e.to_string())?;
-        Ok(self
+        let removed = self
             .auth
             .lock()
             .unwrap()
             .delete_principal(username)
-            .is_some())
+            .is_some();
+        if removed {
+            // FR-S08: revocation takes effect on the wire immediately.
+            self.close_connections_of(username);
+        }
+        Ok(removed)
     }
 
     /// Open a persistent broker on a data directory: recover the journal
@@ -571,6 +582,67 @@ impl Broker {
 
     pub fn unregister_connection(&self, id: ConnectionId) {
         self.live_connections.lock().unwrap().retain(|c| c.id != id);
+    }
+
+    /// Record the authenticated username once SASL PLAIN completes
+    /// (registration happens pre-auth).
+    pub fn set_connection_user(&self, id: ConnectionId, username: &str) {
+        if let Some(conn) = self
+            .live_connections
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c.id == id)
+        {
+            conn.username = username.to_string();
+        }
+    }
+
+    /// Snapshot live connections (id, username) for the management API.
+    pub fn list_connections(&self) -> Vec<(ConnectionId, String)> {
+        self.live_connections
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| (c.id, c.username.clone()))
+            .collect()
+    }
+
+    /// Server-initiated close of one connection (operator action). True
+    /// when a live connection accepted the command.
+    pub fn close_connection(&self, id: ConnectionId, reason: &str) -> bool {
+        let target = self
+            .live_connections
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.control.clone());
+        match target {
+            Some(control) => control
+                .try_send(Control::Close {
+                    reply_code: 320, // CONNECTION_FORCED
+                    reason: reason.to_string(),
+                })
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Close every live connection authenticated as `username` (FR-S08:
+    /// revocation takes effect on the wire, not just for new ops).
+    pub fn close_connections_of(&self, username: &str) {
+        let targets: Vec<ConnectionId> = self
+            .live_connections
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.username == username)
+            .map(|c| c.id)
+            .collect();
+        for id in targets {
+            self.close_connection(id, "credentials revoked");
+        }
     }
 
     /// Evaluate alarms and broadcast blocked/unblocked transitions to all

@@ -68,8 +68,74 @@ enum Command {
         #[arg(long)]
         data_dir: std::path::PathBuf,
     },
+    /// Admin subcommands against the native HTTP API (§13.1).
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+        /// Base URL of the management API.
+        #[arg(long, default_value = "http://127.0.0.1:15672")]
+        url: String,
+        #[arg(long, default_value = "admin")]
+        user: String,
+        /// From --password or RUSTY_MQ_ADMIN_PASSWORD (never logged).
+        #[arg(long)]
+        password: Option<String>,
+        /// Raw JSON output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print version information.
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    Status,
+    Users {
+        #[command(subcommand)]
+        action: Option<UsersAction>,
+    },
+    Permissions {
+        #[command(subcommand)]
+        action: Option<PermissionsAction>,
+    },
+    Queues {
+        #[arg(long, default_value = "/")]
+        vhost: String,
+    },
+    Connections,
+}
+
+#[derive(Debug, Subcommand)]
+enum UsersAction {
+    Create {
+        username: String,
+        password: String,
+        #[arg(default_value = "ordinary")]
+        role: String,
+    },
+    Delete {
+        username: String,
+    },
+    SetPassword {
+        username: String,
+        password: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PermissionsAction {
+    Set {
+        username: String,
+        vhost: String,
+        configure: String,
+        write: String,
+        read: String,
+    },
+    Delete {
+        username: String,
+        vhost: String,
+    },
 }
 
 fn main() {
@@ -187,6 +253,143 @@ fn main() {
                 }
             }
         }
+        Command::Admin {
+            command,
+            url,
+            user,
+            password,
+            json,
+        } => {
+            let password = password
+                .or_else(rusty_mq::admin_client::env_password)
+                .unwrap_or_default();
+            let creds = rusty_mq::admin_client::AdminCredentials { user, password };
+            let base = url.trim_end_matches('/').to_string();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(async move {
+                use rusty_mq::admin_client::request;
+                let outcome: Result<rusty_mq::admin_client::ApiResponse, String> = match command {
+                    AdminCommand::Status => request(&base, "GET", "/v1/status", &creds, None).await,
+                    AdminCommand::Connections => {
+                        request(&base, "GET", "/v1/connections", &creds, None).await
+                    }
+                    AdminCommand::Queues { vhost } => {
+                        let path = format!("/v1/vhosts/{}/queues", urlencode(&vhost));
+                        request(&base, "GET", &path, &creds, None).await
+                    }
+                    AdminCommand::Users { action: None } => {
+                        request(&base, "GET", "/v1/users", &creds, None).await
+                    }
+                    AdminCommand::Users {
+                        action:
+                            Some(UsersAction::Create {
+                                username,
+                                password,
+                                role,
+                            }),
+                    } => {
+                        request(
+                            &base,
+                            "POST",
+                            "/v1/users",
+                            &creds,
+                            Some(&serde_json::json!({
+                                "username": username, "password": password, "role": role
+                            })),
+                        )
+                        .await
+                    }
+                    AdminCommand::Users {
+                        action: Some(UsersAction::Delete { username }),
+                    } => {
+                        let path = format!("/v1/users/{}", urlencode(&username));
+                        request(&base, "DELETE", &path, &creds, None).await
+                    }
+                    AdminCommand::Users {
+                        action: Some(UsersAction::SetPassword { username, password }),
+                    } => {
+                        let path = format!("/v1/users/{}/credentials", urlencode(&username));
+                        request(
+                            &base,
+                            "PUT",
+                            &path,
+                            &creds,
+                            Some(&serde_json::json!({ "password": password })),
+                        )
+                        .await
+                    }
+                    AdminCommand::Permissions { action: None } => {
+                        request(&base, "GET", "/v1/permissions", &creds, None).await
+                    }
+                    AdminCommand::Permissions {
+                        action:
+                            Some(PermissionsAction::Set {
+                                username,
+                                vhost,
+                                configure,
+                                write,
+                                read,
+                            }),
+                    } => {
+                        let path = format!(
+                            "/v1/permissions/{}/{}",
+                            urlencode(&username),
+                            urlencode(&vhost)
+                        );
+                        request(
+                            &base,
+                            "PUT",
+                            &path,
+                            &creds,
+                            Some(&serde_json::json!({
+                                "configure": configure, "write": write, "read": read
+                            })),
+                        )
+                        .await
+                    }
+                    AdminCommand::Permissions {
+                        action: Some(PermissionsAction::Delete { username, vhost }),
+                    } => {
+                        let path = format!(
+                            "/v1/permissions/{}/{}",
+                            urlencode(&username),
+                            urlencode(&vhost)
+                        );
+                        request(&base, "DELETE", &path, &creds, None).await
+                    }
+                };
+                match outcome {
+                    Ok(resp) => {
+                        if json {
+                            println!("{}", resp.body.trim());
+                        } else {
+                            // Human rendering: pretty-print JSON for now;
+                            // tabular views arrive with the report polish.
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.body) {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&v).unwrap_or_default()
+                                );
+                            } else if !resp.body.trim().is_empty() {
+                                println!("{}", resp.body.trim());
+                            } else {
+                                println!("OK ({})", resp.status);
+                            }
+                        }
+                        if resp.status >= 400 {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("admin command failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
         Command::Version => {
             println!("rusty-mq {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -195,4 +398,18 @@ fn main() {
             );
         }
     }
+}
+
+/// Percent-encode a path segment (vhost names contain '/').
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

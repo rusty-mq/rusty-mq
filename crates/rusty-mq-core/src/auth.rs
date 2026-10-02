@@ -99,6 +99,17 @@ impl AuthState {
         names.into_iter()
     }
 
+    /// All permission rows (management listings; sorted for stability).
+    pub fn all_permissions(&self) -> Vec<(String, String, Permissions)> {
+        let mut rows: Vec<_> = self
+            .permissions
+            .iter()
+            .map(|((u, v), p)| (u.clone(), v.clone(), p.clone()))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        rows
+    }
+
     /// Direct permissions read (management listings).
     pub fn get_permissions(&self, username: &str, vhost: &str) -> Option<Permissions> {
         self.permissions

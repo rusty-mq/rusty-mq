@@ -63,6 +63,19 @@ macro_rules! simple_id {
 }
 
 simple_id!(ConnectionId, "conn:");
+
+impl ConnectionId {
+    /// Reconstruct from the registry's wire form (management API round
+    /// trip; the numeric value under the display prefix).
+    pub fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+
+    /// The numeric form the management API uses as the connection id.
+    pub fn to_raw(self) -> u64 {
+        self.0
+    }
+}
 simple_id!(VhostId, "vh:");
 simple_id!(ExchangeId, "ex:");
 simple_id!(QueueId, "q:");

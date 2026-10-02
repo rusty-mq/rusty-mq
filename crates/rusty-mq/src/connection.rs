@@ -496,6 +496,7 @@ impl Connection {
                 .await;
         }
         self.username = user.clone();
+        self.broker.set_connection_user(self.conn_id, &user);
         // Extension capabilities the client declared (§4.3 gating).
         self.client_blocking = start_ok
             .client_properties
@@ -3033,21 +3034,39 @@ impl Connection {
     /// FR-R07: emit connection.blocked/unblocked when the client declared
     /// the capability (§4.3 gating; we advertise it since this run).
     async fn handle_control(&mut self, msg: crate::broker::Control) -> bool {
-        if !self.client_blocking {
-            return true; // capability not declared: nothing to send
-        }
         use crate::broker::Control;
-        let method = match &msg {
-            Control::Blocked(reason) => connection::AMQPMethod::Blocked(connection::Blocked {
-                reason: reason.as_str().into(),
-            }),
-            Control::Unblocked => connection::AMQPMethod::Unblocked(connection::Unblocked {}),
-        };
-        // Blocked goes on channel 0; the client is expected to pause
-        // publishing (the broker has already gated admissions).
-        self.send(AMQPFrame::Method(0, AMQPClass::Connection(method)))
-            .await
-            .is_ok()
+        match &msg {
+            Control::Blocked(reason) => {
+                // §4.3: blocked/unblocked only for capability-declaring
+                // clients; close is always delivered.
+                if !self.client_blocking {
+                    return true;
+                }
+                let blocked = connection::AMQPMethod::Blocked(connection::Blocked {
+                    reason: reason.as_str().into(),
+                });
+                self.send(AMQPFrame::Method(0, AMQPClass::Connection(blocked)))
+                    .await
+                    .is_ok()
+            }
+            Control::Unblocked => {
+                if !self.client_blocking {
+                    return true;
+                }
+                let unblocked = connection::AMQPMethod::Unblocked(connection::Unblocked {});
+                self.send(AMQPFrame::Method(0, AMQPClass::Connection(unblocked)))
+                    .await
+                    .is_ok()
+            }
+            Control::Close { reply_code, reason } => {
+                // Server-initiated close: emit connection.close and linger
+                // briefly for the client's close-ok, then end.
+                self.protocol_error(0, &ProtocolError::connection(*reply_code, reason.clone()))
+                    .await;
+                self.phase = Phase::Closing;
+                true
+            }
+        }
     }
 
     /// Handle a job from this connection's consumer mailbox.

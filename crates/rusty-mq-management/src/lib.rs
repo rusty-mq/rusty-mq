@@ -59,12 +59,15 @@ pub fn router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Router {
         .route("/v1/users", get(list_users).post(create_user))
         .route("/v1/users/{username}/credentials", put(rotate_credentials))
         .route("/v1/users/{username}", delete(delete_user))
+        .route("/v1/permissions", get(list_permissions))
         .route(
             "/v1/permissions/{username}/{vhost}",
             get(get_permissions)
                 .put(put_permissions)
                 .delete(delete_permissions),
         )
+        .route("/v1/connections", get(list_connections))
+        .route("/v1/connections/{id}/close", post(close_connection))
         .with_state(std::sync::Arc::new(broker))
 }
 
@@ -474,6 +477,59 @@ async fn delete_permissions<B: crate::broker_facade::BrokerHandle>(
             "no permissions for that user/vhost",
         ),
         Err(e) => status(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+    }
+}
+
+async fn list_permissions<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+        return e;
+    }
+    Json(json!({ "permissions": broker.list_permissions() })).into_response()
+}
+
+async fn list_connections<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
+        return e;
+    }
+    let rows: Vec<_> = broker
+        .list_connections()
+        .into_iter()
+        .map(|(id, user)| json!({ "id": id, "username": user }))
+        .collect();
+    Json(json!({ "connections": rows })).into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct CloseBody {
+    reason: Option<String>,
+}
+
+async fn close_connection<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<CloseBody>>,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+        return e;
+    }
+    let reason = body
+        .and_then(|b| b.reason.clone())
+        .unwrap_or_else(|| "closed by operator".into());
+    if broker.close_connection(&id, &reason) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        status(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such live connection",
+        )
     }
 }
 

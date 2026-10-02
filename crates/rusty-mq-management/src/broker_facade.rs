@@ -32,6 +32,12 @@ pub trait BrokerHandle: Send + Sync + 'static {
         perms: Permissions,
     ) -> Result<(), String>;
     fn delete_permissions(&self, username: &str, vhost: &str) -> Result<bool, String>;
+    /// Live connections as (id-string, username).
+    fn list_connections(&self) -> Vec<(String, String)>;
+    /// Server-initiated close; false when no such live connection.
+    fn close_connection(&self, id: &str, reason: &str) -> bool;
+    /// All permission rows as JSON objects.
+    fn list_permissions(&self) -> Vec<serde_json::Value>;
 }
 
 impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
@@ -87,5 +93,14 @@ impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
     }
     fn delete_permissions(&self, username: &str, vhost: &str) -> Result<bool, String> {
         (**self).delete_permissions(username, vhost)
+    }
+    fn list_connections(&self) -> Vec<(String, String)> {
+        (**self).list_connections()
+    }
+    fn close_connection(&self, id: &str, reason: &str) -> bool {
+        (**self).close_connection(id, reason)
+    }
+    fn list_permissions(&self) -> Vec<serde_json::Value> {
+        (**self).list_permissions()
     }
 }

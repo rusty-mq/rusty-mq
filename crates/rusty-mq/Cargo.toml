@@ -24,6 +24,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
 axum = { workspace = true }
+base64 = "0.22"
 serde_json = { workspace = true }
 
 rustls-pemfile = { workspace = true }

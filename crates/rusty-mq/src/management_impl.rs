@@ -203,6 +203,38 @@ impl BrokerHandle for Broker {
         Broker::set_permissions(self, username, vhost, perms)
     }
 
+    fn list_connections(&self) -> Vec<(String, String)> {
+        Broker::list_connections(self)
+            .into_iter()
+            .map(|(id, user)| (id.to_raw().to_string(), user))
+            .collect()
+    }
+
+    fn close_connection(&self, id: &str, reason: &str) -> bool {
+        let Ok(parsed) = id.parse::<u64>() else {
+            return false;
+        };
+        Broker::close_connection(self, rusty_mq_core::ConnectionId::from_raw(parsed), reason)
+    }
+
+    fn list_permissions(&self) -> Vec<serde_json::Value> {
+        self.auth
+            .lock()
+            .unwrap()
+            .all_permissions()
+            .into_iter()
+            .map(|(user, vhost, p)| {
+                serde_json::json!({
+                    "username": user,
+                    "vhost": vhost,
+                    "configure": p.configure,
+                    "write": p.write,
+                    "read": p.read,
+                })
+            })
+            .collect()
+    }
+
     fn delete_permissions(&self, username: &str, vhost: &str) -> Result<bool, String> {
         let removed = self
             .auth
