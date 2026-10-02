@@ -17,7 +17,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
 | M3 — delivery state | complete (partial evidence) | Full §6 surface lapin-verified: consume/get/cancel, ack/reject/nack (single+multiple, discard vs requeue), recover(requeue=true), prefetch per-consumer + shared, round-robin, auto-delete, cancel-notify, requeue on channel/connection loss; T09 stress proves no-loss/no-duplicate delivery under 4×50 concurrent publishes with 3 competing consumers and prefetch credit held. channel.flow is a documented flow-ok no-op (RabbitMQ-compatible) |
-| M4 — durable authority | not_started | Storage crate scaffold only |
+| M4 — durable authority | in_progress | Journal engine landed and unit-tested in rusty-mq-storage: segment format v1 (magic/versions/chain links), record model with hand-rolled versioned encoding, CRC-verified commit fences, torn-tail discard, explicit corruption/chain-break failures, segment rolling, fsync-gated durable watermark, failpoint hooks. Broker wiring (durable declarations, persistent enqueue, restart replay) is the next slice — the broker remains memory-backed until then |
 | M5 — confirms and failure safety | not_started | |
 | M6 — storage lifecycle | not_started | |
 | M7 — secure operations | not_started | |
@@ -93,6 +93,17 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-C09 | complete (partial evidence) | round-robin fair scheduling | `round_robin_across_two_consumers`; registry unit test | |
 | FR-Q05 | complete (partial evidence) | auto-delete after last consumer only if it had one | `auto_delete_queue_dies_after_last_consumer` | |
 | FR-Q09 | complete (partial evidence) | cancel-notify on queue delete, capability-gated | `queue_delete_cancels_consumers` (lapin declares the capability) | not yet advertised in server capabilities |
+
+### Storage (§9, M4)
+
+| Item | Status | Implementation | Evidence |
+| --- | --- | --- | --- |
+| Format spec | complete | `docs/storage-format.md` (segments, records, fences, CRC, sync rules) | spec matches implementation |
+| Record model/encoding | complete (partial evidence) | `record.rs` (topology/enqueue/settlement/purge, explicit LE encoding) | roundtrip + truncation + unknown-kind unit tests |
+| Writer | complete (partial evidence) | `journal.rs` (LSN assignment, segment rolling + dir sync, commit() = fsync boundary, durable watermark) | roundtrip, rolling, reopen-after-restart tests |
+| Recovery | complete (partial evidence) | `recover()` (chain validation, checksum verify, committed-only visibility, torn-tail discard) | torn-tail, checksum-corruption, chain-break, foreign-magic tests |
+| Failpoints | complete (partial evidence) | injectable hooks (before-append/before-sync/after-sync) | `failpoint_before_sync_leaves_unfenced_tail` (commit() never returns Ok without sync) |
+| Broker wiring | not_started | | durable declarations + persistent enqueue + restart replay (next slice) |
 
 ### Security (§11), management (§12), CLI/config (§13)
 
@@ -171,6 +182,13 @@ durable+exclusive and durable+auto-delete queue profiles) is enforced from M2
 onward as each method path lands.
 
 ## Standing TODOs (honest open items)
+
+1. Journal group-commit batching (2 ms/1 MiB triggers) is not yet in the
+   writer API — `commit()` fsyncs immediately (correct, unsophisticated);
+   batching lands with broker wiring when confirms arrive (M5).
+2. The torn tail is logically discarded on recovery but not physically
+   truncated; the next writer append after recovery would overlap it —
+   the wiring slice must truncate to the last intact record on open.
 
 1. Pin the RabbitMQ reference release container digest in
    `compatibility/baseline.yaml` (requires first CI runner with container

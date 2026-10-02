@@ -13,9 +13,13 @@
 //! capability (PRD early safety constraint: an in-memory backend must never
 //! positively claim persistence).
 
-/// Marker for the current on-disk format major version (to be assigned when
-/// the journal format is implemented; refusal of unknown majors is required).
-pub const FORMAT_MAJOR: u32 = 0;
+pub mod journal;
+pub mod record;
+
+pub use journal::{
+    recover, JournalConfig, JournalWriter, RecoveredRecord, FORMAT_MAJOR, FORMAT_MINOR,
+};
+pub use record::{Binding, Enqueue, ExchangeRecord, FormatError, QueueRecord, Record};
 
 /// Reasons durable operations are refused before M4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
