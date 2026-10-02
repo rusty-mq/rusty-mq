@@ -120,6 +120,9 @@ pub fn rebuild(
             Record::SettleAck { queue, seq } | Record::SettleDiscard { queue, seq } => {
                 store.discard(QueueId::from_raw(queue), seq);
             }
+            Record::Delivered { queue, seq } => {
+                store.mark_redelivered(QueueId::from_raw(queue), seq);
+            }
             Record::Purge { queue, seqs } => {
                 for seq in seqs {
                     store.discard(QueueId::from_raw(queue), seq);

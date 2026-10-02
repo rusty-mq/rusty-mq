@@ -58,7 +58,8 @@ commit-fence record in the same segment:
 | 0x15 | `Unbind` | payload: binding identity |
 | 0x20 | `Enqueue` | payload: message + destination set (§9.4: stable queue ids + sequences, never names) |
 | 0x21 | `SettleAck` | terminal positive settlement of a queue entry |
-| 0x22 | `SettleDiscard` | terminal discard (reject/nack without requeue) |
+| 0x22 | `SettleDiscard` | terminal discard (reject/nack without requeue; also the no-ack terminal dequeue, journaled before exposure §9.6) |
+| 0x23 | `Delivered` | delivery-attempt marker: entry exposed to a manual-ack consumer; recovery restores it with the conservative redelivered hint |
 | 0x30 | `Purge` | payload: queue id + explicit list of purged entry sequences |
 | 0xF1 | `EndMarker` | clean-shutdown marker |
 

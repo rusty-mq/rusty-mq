@@ -93,6 +93,16 @@ impl MessageStore {
             .map_or(0, |q| q.entries.len() as u64)
     }
 
+    /// Mark a stored entry as previously delivered (conservative
+    /// redelivery hint; §9.6). No-op when the entry is absent.
+    pub fn mark_redelivered(&mut self, queue: QueueId, seq: u64) {
+        if let Some(q) = self.queues.get_mut(&queue) {
+            if let Some(e) = q.entries.iter_mut().find(|e| e.seq == seq) {
+                e.message.redelivered = true;
+            }
+        }
+    }
+
     /// Sequences of the current ready set (purge records must name the
     /// exact set selected at the ordering point — §9.4).
     pub fn ready_seqs(&self, queue: QueueId) -> Vec<u64> {

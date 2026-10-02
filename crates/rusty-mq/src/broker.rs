@@ -119,6 +119,18 @@ impl Broker {
         }
     }
 
+    /// Install a journal failpoint (test-only; T13/T14). No-op in memory
+    /// mode.
+    #[doc(hidden)]
+    pub fn set_journal_failpoint(
+        &self,
+        fp: Option<std::sync::Arc<rusty_mq_storage::journal::Failpoint>>,
+    ) {
+        if let Some(writer) = self.journal.lock().unwrap().as_mut() {
+            writer.set_failpoint(fp);
+        }
+    }
+
     /// Whether the journal is active (persistence claims are possible).
     pub fn is_persistent(&self) -> bool {
         self.journal.lock().unwrap().is_some()

@@ -16,6 +16,7 @@ pub mod kind {
     pub const ENQUEUE: u8 = 0x20;
     pub const SETTLE_ACK: u8 = 0x21;
     pub const SETTLE_DISCARD: u8 = 0x22;
+    pub const DELIVERED: u8 = 0x23;
     pub const PURGE: u8 = 0x30;
     pub const END_MARKER: u8 = 0xF1;
 }
@@ -24,15 +25,35 @@ pub mod kind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     QueueDeclare(QueueRecord),
-    QueueDelete { id: u64 },
+    QueueDelete {
+        id: u64,
+    },
     ExchangeDeclare(ExchangeRecord),
-    ExchangeDelete { id: u64 },
+    ExchangeDelete {
+        id: u64,
+    },
     Bind(Binding),
     Unbind(Binding),
     Enqueue(Enqueue),
-    SettleAck { queue: u64, seq: u64 },
-    SettleDiscard { queue: u64, seq: u64 },
-    Purge { queue: u64, seqs: Vec<u64> },
+    SettleAck {
+        queue: u64,
+        seq: u64,
+    },
+    SettleDiscard {
+        queue: u64,
+        seq: u64,
+    },
+    /// Delivery-attempt marker: the entry was (or is about to be) exposed
+    /// to a manual-ack consumer; recovery restores it with the
+    /// conservative redelivered hint (§9.6).
+    Delivered {
+        queue: u64,
+        seq: u64,
+    },
+    Purge {
+        queue: u64,
+        seqs: Vec<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +111,7 @@ impl Record {
             Record::Enqueue(_) => kind::ENQUEUE,
             Record::SettleAck { .. } => kind::SETTLE_ACK,
             Record::SettleDiscard { .. } => kind::SETTLE_DISCARD,
+            Record::Delivered { .. } => kind::DELIVERED,
             Record::Purge { .. } => kind::PURGE,
         }
     }
@@ -134,7 +156,9 @@ impl Record {
                     b.u64(*s);
                 }
             }
-            Record::SettleAck { queue, seq } | Record::SettleDiscard { queue, seq } => {
+            Record::SettleAck { queue, seq }
+            | Record::SettleDiscard { queue, seq }
+            | Record::Delivered { queue, seq } => {
                 b.u64(*queue);
                 b.u64(*seq);
             }
@@ -226,6 +250,11 @@ impl Record {
                 let queue = r.u64()?;
                 let seq = r.u64()?;
                 Record::SettleDiscard { queue, seq }
+            }
+            kind::DELIVERED => {
+                let queue = r.u64()?;
+                let seq = r.u64()?;
+                Record::Delivered { queue, seq }
             }
             kind::PURGE => {
                 let queue = r.u64()?;

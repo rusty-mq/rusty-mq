@@ -287,6 +287,11 @@ impl JournalWriter {
         Ok(())
     }
 
+    /// Replace the failpoint hook (test-only; T13/T14 evidence).
+    pub fn set_failpoint(&mut self, fp: Option<std::sync::Arc<Failpoint>>) {
+        self.config.failpoint = fp;
+    }
+
     pub fn durable_lsn(&self) -> u64 {
         self.durable_lsn
     }

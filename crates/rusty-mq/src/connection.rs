@@ -2139,7 +2139,7 @@ impl Connection {
         };
         let vhost = self.vhost();
         // Resolve queue + exclusivity, then pop one entry.
-        let outcome: Result<Option<(QueueEntry, u64)>, ProtocolError> = {
+        let outcome: Result<Option<(QueueEntry, QueueId, u64)>, ProtocolError> = {
             let topo = self.broker.topology.lock().unwrap();
             let found = topo.find_queue(vhost, &name);
             match found {
@@ -2168,7 +2168,7 @@ impl Connection {
                     let remaining = store.len(id);
                     Ok(store
                         .pop_ready(id)
-                        .map(|e| (e, remaining.saturating_sub(1))))
+                        .map(|e| (e, id, remaining.saturating_sub(1))))
                 }
             }
         };
@@ -2182,9 +2182,17 @@ impl Connection {
                     .await
                     .is_ok();
             }
-            Ok(Some((entry, remaining))) => (entry, remaining),
+            Ok(Some(x)) => x,
         };
-        let (entry, remaining) = entry;
+        let (entry, queue_id, remaining) = entry;
+
+        // §9.6: journal-before-exposure gate for the polling path.
+        if !self
+            .journal_before_delivery(queue_id, &entry, d.no_ack)
+            .await
+        {
+            return true;
+        }
 
         let delivery_tag = if d.no_ack {
             // Settled at delivery (§9.6 no-ack boundary, memory-backed form).
@@ -2646,6 +2654,71 @@ impl Connection {
             .is_ok()
     }
 
+    /// §9.6 journal-before-exposure gate for consumer deliveries of
+    /// persistent entries in durable queues.
+    ///
+    /// Manual-ack: journal a `Delivered` marker (conservative redelivery
+    /// hint after a crash; a marker without a delivery is permitted).
+    ///
+    /// No-ack: journal the terminal dequeue BEFORE the delivery is handed
+    /// to the connection writer (the entry is then settled even if the
+    /// socket write fails — deliberately outside at-least-once).
+    /// Returns false when the journal failed: the entry is requeued and NOT
+    /// delivered (never a fabricated outcome).
+    async fn journal_before_delivery(
+        &mut self,
+        queue: QueueId,
+        entry: &rusty_mq_core::store::QueueEntry,
+        no_ack: bool,
+    ) -> bool {
+        if !entry.message.persistent {
+            return true;
+        }
+        let durable = self
+            .broker
+            .topology
+            .lock()
+            .unwrap()
+            .queue_record(queue)
+            .is_some_and(|r| r.profile.durable);
+        if !durable {
+            return true;
+        }
+        let record = if no_ack {
+            rusty_mq_storage::Record::SettleDiscard {
+                queue: queue.to_raw(),
+                seq: entry.seq,
+            }
+        } else {
+            rusty_mq_storage::Record::Delivered {
+                queue: queue.to_raw(),
+                seq: entry.seq,
+            }
+        };
+        if self.broker.journal_commit(&[record]).is_err() {
+            tracing::error!(
+                queue = ?queue,
+                seq = entry.seq,
+                "delivery journal gate failed; entry requeued, not delivered"
+            );
+            self.broker
+                .store
+                .lock()
+                .unwrap()
+                .requeue(queue, entry.clone());
+            return false;
+        }
+        // Reflect the conservative hint in live state too.
+        if !no_ack {
+            self.broker
+                .store
+                .lock()
+                .unwrap()
+                .mark_redelivered(queue, entry.seq);
+        }
+        true
+    }
+
     /// Handle a job from this connection's consumer mailbox.
     async fn handle_job(&mut self, job: Job) -> bool {
         match job {
@@ -2669,13 +2742,17 @@ impl Connection {
                     self.broker.dispatch_queue(queue);
                     return true;
                 }
+                // §9.6: the durable boundary precedes exposure.
+                if !self.journal_before_delivery(queue, &entry, no_ack).await {
+                    return true;
+                }
                 let mut delivery_tag = 0;
                 if let Some(ch) = self.channels.get_mut(&job_channel) {
                     delivery_tag = ch.next_delivery_tag;
                     ch.next_delivery_tag += 1;
                     if !no_ack {
-                        // no-ack deliveries settle at pop (§9.6); only
-                        // manual-ack deliveries join the unacked set.
+                        // no-ack deliveries settle at pop; only manual-ack
+                        // deliveries join the unacked set.
                         ch.unacked.insert(
                             delivery_tag,
                             UnackedDelivery {

@@ -18,7 +18,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
 | M3 — delivery state | complete (partial evidence) | Full §6 surface lapin-verified: consume/get/cancel, ack/reject/nack (single+multiple, discard vs requeue), recover(requeue=true), prefetch per-consumer + shared, round-robin, auto-delete, cancel-notify, requeue on channel/connection loss; T09 stress proves no-loss/no-duplicate delivery under 4×50 concurrent publishes with 3 competing consumers and prefetch credit held. channel.flow is a documented flow-ok no-op (RabbitMQ-compatible) |
 | M4 — durable authority | in_progress | Journal engine + broker wiring complete: durable declares/deletes/binds/unbinds/purges commit before their replies; persistent publishes journal pre-assigned destination sequences under the store lock; terminal settlements journaled (INV-02); restart replays the journal into live topology+store with id stability and mint-bumping; `serve --data-dir` enables persistence (memory mode makes no persistence claim). lapin kill/restart round trip proves: topology + bindings survive, surviving set exactly {unacked-at-kill, ready, post-restart}, settled entries never resurrect. Remaining M4: delivery-attempt markers (§9.6, with M5 failpoints), redb projection |
-| M5 — confirms and failure safety | in_progress | confirm.select/acks live: per-channel publish sequences (independent namespace, FR-C04), positive confirms after admission (INV-01 order: journal commit → live apply → confirm), FIFO confirm ordering, mandatory return serialized BEFORE the confirm, nack on header-time publish rejection, 10k pending-confirm ceiling, capabilities advertised (publisher_confirms/basic.nack/consumer_cancel_notify). Pending: delivery-attempt markers, failpoint crash matrix (T13/T14), disk-failure quiesce |
+| M5 — confirms and failure safety | in_progress | Confirms live (see FR-PUB05/06). §9.6 delivery-safety wired and lapin-verified: Delivered markers journaled BEFORE manual-ack exposure (redelivered hint survives kill/restart), no-ack terminal dequeues journaled BEFORE exposure (never redelivered), both on the consumer-job and basic.get paths; journal failpoints injectable at runtime (T13: injected fsync failure → no positive confirm, channel closes 506). Pending: disk-failure quiesce/alarms (FR-R04), redb projection, extended T14 kill matrix |
 | M6 — storage lifecycle | not_started | |
 | M7 — secure operations | not_started | |
 | M8 — migration and interoperability | not_started | |
@@ -110,7 +110,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | Publish path | complete (partial evidence) | persistent+durable destinations: peek seqs under store lock → journal → live enqueue (§9.5 order) | same test (three messages survive with exact seqs) |
 | Settlements | complete (partial evidence) | terminal ack/discard of persistent entries in durable queues journaled | INV-02 evidence: acked entry absent after restart |
 | Purge | complete (partial evidence) | exact ready-set list journaled before live purge (§9.4) | store unit tests + seq identity via restart test |
-| Delivery-attempt markers | not_started | | §9.6 conservative redelivered hints — with M5 failpoint suite |
+| Delivery-attempt markers | complete (partial evidence) | Delivered record (0x23); journaled before manual-ack exposure on both consumer and get paths; replay sets the conservative hint | `manual_ack_delivery_comes_back_redelivered_after_kill`, `no_ack_delivery_settles_before_exposure` |
 | redb projection | not_started | | derived index, applied-LSN watermark |
 
 ### Security (§11), management (§12), CLI/config (§13)
@@ -133,7 +133,7 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T09 | complete (partial evidence) | `stress_lapin.rs::concurrent_publish_consume_no_loss_no_duplicates` (200 msgs, 4 publishers, 3 consumers, prefetch 7: exact-once totals, zero duplicates, credit bound held) + `shared_prefetch_limits_channel_not_consumers` |
 | T11 | in_progress | `unacked_redelivers_to_new_consumer_after_connection_loss` (connection-loss requeue) |
 | T10, T14–T30 | not_started | |
-| T13 | not_started | injected-sync-failure matrix: no positive confirm before successful fsync |
+| T13 | complete (partial evidence) | `no_positive_confirm_when_journal_fsync_fails`: before-sync failpoint → confirm future errors (channel close 506), failpoint provably fired; storage-level `failpoint_before_sync_leaves_unfenced_tail` proves commit() never returns Ok without sync
 
 ## Client-library findings (evidence-backed)
 

@@ -19,6 +19,33 @@ pub async fn serve(listen: SocketAddr, broker: Broker) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Accept loop over an already-bound, shared broker (tests that need a
+/// live handle for failpoint control).
+pub async fn serve_listener_shared(listener: TcpListener, broker: Arc<Broker>) {
+    let live = Arc::new(AtomicUsize::new(0));
+    loop {
+        let (socket, _peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("accept error: {e}");
+                continue;
+            }
+        };
+        if live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            tracing::warn!("connection cap reached; refusing");
+            drop(socket);
+            continue;
+        }
+        live.fetch_add(1, Ordering::Relaxed);
+        let broker = broker.clone();
+        let live = live.clone();
+        tokio::spawn(async move {
+            Connection::run(socket, broker).await;
+            live.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
+
 /// Accept loop over an already-bound listener (tests bind port 0 first).
 pub async fn serve_listener(listener: TcpListener, broker: Broker) {
     let broker = Arc::new(broker);
