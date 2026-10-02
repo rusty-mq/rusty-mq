@@ -417,6 +417,26 @@ impl Topology {
             .insert(name.to_string(), id);
     }
 
+    /// Iterate all queues with their records (snapshot capture).
+    pub fn iter_queues(&self) -> impl Iterator<Item = (QueueId, &QueueRecord)> {
+        self.queues.iter().map(|(id, rec)| (*id, rec))
+    }
+
+    /// Iterate all exchanges with their records (snapshot capture).
+    pub fn iter_exchanges(&self) -> impl Iterator<Item = (ExchangeId, &ExchangeRecord)> {
+        self.exchanges.iter().map(|(id, rec)| (*id, rec))
+    }
+
+    /// Iterate bindings as (exchange, queue, key) triples across vhosts
+    /// (snapshot capture).
+    pub fn iter_bindings(&self) -> impl Iterator<Item = (ExchangeId, QueueId, &str)> {
+        self.bindings.values().flat_map(|per_vhost| {
+            per_vhost
+                .iter()
+                .flat_map(|(ex, list)| list.iter().map(|b| (*ex, b.queue, b.key.as_str())))
+        })
+    }
+
     /// Remove an exchange by id (replay path); drops its bindings.
     pub fn remove_exchange_by_id(&mut self, vhost: VhostId, id: ExchangeId) {
         if let Some(rec) = self.exchanges.remove(&id) {

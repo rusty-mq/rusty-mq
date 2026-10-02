@@ -93,6 +93,14 @@ impl MessageStore {
             .map_or(0, |q| q.entries.len() as u64)
     }
 
+    /// All ready entries of a queue in FIFO order (snapshot capture).
+    pub fn ready_entries(&self, queue: QueueId) -> impl Iterator<Item = &QueueEntry> {
+        self.queues
+            .get(&queue)
+            .map(|q| q.entries.iter())
+            .unwrap_or_default()
+    }
+
     /// Mark a stored entry as previously delivered (conservative
     /// redelivery hint; §9.6). No-op when the entry is absent.
     pub fn mark_redelivered(&mut self, queue: QueueId, seq: u64) {

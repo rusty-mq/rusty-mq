@@ -16,7 +16,7 @@ pub const FORMAT_MINOR: u32 = 0;
 /// Fixed size of the segment header.
 const SEGMENT_HEADER_LEN: usize = 32;
 /// Fixed size of a record header: LSN(8) + kind(1) + len(4) + crc(4).
-const RECORD_HEADER_LEN: usize = 17;
+pub(crate) const RECORD_HEADER_LEN: usize = 17;
 // ---------------------------------------------------------------------
 // CRC-32 (IEEE 802.3), table-driven. Self-contained: no new dependency,
 // fixed known vectors in tests.
@@ -299,6 +299,11 @@ impl JournalWriter {
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
     }
+
+    /// Current segment id (reclaim keeps this one).
+    pub fn current_segment_id(&self) -> u64 {
+        self.segment_id
+    }
 }
 
 fn io_err(e: io::Error) -> FormatError {
@@ -312,6 +317,11 @@ fn sync_dir(dir: &Path) -> Result<(), FormatError> {
 
 fn segment_file_name(id: u64) -> String {
     format!("{id:020}.log")
+}
+
+/// Public alias for snapshot/reclaim use.
+pub fn segment_file_name_pub(id: u64) -> String {
+    segment_file_name(id)
 }
 
 // ---------------------------------------------------------------------
@@ -443,7 +453,7 @@ fn read_segment_header(dir: &Path, id: u64) -> Result<(SegmentHeader, usize), Fo
 }
 
 /// List the segment ids in the directory, sorted.
-fn scan_segments(dir: &Path) -> Result<Vec<u64>, FormatError> {
+pub(crate) fn scan_segments(dir: &Path) -> Result<Vec<u64>, FormatError> {
     let mut ids = Vec::new();
     for entry in fs::read_dir(dir).map_err(io_err)? {
         let entry = entry.map_err(io_err)?;
@@ -470,6 +480,17 @@ fn scan_segments(dir: &Path) -> Result<Vec<u64>, FormatError> {
 ///   segment only; checksum failures on complete records are errors.
 /// - Returns records grouped by their commit fence.
 pub fn recover(dir: &Path) -> Result<Vec<RecoveredRecord>, FormatError> {
+    recover_with_options(dir, false)
+}
+
+/// `allow_orphan_first`: a manifest-published reclamation removed the head
+/// of the chain; the first remaining segment's `previous` legitimately
+/// points at a deleted id (§9.9 step 5). Only legal when the caller has a
+/// manifest covering the reclaimed LSNs.
+pub fn recover_with_options(
+    dir: &Path,
+    allow_orphan_first: bool,
+) -> Result<Vec<RecoveredRecord>, FormatError> {
     let ids = scan_segments(dir)?;
     let mut out = Vec::new();
     for (i, &id) in ids.iter().enumerate() {
@@ -480,7 +501,11 @@ pub fn recover(dir: &Path) -> Result<Vec<RecoveredRecord>, FormatError> {
                 header.segment_id
             )));
         }
-        let expected_previous = if i == 0 { 0 } else { ids[i - 1] };
+        let expected_previous = match i {
+            0 if allow_orphan_first => header.previous, // reclaimed head: accept
+            0 => 0,
+            _ => ids[i - 1],
+        };
         if header.previous != expected_previous {
             return Err(FormatError::ChainBreak(header.previous));
         }

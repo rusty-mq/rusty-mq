@@ -104,12 +104,36 @@ Directory metadata is synced when a new segment file is created. Group
 commit (2 ms / 1 MiB triggers) batches syncs without ever acknowledging a
 transaction before its fence is fsynced.
 
-## What this slice implements
+## Snapshots, manifest, and reclamation (§9.9, M6)
 
-Writer (append with LSN assignment, segment rolling, sync + watermark,
-failpoint hooks for tests) and reader (segment-chain validation, checksum
-verification, torn-tail discard, committed-transaction replay) — with the
-record model above. Broker wiring (durable declarations behind the topology,
-persistent enqueue path, restart reconstruction into live state) lands in
-the next slice; until then the broker remains memory-backed and claims no
-persistence.
+`snapshots/snapshot-<generation>/state.bin` holds a full durable-state
+capture: magic `RMQSNAP1` + format versions + generation + covered LSN +
+record count, then a stream of the SAME record frames the journal uses
+(kind + length + CRC + payload — no LSNs; identity is the (queue, seq)
+pair). The recovery root is `MANIFEST` (magic `RMQMNFST`, generation,
+covered LSN, snapshot directory name), published atomically: write
+`MANIFEST.tmp`, fsync, rename, fsync the directory.
+
+Recovery order: snapshot records fold first, then journal records with LSN
+> covered re-apply — the same idempotent fold (INV-11). The covered LSN is
+read after the state capture, so it is ≥ every captured event; suffix
+records between the capture moment and the covered LSN simply re-apply.
+
+Reclamation deletes journal segments whose every record LSN ≤ covered, never
+the writer's current tail (an unlinked tail would silently lose appends),
+plus snapshot directories older than the manifest's generation. With a
+manifest present, recovery tolerates the first remaining segment pointing
+at a reclaimed predecessor; without one, the chain must be intact (a
+leading gap without a manifest is an explicit chain-break failure).
+
+The broker triggers snapshot+reclaim inline after a commit when journal
+bytes exceed a ceiling; the capture uses try_lock, so a contended round
+defers to the next commit instead of deadlocking against callers that hold
+state locks across `journal_commit` (the persistent publish path).
+
+## Implementation status
+
+Writer, reader, broker wiring (durable declarations, persistent enqueue,
+settlements, §9.6 delivery safety), restart replay, and the M6
+snapshot/manifest/reclamation lifecycle described above are implemented and
+tested; see docs/implementation-status.md for the evidence ledger.

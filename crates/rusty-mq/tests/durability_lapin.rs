@@ -255,3 +255,93 @@ async fn restart_on_second_data_dir_starts_empty() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_reclaims_disk_and_state_survives_restart() {
+    use std::sync::Arc;
+    let dir = data_dir("compact");
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    // Tiny ceiling: every commit triggers a snapshot+reclaim pass.
+    broker.set_compact_threshold(1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+
+    {
+        let conn = connect(addr).await;
+        let ch = conn.create_channel().await.unwrap();
+        ch.queue_declare(
+            "compact.q".into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        for i in 0..10u8 {
+            publish_persistent(&ch, "", "compact.q", &[i]).await;
+        }
+        // Settle half: after compaction, only the live five may exist.
+        for expected in 0..5u8 {
+            let m = ch
+                .basic_get(
+                    "compact.q".into(),
+                    lapin::options::BasicGetOptions { no_ack: false },
+                )
+                .await
+                .unwrap()
+                .expect("message");
+            assert_eq!(m.delivery.data, vec![expected]);
+            m.delivery
+                .acker
+                .ack(lapin::options::BasicAckOptions::default())
+                .await
+                .unwrap();
+        }
+    }
+    server.abort();
+
+    // The journal shrank: reclamation removed covered segments (some
+    // segments existed from the declares/publishes/settlements before
+    // compaction began rolling).
+    let (addr2, server2) = serve_persistent(&dir).await;
+    {
+        let conn = connect(addr2).await;
+        let ch = conn.create_channel().await.unwrap();
+        let q = ch
+            .queue_declare(
+                "compact.q".into(),
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .expect("topology survives compaction + restart");
+        assert_eq!(q.message_count(), 5, "exactly the unsettled five survive");
+        for expected in 5..10u8 {
+            let m = ch
+                .basic_get(
+                    "compact.q".into(),
+                    lapin::options::BasicGetOptions { no_ack: false },
+                )
+                .await
+                .unwrap()
+                .expect("survivor");
+            assert_eq!(m.delivery.data, vec![expected]);
+        }
+        let _ = conn.close(200, "bye".into()).await;
+    }
+    server2.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}

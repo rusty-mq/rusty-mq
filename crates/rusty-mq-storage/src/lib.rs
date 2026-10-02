@@ -16,6 +16,7 @@
 pub mod journal;
 pub mod rebuild;
 pub mod record;
+pub mod snapshot;
 
 pub use journal::{
     recover, JournalConfig, JournalWriter, RecoveredRecord, FORMAT_MAJOR, FORMAT_MINOR,
