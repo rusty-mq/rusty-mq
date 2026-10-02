@@ -38,6 +38,14 @@ pub trait BrokerHandle: Send + Sync + 'static {
     fn close_connection(&self, id: &str, reason: &str) -> bool;
     /// All permission rows as JSON objects.
     fn list_permissions(&self) -> Vec<serde_json::Value>;
+    /// Native definitions export (durable topology).
+    fn export_definitions(&self) -> serde_json::Value;
+    /// Import definitions; returns the per-resource report as JSON.
+    fn import_definitions(
+        &self,
+        payload: &serde_json::Value,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, String>;
 }
 
 impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
@@ -102,5 +110,15 @@ impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
     }
     fn list_permissions(&self) -> Vec<serde_json::Value> {
         (**self).list_permissions()
+    }
+    fn export_definitions(&self) -> serde_json::Value {
+        (**self).export_definitions()
+    }
+    fn import_definitions(
+        &self,
+        payload: &serde_json::Value,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, String> {
+        (**self).import_definitions(payload, dry_run)
     }
 }

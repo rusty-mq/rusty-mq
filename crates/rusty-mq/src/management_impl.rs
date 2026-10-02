@@ -217,6 +217,19 @@ impl BrokerHandle for Broker {
         Broker::close_connection(self, rusty_mq_core::ConnectionId::from_raw(parsed), reason)
     }
 
+    fn export_definitions(&self) -> serde_json::Value {
+        crate::definitions::export(self)
+    }
+
+    fn import_definitions(
+        &self,
+        payload: &serde_json::Value,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, String> {
+        crate::definitions::import(self, payload, dry_run)
+            .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+    }
+
     fn list_permissions(&self) -> Vec<serde_json::Value> {
         self.auth
             .lock()

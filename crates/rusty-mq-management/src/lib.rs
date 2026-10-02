@@ -66,6 +66,10 @@ pub fn router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Router {
                 .put(put_permissions)
                 .delete(delete_permissions),
         )
+        .route(
+            "/v1/definitions",
+            get(get_definitions).post(post_definitions),
+        )
         .route("/v1/connections", get(list_connections))
         .route("/v1/connections/{id}/close", post(close_connection))
         .with_state(std::sync::Arc::new(broker))
@@ -477,6 +481,44 @@ async fn delete_permissions<B: crate::broker_facade::BrokerHandle>(
             "no permissions for that user/vhost",
         ),
         Err(e) => status(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+    }
+}
+
+async fn get_definitions<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
+        return e;
+    }
+    Json(broker.export_definitions()).into_response()
+}
+
+async fn post_definitions<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+        return e;
+    }
+    let Some(Json(payload)) = body else {
+        return status(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "definitions body required",
+        );
+    };
+    // ?dry_run=true (or any truthy value) enables report-only mode.
+    let dry_run = query
+        .as_deref()
+        .and_then(|q| q.split('&').find(|p| p.starts_with("dry_run=")))
+        .map(|p| p.split('=').nth(1) != Some("false"))
+        .unwrap_or(false);
+    match broker.import_definitions(&payload, dry_run) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => status(StatusCode::BAD_REQUEST, "bad_request", e),
     }
 }
 

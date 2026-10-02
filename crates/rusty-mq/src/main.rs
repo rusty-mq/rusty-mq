@@ -112,6 +112,26 @@ enum AdminCommand {
         vhost: String,
     },
     Connections,
+    Definitions {
+        #[command(subcommand)]
+        action: DefinitionsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DefinitionsAction {
+    /// Write the export to a file (or stdout with --json).
+    Export {
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Import from a file; --dry-run reports without mutating.
+    Import {
+        #[arg(long)]
+        file: std::path::PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,6 +344,52 @@ fn main() {
                     AdminCommand::Status => request(&base, "GET", "/v1/status", &creds, None).await,
                     AdminCommand::Connections => {
                         request(&base, "GET", "/v1/connections", &creds, None).await
+                    }
+                    AdminCommand::Definitions {
+                        action: DefinitionsAction::Export { out },
+                    } => match request(&base, "GET", "/v1/definitions", &creds, None).await {
+                        Ok(resp) => {
+                            match out {
+                                Some(path) => {
+                                    if let Err(e) = std::fs::write(&path, resp.body.trim()) {
+                                        eprintln!("cannot write {}: {e}", path.display());
+                                        std::process::exit(1);
+                                    }
+                                    println!("definitions written to {}", path.display());
+                                }
+                                None => println!("{}", resp.body.trim()),
+                            }
+                            // Early return: printing already handled.
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("admin command failed: {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                    AdminCommand::Definitions {
+                        action: DefinitionsAction::Import { file, dry_run },
+                    } => {
+                        let raw = match std::fs::read_to_string(&file) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("cannot read {}: {e}", file.display());
+                                std::process::exit(1);
+                            }
+                        };
+                        let payload: serde_json::Value = match serde_json::from_str(&raw) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("definitions not valid JSON: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        let path = if dry_run {
+                            "/v1/definitions?dry_run=true"
+                        } else {
+                            "/v1/definitions"
+                        };
+                        request(&base, "POST", path, &creds, Some(&payload)).await
                     }
                     AdminCommand::Queues { vhost } => {
                         let path = format!("/v1/vhosts/{}/queues", urlencode(&vhost));

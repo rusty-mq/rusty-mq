@@ -6,6 +6,7 @@ pub mod alarms;
 pub mod broker;
 pub mod connection;
 pub mod consumers;
+pub mod definitions;
 pub mod management_impl;
 pub mod metrics;
 pub mod migration;
