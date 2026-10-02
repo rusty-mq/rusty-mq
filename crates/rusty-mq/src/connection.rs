@@ -136,6 +136,8 @@ pub struct Connection {
     mailbox_tx: mpsc::Sender<Job>,
     /// Client declared the consumer_cancel_notify capability (§4.3).
     client_cancel_notify: bool,
+    /// Client declared connection.blocked (§4.3 gates our notifications).
+    client_blocking: bool,
     /// Authenticated principal (set at start-ok; empty never — auth is
     /// required before tune).
     username: String,
@@ -157,11 +159,18 @@ impl Connection {
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
         // Consumer mailbox: bounded push-delivery queue (ADR-0004).
         let (mailbox_tx, mailbox_rx) = mpsc::channel::<Job>(CONSUMER_MAILBOX_CAP);
+        // Control channel: alarm notifications (FR-R07), bounded.
+        let (control_tx, control_rx) = mpsc::channel::<crate::broker::Control>(8);
         let (read_half, write_half) = socket.into_split();
 
         let writer = tokio::spawn(writer_task(write_half, outbound_rx));
 
         Metrics::inc(&broker.metrics.connections_opened);
+        broker.register_connection(crate::broker::LiveConnection {
+            id: conn_id,
+            username: String::new(), // enriched post-auth with the registry pass
+            control: control_tx,
+        });
         let mut conn = Self {
             broker,
             conn_id,
@@ -169,6 +178,7 @@ impl Connection {
             awaiting_close_ok: HashMap::new(),
             mailbox_tx,
             client_cancel_notify: false,
+            client_blocking: false,
             username: String::new(),
             limits: ProtocolLimits::default(),
             negotiated: None,
@@ -178,7 +188,8 @@ impl Connection {
         };
 
         tracing::info!(connection = %conn_id, peer = %peer, "connection opened");
-        conn.drive(read_half, mailbox_rx).await;
+        conn.drive(read_half, mailbox_rx, control_rx).await;
+        self_unregister(&conn.broker, conn_id);
 
         // Reclaim connection-scoped resources (FR-P09): exclusive queues
         // disappear with their owning connection (FR-Q04).
@@ -218,7 +229,12 @@ impl Connection {
 
     /// Main loop: handshake with deadline, then socket reads + consumer
     /// mailbox jobs concurrently (heartbeats idle-detect the socket side).
-    async fn drive(&mut self, mut read: OwnedReadHalf, mut mailbox: mpsc::Receiver<Job>) {
+    async fn drive(
+        &mut self,
+        mut read: OwnedReadHalf,
+        mut mailbox: mpsc::Receiver<Job>,
+        mut control: mpsc::Receiver<crate::broker::Control>,
+    ) {
         let handshake_deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.limits.handshake_timeout_seconds as u64);
         let mut reader = FrameReader::new(&self.server_view_limits());
@@ -311,6 +327,13 @@ impl Connection {
                     // None: all senders dropped (broker teardown); keep
                     // the socket side alive.
                 }
+                msg = control.recv() => {
+                    if let Some(msg) = msg {
+                        if !self.handle_control(msg).await {
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
@@ -359,6 +382,10 @@ impl Connection {
         );
         caps.insert(
             "consumer_cancel_notify".into(),
+            amq_protocol::types::AMQPValue::Boolean(true),
+        );
+        caps.insert(
+            "connection.blocked".into(),
             amq_protocol::types::AMQPValue::Boolean(true),
         );
         props.insert(
@@ -471,6 +498,20 @@ impl Connection {
         }
         self.username = user.clone();
         // Extension capabilities the client declared (§4.3 gating).
+        self.client_blocking = start_ok
+            .client_properties
+            .inner()
+            .get("capabilities")
+            .and_then(|v| match v {
+                amq_protocol::types::AMQPValue::FieldTable(t) => Some(t),
+                _ => None,
+            })
+            .is_some_and(|t| {
+                matches!(
+                    t.inner().get("connection.blocked"),
+                    Some(amq_protocol::types::AMQPValue::Boolean(true))
+                )
+            });
         self.client_cancel_notify = start_ok
             .client_properties
             .inner()
@@ -2140,6 +2181,18 @@ impl Connection {
             }
         };
 
+        // §10/FR-R02: a memory alarm stops new message admissions (bounded
+        // memory; confirmed persistent messages are never evicted).
+        if self.broker.memory_alarm() {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                "RESOURCE_ERROR - memory alarm: message admissions paused",
+                rusty_mq_protocol::error::class_id::BASIC,
+                40, // basic.publish
+            );
+            self.broker.evaluate_alarms_and_notify();
+            return self.protocol_error(channel_id, &e).await;
+        }
         // Durable-destination routing for persistent messages: pre-assign
         // sequences and commit the Enqueue record BEFORE live admission
         // (§9.5). The store lock is held across the commit so the assigned
@@ -2192,7 +2245,9 @@ impl Connection {
 
         Metrics::inc(&self.broker.metrics.messages_published);
         // Admit to every destination under the store budget, then dispatch
-        // to waiting consumers.
+        // to waiting consumers. Admission crossing the budget raises the
+        // memory alarm (evaluate + notify below).
+        let mut admission_failure: Option<AdmitError> = None;
         for queue in &destinations {
             let admitted = self
                 .broker
@@ -2202,19 +2257,25 @@ impl Connection {
                 .enqueue(*queue, message.clone());
             match admitted {
                 Ok(_) => self.broker.dispatch_queue(*queue),
-                // Never fabricate success on admission failure (§6.4).
-                Err(AdmitError::BudgetExceeded) => {
-                    let e = ProtocolError::channel(
-                        reply_code::RESOURCE_ERROR,
-                        "RESOURCE_ERROR - in-memory message budget exceeded",
-                        rusty_mq_protocol::error::class_id::BASIC,
-                        40, // basic.publish
-                    );
-                    return self.protocol_error(channel_id, &e).await;
+                // Never fabricate success on admission failure (§6.4);
+                // the budget being hit IS the memory alarm transition.
+                Err(e @ AdmitError::BudgetExceeded) => {
+                    admission_failure = Some(e);
+                    break;
                 }
             }
         }
 
+        self.broker.evaluate_alarms_and_notify();
+        if admission_failure.is_some() {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                "RESOURCE_ERROR - memory alarm: message budget exceeded",
+                rusty_mq_protocol::error::class_id::BASIC,
+                40, // basic.publish
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
         // FR-PUB02: mandatory + zero destinations returns the message.
         if destinations.is_empty() && inflight.mandatory {
             let sent = self
@@ -2614,6 +2675,8 @@ impl Connection {
         for q in queues {
             self.broker.dispatch_queue(q);
         }
+        // Freed bytes may clear the memory alarm (notify).
+        self.broker.evaluate_alarms_and_notify();
     }
 
     async fn handle_basic_ack(&mut self, channel_id: u16, d: basic::Ack) -> bool {
@@ -2968,6 +3031,26 @@ impl Connection {
         true
     }
 
+    /// FR-R07: emit connection.blocked/unblocked when the client declared
+    /// the capability (§4.3 gating; we advertise it since this run).
+    async fn handle_control(&mut self, msg: crate::broker::Control) -> bool {
+        if !self.client_blocking {
+            return true; // capability not declared: nothing to send
+        }
+        use crate::broker::Control;
+        let method = match &msg {
+            Control::Blocked(reason) => connection::AMQPMethod::Blocked(connection::Blocked {
+                reason: reason.as_str().into(),
+            }),
+            Control::Unblocked => connection::AMQPMethod::Unblocked(connection::Unblocked {}),
+        };
+        // Blocked goes on channel 0; the client is expected to pause
+        // publishing (the broker has already gated admissions).
+        self.send(AMQPFrame::Method(0, AMQPClass::Connection(method)))
+            .await
+            .is_ok()
+    }
+
     /// Handle a job from this connection's consumer mailbox.
     async fn handle_job(&mut self, job: Job) -> bool {
         match job {
@@ -3218,6 +3301,10 @@ fn channel_id_of(m: &channel::AMQPMethod) -> u16 {
         M::Close(x) => x.get_amqp_method_id(),
         M::CloseOk(x) => x.get_amqp_method_id(),
     }
+}
+
+fn self_unregister(broker: &Arc<Broker>, id: ConnectionId) {
+    broker.unregister_connection(id);
 }
 
 /// Writer task: sole owner of the socket write half (FR-P07, ADR-0003).

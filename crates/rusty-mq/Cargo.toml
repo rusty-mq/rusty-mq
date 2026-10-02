@@ -26,6 +26,9 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 base64 = "0.22"
 lapin = { workspace = true }
@@ -36,5 +39,6 @@ amq-protocol = { workspace = true }
 tokio-test = { workspace = true }
 futures-lite = { workspace = true }
 
+# Narrow unsafe exceptions documented per PRD §15.2 (statvfs disk probe).
 [lints]
 workspace = true

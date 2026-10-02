@@ -1701,6 +1701,7 @@ dependencies = [
  "http",
  "http-body-util",
  "lapin",
+ "libc",
  "rand 0.8.8",
  "rusty-mq-core",
  "rusty-mq-management",

@@ -20,10 +20,10 @@ impl BrokerHandle for Broker {
     }
 
     fn is_ready(&self) -> bool {
-        // The broker only serves after recovery completes (open_persistent
-        // returns post-replay); readiness is therefore true whenever the
-        // process is accepting. Alarms (FR-R04) will refine this.
-        true
+        // Recovery completes before serving; a disk alarm makes readiness
+        // fail while liveness stays healthy (§12.1) — durable admissions
+        // are quiesced in that state.
+        !self.disk_alarm()
     }
 
     fn render_metrics(&self) -> String {

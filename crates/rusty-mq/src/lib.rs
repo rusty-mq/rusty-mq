@@ -1,6 +1,7 @@
 //! rusty-mq broker library: composition surface for the executable and the
 //! integration test harness.
 
+pub mod alarms;
 pub mod broker;
 pub mod connection;
 pub mod consumers;

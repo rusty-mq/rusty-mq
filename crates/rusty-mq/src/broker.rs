@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::alarms::Alarms;
 use crate::consumers::{Consumers, Job};
 use crate::metrics::Metrics;
 use rusty_mq_core::auth::{AuthState, Permissions, Principal, Role};
@@ -21,6 +22,22 @@ use rusty_mq_storage::{journal::JournalConfig, JournalWriter};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("journal commit failed")]
 pub struct JournalCommitError;
+
+/// Control messages pushed to live connections (alarm notifications).
+#[derive(Clone, Debug)]
+pub enum Control {
+    Blocked(String),
+    Unblocked,
+}
+
+/// A registered live connection (alarm fan-out target).
+pub struct LiveConnection {
+    pub id: ConnectionId,
+    pub username: String,
+    /// Bounded control channel; a full channel drops the notification
+    /// (bounded by construction — the socket writer is the real backstop).
+    pub control: tokio::sync::mpsc::Sender<Control>,
+}
 
 /// Argon2id hash of a fresh password (PHC string with a random salt).
 pub fn argon2_hash(password: &str) -> Result<String, String> {
@@ -179,6 +196,9 @@ pub struct Broker {
     pub auth: Mutex<AuthState>,
     /// Process metrics (§12.2): bounded-cardinality counters.
     pub metrics: Metrics,
+    /// Resource alarms (§10) + connection registry for notifications.
+    pub alarms: Mutex<Alarms>,
+    pub live_connections: Mutex<Vec<LiveConnection>>,
     /// M1: exactly one test user; M7 replaces this with durable principals.
     pub test_user: TestUser,
     connection_seq: AtomicU64,
@@ -219,6 +239,8 @@ impl Broker {
                 password,
             },
             metrics: Metrics::default(),
+            alarms: Mutex::new(Alarms::default()),
+            live_connections: Mutex::new(Vec::new()),
             connection_seq: AtomicU64::new(1),
             consumer_tag_seq: AtomicU64::new(1),
         }
@@ -396,6 +418,8 @@ impl Broker {
                 password,
             },
             metrics: Metrics::default(),
+            alarms: Mutex::new(Alarms::default()),
+            live_connections: Mutex::new(Vec::new()),
             connection_seq: AtomicU64::new(1),
             consumer_tag_seq: AtomicU64::new(1),
         }
@@ -409,6 +433,12 @@ impl Broker {
         &self,
         records: &[Record],
     ) -> std::result::Result<(), JournalCommitError> {
+        // §6.4/§7.4: a disk alarm stops durable writes — never a false
+        // successful confirm under uncertain persistence.
+        if self.disk_alarm() {
+            tracing::error!("journal commit refused: disk alarm active");
+            return Err(JournalCommitError);
+        }
         let fence = {
             let mut journal = self.journal.lock().unwrap();
             match journal.as_mut() {
@@ -527,6 +557,71 @@ impl Broker {
     /// Whether the journal is active (persistence claims are possible).
     pub fn is_persistent(&self) -> bool {
         self.journal.lock().unwrap().is_some()
+    }
+
+    /// Register a live connection (alarm fan-out). Bounded: connections
+    /// beyond a sanity cap are accepted but not registered for broadcast.
+    pub fn register_connection(&self, conn: LiveConnection) {
+        const MAX_REGISTERED: usize = 4096;
+        let mut live = self.live_connections.lock().unwrap();
+        if live.len() < MAX_REGISTERED {
+            live.push(conn);
+        }
+    }
+
+    pub fn unregister_connection(&self, id: ConnectionId) {
+        self.live_connections.lock().unwrap().retain(|c| c.id != id);
+    }
+
+    /// Evaluate alarms and broadcast blocked/unblocked transitions to all
+    /// live connections (FR-R07). Callers pass the connection filter
+    /// (capability gating happens connection-side).
+    pub fn evaluate_alarms_and_notify(&self) {
+        let transitions = {
+            let store_bytes = self.store.lock().unwrap().total_bytes();
+            let mut alarms = self.alarms.lock().unwrap();
+            alarms.evaluate(store_bytes, MESSAGE_BYTE_BUDGET, self.data_dir.as_deref())
+        };
+        if !transitions.any() {
+            return;
+        }
+        let notifications: Vec<Control> = [
+            (
+                transitions.memory_raised || transitions.disk_raised,
+                Control::Blocked("resource alarm".into()),
+            ),
+            (
+                transitions.memory_cleared || transitions.disk_cleared,
+                Control::Unblocked,
+            ),
+        ]
+        .iter()
+        .filter(|(fire, _)| *fire)
+        .map(|(_, msg)| msg.clone())
+        .collect();
+        if notifications.is_empty() {
+            return;
+        }
+        let mut live = self.live_connections.lock().unwrap();
+        live.retain(|conn| {
+            // try_send: never block the evaluating thread; a full control
+            // channel means the connection is slow — its bounded writer
+            // already backpressures it.
+            notifications
+                .iter()
+                .all(|msg| conn.control.try_send(msg.clone()).is_ok())
+                || conn.control.try_send(Control::Unblocked).is_ok()
+        });
+    }
+
+    /// Whether durable admissions must quiesce (disk alarm, §6.4).
+    pub fn disk_alarm(&self) -> bool {
+        self.alarms.lock().unwrap().disk()
+    }
+
+    /// Memory alarm state (admission gating, §10).
+    pub fn memory_alarm(&self) -> bool {
+        self.alarms.lock().unwrap().memory()
     }
 
     /// Server-generated consumer tag (RabbitMQ-style amq.ctag-...).
