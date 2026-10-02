@@ -8,6 +8,7 @@ pub mod connection;
 pub mod consumers;
 pub mod management_impl;
 pub mod metrics;
+pub mod migration;
 pub mod server;
 pub mod tls;
 

@@ -48,6 +48,14 @@ enum Command {
         #[arg(long, default_value = "guest")]
         password: String,
     },
+    /// Offline RabbitMQ definitions preflight (§19.1, T29).
+    MigrationInspect {
+        #[arg(long)]
+        definitions: std::path::PathBuf,
+        /// Report destination; omit for stdout.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
     /// Offline backup of a stopped broker's data directory (§9.10).
     BackupCreate {
         #[arg(long)]
@@ -215,6 +223,47 @@ fn main() {
             if let Err(e) = runtime.block_on(rusty_mq::server::serve_shared(listen, broker)) {
                 tracing::error!("server failed: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::MigrationInspect {
+            definitions,
+            output,
+        } => {
+            let raw = match std::fs::read_to_string(&definitions) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("cannot read {}: {e}", definitions.display());
+                    std::process::exit(1);
+                }
+            };
+            let defs: rusty_mq::migration::Definitions = match serde_json::from_str(&raw) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("definitions not valid JSON: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let report = rusty_mq::migration::inspect(&defs);
+            let json = serde_json::to_string_pretty(&report).expect("report serializes");
+            match output {
+                Some(path) => {
+                    if let Err(e) = std::fs::write(&path, &json) {
+                        eprintln!("cannot write {}: {e}", path.display());
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "report written to {} (ready={}, blocking={}, warning={}, unknown={})",
+                        path.display(),
+                        report.ready,
+                        report.summary.blocking,
+                        report.summary.warning,
+                        report.summary.unknown
+                    );
+                }
+                None => println!("{json}"),
+            }
+            if !report.ready {
+                std::process::exit(2);
             }
         }
         Command::BackupCreate { data_dir, output } => {
