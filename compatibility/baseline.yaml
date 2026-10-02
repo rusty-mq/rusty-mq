@@ -1,0 +1,42 @@
+# Frozen differential baseline for rusty-mq V1 (PRD §4.2).
+# A documentation version is NOT a baseline. The release below is pinned;
+# the container digest must be filled by the first CI runner with registry
+# access and is marked pending until then. Differential tests that depend on
+# observed baseline behavior must be marked blocked, not passed, until the
+# digest is recorded.
+
+baseline:
+  pinned_on: "2026-10-02"
+  rabbitmq_release: "4.1.3"           # selected supported release; verify availability on first CI run
+  image_digest: null                   # PENDING_VERIFICATION: sha256 digest of rabbitmq:4.1.3-management-alpine or equivalent
+  effective_config:
+    queue_type_default: "classic"      # profile switch documented per R4 (4.3 changed transient non-exclusive default)
+    deprecated_features_enabled: []
+  amqp_spec_source:
+    repo: "https://github.com/rabbitmq/amqp-0.9.1-spec"
+    revision: null                     # PENDING_VERIFICATION: pin commit sha on first fetch
+  codec:
+    crate: "amq-protocol"
+    version: "7.2.3"                   # resolved at M0; upgrade requires interop suite pass
+
+clients:
+  rust_lapin:    { version: null, status: pending_verification }
+  python_pika:   { version: null, status: pending_verification }
+  node_amqplib:  { version: null, status: pending_verification }
+  java_client:   { version: null, status: pending_verification }
+  go_amqp091:    { version: null, status: pending_verification }
+
+harness:
+  commit: null                         # PENDING_VERIFICATION: tests/interop harness pin
+  os: "macOS (dev); Linux x86_64 + arm64 (CI/release)"
+  runtimes: {}
+
+# Differential case policy: cases marked "divergent_intentional" must each
+# have an entry in features.yaml with the exact rusty-mq behavior.
+case_policy:
+  supported_cases: []                  # filled as the matrix lands (M2+)
+  rejected_cases: []                   # filled as the matrix lands (M2+)
+  divergent_intentional: []
+  blocked_on_baseline_pin:
+    - "if_empty/if_unused delete semantics fixture"
+    - "transient non-exclusive queue default profile (4.3 behavior switch)"

@@ -1,0 +1,21 @@
+[package]
+name = "rusty-mq-protocol"
+description = "AMQP 0-9-1 framing, limits, and connection/channel state machines for rusty-mq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+amq-protocol = { workspace = true }
+cookie-factory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusty-mq",
+    "crates/rusty-mq-protocol",
+    "crates/rusty-mq-core",
+    "crates/rusty-mq-storage",
+    "crates/rusty-mq-management",
+    "crates/rusty-mq-testkit",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rusty-mq/rusty-mq"
+authors = ["Gavin Yang <gavin@rusty-mq.dev>"]
+
+[workspace.dependencies]
+# Internal crates
+rusty-mq-protocol = { path = "crates/rusty-mq-protocol", version = "0.1.0-alpha.1" }
+rusty-mq-core = { path = "crates/rusty-mq-core", version = "0.1.0-alpha.1" }
+rusty-mq-storage = { path = "crates/rusty-mq-storage", version = "0.1.0-alpha.1" }
+rusty-mq-management = { path = "crates/rusty-mq-management", version = "0.1.0-alpha.1" }
+rusty-mq-testkit = { path = "crates/rusty-mq-testkit", version = "0.1.0-alpha.1" }
+
+# Protocol codec: BSD-2-Clause (see THIRD_PARTY_NOTICES.md).
+# Reused for wire types/codecs only; server state machines are implemented here.
+amq-protocol = { version = "7.2", default-features = false }
+# Serialization combinator used by amq-protocol's codegen (same version family).
+cookie-factory = { version = "0.3", default-features = false }
+
+# Runtime and networking
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal", "fs"] }
+bytes = "1"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+proptest = "1"
+lapin = { version = "4", default-features = false, features = ["tokio"] } # no TLS stack for tests
+tokio-test = "0.4"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid" # PRD §15.2: no unsafe in original protocol/core/storage logic
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.ci]
+inherits = "release"
+debug = false

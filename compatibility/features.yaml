@@ -1,0 +1,136 @@
+# Machine-readable feature/error matrix (PRD §4.4).
+# status: unsupported | planned | in_progress | supported
+# `planned` MUST NOT be rendered as supported anywhere.
+# Every non-`supported` behavior-bearing entry carries its exact rejection.
+
+features:
+  # --- protocol core ---
+  amqp_091_wire:
+    status: in_progress
+    target_release: "1.0"
+    requirement: FR-P01
+    tests: ["framing unit tests", "T01 (lapin) partial"]
+  publisher_confirms:
+    status: planned
+    target_release: "1.0"
+    requirement: FR-PUB05
+    tests: []
+  basic_nack:
+    status: planned
+    target_release: "1.0"
+    requirement: FR-C05
+    tests: []
+  consumer_cancel_notify:
+    status: planned
+    target_release: "1.0"
+    requirement: FR-Q09
+    tests: []
+  connection_blocked:
+    status: planned
+    target_release: "1.0"
+    requirement: FR-R07
+    tests: []
+  basic_recover_requeue_true:
+    status: planned
+    target_release: "1.0"
+    requirement: FR-C08
+    tests: []
+
+  # --- rejections (deferred features; behavior = reject before state change) ---
+  queue_ttl:
+    status: unsupported
+    target_release: "1.1"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-message-ttl / x-expires argument)"
+    accepted_arguments: []
+  message_expiration_property:
+    status: unsupported
+    target_release: "1.1"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (basic.publish expiration property)"
+  dead_letter_exchange:
+    status: unsupported
+    target_release: "1.1"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-dead-letter-exchange argument)"
+  quorum_queue:
+    status: unsupported
+    target_release: "3.0"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-queue-type=quorum)"
+  stream_queue:
+    status: unsupported
+    target_release: later research
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-queue-type=stream)"
+  priority_queue:
+    status: unsupported
+    target_release: "2.0"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-max-priority argument)"
+  amqp_transactions:
+    status: unsupported
+    target_release: "2.0 (requires separate atomicity design)"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (tx.* methods)"
+  publish_immediate:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED (basic.publish immediate=true)"
+  basic_recover_requeue_false:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED"
+  basic_recover_async:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED (obsolete method)"
+  consumer_no_local:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED (basic.consume no_local=true)"
+  direct_reply_to:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED (amq.rabbitmq.reply-to)"
+  single_active_consumer:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-single-active-consumer)"
+  consumer_priority:
+    status: unsupported
+    target_release: "2.0"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (x-priority consumer argument)"
+  prefetch_size:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 540 NOT_IMPLEMENTED (basic.qos prefetch_size != 0)"
+  headers_exchange:
+    status: unsupported
+    target_release: "2.0"
+    rejection: "channel.close 503 COMMAND_INVALID / 540 (unknown exchange type)"
+  exchange_to_exchange_binding:
+    status: unsupported
+    target_release: "2.0"
+    rejection: "channel.close 540 NOT_IMPLEMENTED"
+  alternate_exchange:
+    status: unsupported
+    target_release: "2.0"
+    rejection: "channel.close 540 NOT_IMPLEMENTED (alternate-exchange argument)"
+  amqp_1_0:              { status: unsupported, target_release: later research, rejection: "connection close at protocol header" }
+  mqtt:                  { status: unsupported, target_release: later research, rejection: "not a listener" }
+  stomp:                 { status: unsupported, target_release: later research, rejection: "not a listener" }
+  federation_shovel:     { status: unsupported, target_release: none, rejection: "n/a" }
+
+  # --- queue profile deviations (ADR-0005) ---
+  durable_exclusive_queue:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 406 PRECONDITION_FAILED (durable=true + exclusive=true rejected in V1 profile)"
+  durable_auto_delete_queue:
+    status: unsupported
+    target_release: none
+    rejection: "channel.close 406 PRECONDITION_FAILED (durable=true + auto_delete=true rejected in V1 profile)"
+  shared_transient_queue:
+    status: unsupported_by_default
+    target_release: "1.0 (opt-in compat switch)"
+    rejection: "channel.close 406 PRECONDITION_FAILED unless compatibility.allow_transient_nonexclusive_queues=true"
+
+  # --- management surface ---
+  rabbitmq_http_api:
+    status: unsupported
+    target_release: "1.1 (selected endpoints)"
+    rejection: "404 on /api/*; native /v1/* only in V1"

@@ -1,0 +1,19 @@
+[package]
+name = "rusty-mq-core"
+description = "Typed commands, topology, routing, queue behavior, and admission for rusty-mq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

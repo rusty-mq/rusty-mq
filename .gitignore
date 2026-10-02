@@ -1,0 +1,29 @@
+# Rust
+/target
+Cargo.lock.orig
+**/*.rs.bk
+
+# rust-analyzer / clippy artifacts
+*.rustfmt_backup
+
+# Data directories created by local dev runs
+/data
+**/data/
+*.redb
+*.log
+*.snapshot
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+/tests/**/target
+/coverage/
+*.profraw

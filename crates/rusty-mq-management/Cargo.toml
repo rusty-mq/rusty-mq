@@ -1,0 +1,16 @@
+[package]
+name = "rusty-mq-management"
+description = "Native HTTP management API, auth middleware, and schemas for rusty-mq (M7)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusty-mq-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

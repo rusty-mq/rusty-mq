@@ -1,0 +1,15 @@
+[package]
+name = "rusty-mq-testkit"
+description = "Deterministic clocks, failpoints, fixtures, and process harness for rusty-mq tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
