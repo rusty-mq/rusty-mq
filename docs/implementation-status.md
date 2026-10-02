@@ -17,7 +17,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
 | M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
 | M3 — delivery state | complete (partial evidence) | Full §6 surface lapin-verified: consume/get/cancel, ack/reject/nack (single+multiple, discard vs requeue), recover(requeue=true), prefetch per-consumer + shared, round-robin, auto-delete, cancel-notify, requeue on channel/connection loss; T09 stress proves no-loss/no-duplicate delivery under 4×50 concurrent publishes with 3 competing consumers and prefetch credit held. channel.flow is a documented flow-ok no-op (RabbitMQ-compatible) |
-| M4 — durable authority | in_progress | Journal engine landed and unit-tested in rusty-mq-storage: segment format v1 (magic/versions/chain links), record model with hand-rolled versioned encoding, CRC-verified commit fences, torn-tail discard, explicit corruption/chain-break failures, segment rolling, fsync-gated durable watermark, failpoint hooks. Broker wiring (durable declarations, persistent enqueue, restart replay) is the next slice — the broker remains memory-backed until then |
+| M4 — durable authority | in_progress | Journal engine + broker wiring complete: durable declares/deletes/binds/unbinds/purges commit before their replies; persistent publishes journal pre-assigned destination sequences under the store lock; terminal settlements journaled (INV-02); restart replays the journal into live topology+store with id stability and mint-bumping; `serve --data-dir` enables persistence (memory mode makes no persistence claim). lapin kill/restart round trip proves: topology + bindings survive, surviving set exactly {unacked-at-kill, ready, post-restart}, settled entries never resurrect. Remaining M4: delivery-attempt markers (§9.6, with M5 failpoints), redb projection |
 | M5 — confirms and failure safety | not_started | |
 | M6 — storage lifecycle | not_started | |
 | M7 — secure operations | not_started | |
@@ -103,7 +103,12 @@ Updated: 2026-10-02 (M0/M1 development start).
 | Writer | complete (partial evidence) | `journal.rs` (LSN assignment, segment rolling + dir sync, commit() = fsync boundary, durable watermark) | roundtrip, rolling, reopen-after-restart tests |
 | Recovery | complete (partial evidence) | `recover()` (chain validation, checksum verify, committed-only visibility, torn-tail discard) | torn-tail, checksum-corruption, chain-break, foreign-magic tests |
 | Failpoints | complete (partial evidence) | injectable hooks (before-append/before-sync/after-sync) | `failpoint_before_sync_leaves_unfenced_tail` (commit() never returns Ok without sync) |
-| Broker wiring | not_started | | durable declarations + persistent enqueue + restart replay (next slice) |
+| Broker wiring | complete (partial evidence) | journal_commit gate in every durable path (506 on failure, live state intact or rolled back); `Broker::open_persistent` (recover-then-open); stable raw ids + mint bump after replay | `durability_lapin.rs`: restart round trip, fresh-dir isolation |
+| Publish path | complete (partial evidence) | persistent+durable destinations: peek seqs under store lock → journal → live enqueue (§9.5 order) | same test (three messages survive with exact seqs) |
+| Settlements | complete (partial evidence) | terminal ack/discard of persistent entries in durable queues journaled | INV-02 evidence: acked entry absent after restart |
+| Purge | complete (partial evidence) | exact ready-set list journaled before live purge (§9.4) | store unit tests + seq identity via restart test |
+| Delivery-attempt markers | not_started | | §9.6 conservative redelivered hints — with M5 failpoint suite |
+| redb projection | not_started | | derived index, applied-LSN watermark |
 
 ### Security (§11), management (§12), CLI/config (§13)
 
@@ -184,8 +189,10 @@ onward as each method path lands.
 ## Standing TODOs (honest open items)
 
 1. Journal group-commit batching (2 ms/1 MiB triggers) is not yet in the
-   writer API — `commit()` fsyncs immediately (correct, unsophisticated);
-   batching lands with broker wiring when confirms arrive (M5).
+   writer API — `commit()` fsyncs immediately per transaction (correct,
+   unsophisticated; the persistent publish path holds the store lock
+   across the commit, serializing publishers); batching + pipelining land
+   with confirms (M5).
 2. ~~Torn-tail physical truncation~~ — fixed in this slice: writer open
    truncates the tail segment to its last intact record boundary (test:
    `reopen_after_torn_tail_truncates_and_future_commits_recover`).

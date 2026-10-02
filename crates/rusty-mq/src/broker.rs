@@ -11,6 +11,14 @@ use rusty_mq_core::store::MessageStore;
 use rusty_mq_core::topology::{CompatibilitySwitches, Topology};
 use rusty_mq_core::ConnectionId;
 use rusty_mq_core::QueueId;
+use rusty_mq_storage::record::Record;
+use rusty_mq_storage::{journal::JournalConfig, JournalWriter};
+
+/// A journal commit failed; callers must surface it (never fabricate
+/// success, §6.4). Details are logged at the failure site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("journal commit failed")]
+pub struct JournalCommitError;
 
 /// Aggregate in-memory message budget for the development broker
 /// (bounded by construction, INV-09; configurable in M7's config surface).
@@ -28,6 +36,9 @@ pub struct Broker {
     pub topology: Mutex<Topology>,
     /// In-memory message store (M2); the durable journal augments this in M4.
     pub store: Mutex<MessageStore>,
+    /// Durable journal (None = memory-backed development mode: accepted
+    /// durable declarations make no persistence claim).
+    pub journal: Mutex<Option<JournalWriter>>,
     /// Consumer registry (M3).
     pub consumers: Mutex<Consumers>,
     /// M1: exactly one test user; M7 replaces this with durable principals.
@@ -42,6 +53,7 @@ impl Broker {
         Self {
             topology: Mutex::new(Topology::new(CompatibilitySwitches::default())),
             store: Mutex::new(MessageStore::new(MESSAGE_BYTE_BUDGET)),
+            journal: Mutex::new(None),
             consumers: Mutex::new(Consumers::new()),
             test_user: TestUser {
                 username: user,
@@ -58,6 +70,58 @@ impl Broker {
 
     pub fn connections_opened(&self) -> u64 {
         self.connection_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Open a persistent broker on a data directory: recover the journal
+    /// into live state first (the journal is the only source of truth,
+    /// ADR-0002), then open the writer for appends.
+    pub fn open_persistent(user: String, password: String, data_dir: &std::path::Path) -> Self {
+        let (rebuilt, writer) = rusty_mq_storage::rebuild::open_persistent(
+            data_dir,
+            MESSAGE_BYTE_BUDGET,
+            JournalConfig::default(),
+        )
+        .expect("recovery must succeed or startup must fail explicitly");
+        tracing::info!(
+            replayed = rebuilt.replayed,
+            data_dir = %data_dir.display(),
+            "recovered durable state from journal"
+        );
+        Self {
+            topology: Mutex::new(rebuilt.topology),
+            store: Mutex::new(rebuilt.store),
+            journal: Mutex::new(Some(writer)),
+            consumers: Mutex::new(Consumers::new()),
+            test_user: TestUser {
+                username: user,
+                password,
+            },
+            connection_seq: AtomicU64::new(1),
+            consumer_tag_seq: AtomicU64::new(1),
+        }
+    }
+
+    /// Commit records through the journal writer (the durable boundary,
+    /// ADR-0001). Memory-backed mode accepts and continues (it never had a
+    /// persistence claim); a persistent-mode failure is an error the caller
+    /// must surface — never a fabricated success (§6.4).
+    pub fn journal_commit(
+        &self,
+        records: &[Record],
+    ) -> std::result::Result<(), JournalCommitError> {
+        let mut journal = self.journal.lock().unwrap();
+        match journal.as_mut() {
+            Some(writer) => writer.commit(records).map(|_| ()).map_err(|e| {
+                tracing::error!(error = %e, "journal commit failed");
+                JournalCommitError
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the journal is active (persistence claims are possible).
+    pub fn is_persistent(&self) -> bool {
+        self.journal.lock().unwrap().is_some()
     }
 
     /// Server-generated consumer tag (RabbitMQ-style amq.ctag-...).

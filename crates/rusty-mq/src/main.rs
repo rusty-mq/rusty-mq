@@ -27,6 +27,10 @@ enum Command {
         /// Listen address; loopback only until M7 (PRD early safety constraint).
         #[arg(long, default_value = "127.0.0.1:5672")]
         listen: SocketAddr,
+        /// Data directory for the durable journal; absent = memory-backed
+        /// development mode (no persistence claim).
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
         /// Development username for SASL PLAIN (M1 test auth only).
         #[arg(long, default_value = "guest")]
         user: String,
@@ -49,6 +53,7 @@ fn main() {
     match cli.command {
         Command::Serve {
             listen,
+            data_dir,
             user,
             password,
         } => {
@@ -57,7 +62,10 @@ fn main() {
                     "development credentials guest/guest in use; real authentication lands in M7"
                 );
             }
-            let broker = rusty_mq::Broker::new(user, password);
+            let broker = match &data_dir {
+                Some(dir) => rusty_mq::Broker::open_persistent(user, password, dir),
+                None => rusty_mq::Broker::new(user, password),
+            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

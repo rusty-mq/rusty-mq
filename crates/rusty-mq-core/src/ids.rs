@@ -76,6 +76,33 @@ impl QueueId {
     }
 }
 
+/// Raw-id access for journaling (stable identities across restarts) and
+/// white-box tests. Values are opaque; callers must not interpret them.
+impl QueueId {
+    pub fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn to_raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl ExchangeId {
+    pub fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn to_raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Raise the global id mint past `v` so freshly minted ids never collide
+/// with restored journal identities (call once after replay with the
+/// highest restored id).
+pub fn bump_past(v: u64) {
+    let _ = NEXT_ID.fetch_max(v + 1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

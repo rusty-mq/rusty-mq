@@ -90,6 +90,12 @@ struct InFlightPublish {
     assembler: MessageAssembler,
 }
 
+/// Which terminal settlement a journal record represents.
+enum SettlementKind {
+    Ack,
+    Discard,
+}
+
 /// A delivery held out of the ready set pending settlement (§6.1).
 struct UnackedDelivery {
     queue: QueueId,
@@ -816,6 +822,12 @@ impl Connection {
                 class_id,
                 method_id,
             ),
+            TopologyError::ResourceErrorJournal => ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                "RESOURCE_ERROR - durable journal commit failed",
+                class_id,
+                method_id,
+            ),
         }
     }
 
@@ -985,15 +997,43 @@ impl Connection {
         };
         let declared: Result<(), rusty_mq_core::topology::DeclareExchangeError> = {
             let mut topo = self.broker.topology.lock().unwrap();
-            topo.declare_exchange(
+            let result = topo.declare_exchange(
                 vhost,
                 d.exchange.as_str(),
                 kind,
                 d.durable,
                 d.auto_delete,
                 d.internal,
-            )
-            .map(|_| ())
+            );
+            // Durable declarations wait for the journal commit before their
+            // success reply (§9.1); memory mode commits trivially.
+            let mut journal_failure = false;
+            if let (Ok(id), true) = (&result, d.durable) {
+                let record =
+                    rusty_mq_storage::Record::ExchangeDeclare(rusty_mq_storage::ExchangeRecord {
+                        name: d.exchange.as_str().to_string(),
+                        id: id.to_raw(),
+                        kind: match kind {
+                            rusty_mq_core::routing::ExchangeType::Direct => 0,
+                            rusty_mq_core::routing::ExchangeType::Fanout => 1,
+                            rusty_mq_core::routing::ExchangeType::Topic => 2,
+                        },
+                        durable: d.durable,
+                        auto_delete: d.auto_delete,
+                        internal: d.internal,
+                    });
+                if self.broker.journal_commit(&[record]).is_err() {
+                    topo.remove_exchange_by_id(vhost, *id);
+                    journal_failure = true;
+                }
+            }
+            if journal_failure {
+                Err(rusty_mq_core::topology::DeclareExchangeError::Topology(
+                    rusty_mq_core::topology::TopologyError::ResourceErrorJournal,
+                ))
+            } else {
+                result.map(|_| ())
+            }
         };
         match declared {
             Ok(()) if !d.nowait => {
@@ -1133,12 +1173,39 @@ impl Connection {
         // Active declare.
         let declared: Result<String, rusty_mq_core::topology::DeclareQueueError> = {
             let mut topo = self.broker.topology.lock().unwrap();
-            topo.declare_queue(vhost, d.queue.as_str(), profile, owner)
-                .map(|id| {
+            let result = topo.declare_queue(vhost, d.queue.as_str(), profile, owner);
+            // Durable declarations wait for the journal commit (§9.1).
+            let mut journal_failure = false;
+            if let (Ok(id), true) = (&result, d.durable) {
+                let name = topo
+                    .queue_record(*id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                let record =
+                    rusty_mq_storage::Record::QueueDeclare(rusty_mq_storage::QueueRecord {
+                        name,
+                        id: id.to_raw(),
+                        durable: profile.durable,
+                        exclusive: false, // durable+exclusive rejected upstream
+                        auto_delete: false,
+                        owner: 0,
+                    });
+                if self.broker.journal_commit(&[record]).is_err() {
+                    topo.remove_queue_by_id(vhost, *id);
+                    journal_failure = true;
+                }
+            }
+            if journal_failure {
+                Err(rusty_mq_core::topology::DeclareQueueError::Topology(
+                    rusty_mq_core::topology::TopologyError::ResourceErrorJournal,
+                ))
+            } else {
+                result.map(|id| {
                     topo.queue_record(id)
                         .map(|r| r.name.clone())
                         .unwrap_or_default()
                 })
+            }
         };
         match declared {
             Ok(name) => {
@@ -1217,27 +1284,50 @@ impl Connection {
             // and the delete-ok reply.
             let ready = self.broker.store.lock().unwrap().len(id);
             let consumer_count = self.broker.consumers.lock().unwrap().consumer_count(id);
-            let deleted = self.broker.topology.lock().unwrap().delete_queue(
-                vhost,
-                &name,
-                d.if_unused,
-                d.if_empty,
-                consumer_count,
-                ready,
-            );
-            match deleted {
-                Ok(_) => Ok(()),
-                Err(e) => Err(Self::topology_error(e, CLASS, method)),
-            }
-            .map(|_| {
-                // Tear down consumers: notify capable ones, deregister all
-                // (FR-Q09), then drop stored entries.
-                let jobs = self.broker.cancel_and_deregister_queue(id);
-                for (mailbox, job) in jobs {
-                    let _ = mailbox.try_send(job);
+            let durable = self
+                .broker
+                .topology
+                .lock()
+                .unwrap()
+                .queue_record(id)
+                .is_some_and(|r| r.profile.durable);
+            // Durable deletes commit to the journal BEFORE the live removal:
+            // a failed commit leaves everything intact (§6.4).
+            let journal_ok = !durable
+                || self
+                    .broker
+                    .journal_commit(&[rusty_mq_storage::Record::QueueDelete { id: id.to_raw() }])
+                    .is_ok();
+            if !journal_ok {
+                Err(ProtocolError::channel(
+                    reply_code::RESOURCE_ERROR,
+                    "RESOURCE_ERROR - durable journal commit failed",
+                    CLASS,
+                    method,
+                ))
+            } else {
+                let deleted = self.broker.topology.lock().unwrap().delete_queue(
+                    vhost,
+                    &name,
+                    d.if_unused,
+                    d.if_empty,
+                    consumer_count,
+                    ready,
+                );
+                match deleted {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(Self::topology_error(e, CLASS, method)),
                 }
-                self.broker.store.lock().unwrap().drain(id)
-            })
+                .map(|_| {
+                    // Tear down consumers: notify capable ones, deregister all
+                    // (FR-Q09), then drop stored entries.
+                    let jobs = self.broker.cancel_and_deregister_queue(id);
+                    for (mailbox, job) in jobs {
+                        let _ = mailbox.try_send(job);
+                    }
+                    self.broker.store.lock().unwrap().drain(id)
+                })
+            }
         };
         match outcome {
             Ok(discarded) => {
@@ -1291,9 +1381,33 @@ impl Connection {
                     CLASS,
                     method,
                 )),
-                (Some(q), Some(e)) => topo
-                    .bind(vhost, e, q, d.routing_key.as_str())
-                    .map_err(|err| Self::topology_error(err, CLASS, method)),
+                (Some(q), Some(e)) => {
+                    let both_durable = topo.exchange_record(e).is_some_and(|r| r.durable)
+                        && topo.queue_record(q).is_some_and(|r| r.profile.durable);
+                    let result = topo
+                        .bind(vhost, e, q, d.routing_key.as_str())
+                        .map_err(|err| Self::topology_error(err, CLASS, method));
+                    if result.is_ok() && both_durable {
+                        let record = rusty_mq_storage::Record::Bind(rusty_mq_storage::Binding {
+                            exchange: e.to_raw(),
+                            queue: q.to_raw(),
+                            routing_key: d.routing_key.as_str().to_string(),
+                        });
+                        drop(topo);
+                        if self.broker.journal_commit(&[record]).is_err() {
+                            Err(ProtocolError::channel(
+                                reply_code::RESOURCE_ERROR,
+                                "RESOURCE_ERROR - durable journal commit failed",
+                                CLASS,
+                                method,
+                            ))
+                        } else {
+                            result
+                        }
+                    } else {
+                        result
+                    }
+                }
             }
         };
         match outcome {
@@ -1338,9 +1452,33 @@ impl Connection {
                     CLASS,
                     method,
                 )),
-                (Some(q), Some(e)) => topo
-                    .unbind(vhost, e, q, d.routing_key.as_str())
-                    .map_err(|err| Self::topology_error(err, CLASS, method)),
+                (Some(q), Some(e)) => {
+                    let both_durable = topo.exchange_record(e).is_some_and(|r| r.durable)
+                        && topo.queue_record(q).is_some_and(|r| r.profile.durable);
+                    let result = topo
+                        .unbind(vhost, e, q, d.routing_key.as_str())
+                        .map_err(|err| Self::topology_error(err, CLASS, method));
+                    if result.is_ok() && both_durable {
+                        let record = rusty_mq_storage::Record::Unbind(rusty_mq_storage::Binding {
+                            exchange: e.to_raw(),
+                            queue: q.to_raw(),
+                            routing_key: d.routing_key.as_str().to_string(),
+                        });
+                        drop(topo);
+                        if self.broker.journal_commit(&[record]).is_err() {
+                            Err(ProtocolError::channel(
+                                reply_code::RESOURCE_ERROR,
+                                "RESOURCE_ERROR - durable journal commit failed",
+                                CLASS,
+                                method,
+                            ))
+                        } else {
+                            result
+                        }
+                    } else {
+                        result
+                    }
+                }
             }
         };
         match outcome {
@@ -1393,8 +1531,35 @@ impl Connection {
                     ))
                 }
                 Some(id) => {
+                    let durable = topo.queue_record(id).is_some_and(|r| r.profile.durable);
                     drop(topo);
-                    Ok(self.broker.store.lock().unwrap().purge(id))
+                    // Capture the ready set at this ordering point (§9.4),
+                    // journal it for durable queues, then purge live. A
+                    // failed journal commit aborts with everything intact.
+                    let mut store = self.broker.store.lock().unwrap();
+                    let mut journal_failure = false;
+                    if durable {
+                        let seqs = store.ready_seqs(id);
+                        if !seqs.is_empty() {
+                            let record = rusty_mq_storage::Record::Purge {
+                                queue: id.to_raw(),
+                                seqs,
+                            };
+                            if self.broker.journal_commit(&[record]).is_err() {
+                                journal_failure = true;
+                            }
+                        }
+                    }
+                    if journal_failure {
+                        Err(ProtocolError::channel(
+                            reply_code::RESOURCE_ERROR,
+                            "RESOURCE_ERROR - durable journal commit failed",
+                            CLASS,
+                            method,
+                        ))
+                    } else {
+                        Ok(store.purge(id))
+                    }
                 }
             }
         };
@@ -1687,6 +1852,56 @@ impl Connection {
             }
         };
 
+        // Durable-destination routing for persistent messages: pre-assign
+        // sequences and commit the Enqueue record BEFORE live admission
+        // (§9.5). The store lock is held across the commit so the assigned
+        // sequences cannot race another publisher (correctness before
+        // throughput; group commit batches this in M5).
+        let durable_destinations: Vec<QueueId> = if message.persistent {
+            let topo = self.broker.topology.lock().unwrap();
+            destinations
+                .iter()
+                .copied()
+                .filter(|q| topo.queue_record(*q).is_some_and(|r| r.profile.durable))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The commit happens inside a scoped block so the store guard ends
+        // before any await on this path.
+        let commit_failed = if !durable_destinations.is_empty() {
+            let store = self.broker.store.lock().unwrap();
+            let assigned: Vec<(u64, u64)> = durable_destinations
+                .iter()
+                .map(|q| (q.to_raw(), store.next_seq_of(*q)))
+                .collect();
+            let record = rusty_mq_storage::Record::Enqueue(rusty_mq_storage::Enqueue {
+                // Message identity is the (queue, seq) pair in V1; the
+                // broker-wide id arrives with the redb projection (M5).
+                message_id: 0,
+                property_bytes: message.property_bytes.clone(),
+                body: message.body.clone(),
+                exchange: message.exchange.clone(),
+                routing_key: message.routing_key.clone(),
+                persistent: true,
+                destinations: assigned,
+            });
+            let failed = self.broker.journal_commit(&[record]).is_err();
+            drop(store); // unconditional within this block
+            failed
+        } else {
+            false
+        };
+        if commit_failed {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                "RESOURCE_ERROR - durable journal commit failed",
+                rusty_mq_protocol::error::class_id::BASIC,
+                40, // basic.publish
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
+
         // Admit to every destination under the store budget, then dispatch
         // to waiting consumers.
         for queue in &destinations {
@@ -1953,10 +2168,19 @@ impl Connection {
     /// Apply a settlement to `tags`: drop (ack/nack without requeue —
     /// terminal discard in V1, DLX is deferred) or requeue (original
     /// relative position, redelivered hint). Releases consumer credit and
-    /// re-dispatched freed queues.
-    fn apply_settlement(&mut self, channel_id: u16, tags: Vec<u64>, requeue: bool) {
+    /// re-dispatched freed queues. Terminal settlements of persistent
+    /// entries from durable queues are journaled (INV-02: a positively
+    /// settled entry must never resurrect).
+    fn apply_settlement(
+        &mut self,
+        channel_id: u16,
+        tags: Vec<u64>,
+        requeue: bool,
+        ack_kind: SettlementKind,
+    ) {
         let mut requeued_queues: Vec<QueueId> = Vec::new();
         let mut released: Vec<Option<String>> = Vec::new();
+        let mut journal_records: Vec<rusty_mq_storage::Record> = Vec::new();
         if let Some(ch) = self.channels.get_mut(&channel_id) {
             for tag in tags {
                 if let Some(u) = ch.unacked.remove(&tag) {
@@ -1966,11 +2190,46 @@ impl Connection {
                         if !requeued_queues.contains(&u.queue) {
                             requeued_queues.push(u.queue);
                         }
+                    } else {
+                        // Terminal: journal when persistent + durable queue.
+                        if u.entry.message.persistent {
+                            let durable = self
+                                .broker
+                                .topology
+                                .lock()
+                                .unwrap()
+                                .queue_record(u.queue)
+                                .is_some_and(|r| r.profile.durable);
+                            if durable {
+                                journal_records.push(match ack_kind {
+                                    SettlementKind::Ack => rusty_mq_storage::Record::SettleAck {
+                                        queue: u.queue.to_raw(),
+                                        seq: u.entry.seq,
+                                    },
+                                    SettlementKind::Discard => {
+                                        rusty_mq_storage::Record::SettleDiscard {
+                                            queue: u.queue.to_raw(),
+                                            seq: u.entry.seq,
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        // The entry was already held out of the ready set;
+                        // dropping it from unacked completes the settlement.
                     }
-                    // else: terminal discard — the entry was already held
-                    // out of the ready set, so dropping it is enough.
                 }
             }
+        }
+        if !journal_records.is_empty() && self.broker.journal_commit(&journal_records).is_err() {
+            tracing::error!(
+                count = journal_records.len(),
+                "settlement journal commit failed; entry may redeliver after restart"
+            );
+            // §6.4: never fabricate success — but the settlement was
+            // already applied in-memory; the failure is logged and the
+            // entries remain recoverable (at-least-once, never loss of
+            // an unsettled message).
         }
         for consumer_tag in released.into_iter().flatten() {
             self.broker
@@ -2008,7 +2267,7 @@ impl Connection {
             Ok(tags) => tags,
             Err(e) => return self.protocol_error(channel_id, &e).await,
         };
-        self.apply_settlement(channel_id, tags, false);
+        self.apply_settlement(channel_id, tags, false, SettlementKind::Ack);
         true
     }
 
@@ -2024,7 +2283,7 @@ impl Connection {
             Ok(tags) => tags,
             Err(e) => return self.protocol_error(channel_id, &e).await,
         };
-        self.apply_settlement(channel_id, tags, d.requeue);
+        self.apply_settlement(channel_id, tags, d.requeue, SettlementKind::Discard);
         true
     }
 
@@ -2040,7 +2299,7 @@ impl Connection {
             Ok(tags) => tags,
             Err(e) => return self.protocol_error(channel_id, &e).await,
         };
-        self.apply_settlement(channel_id, tags, d.requeue);
+        self.apply_settlement(channel_id, tags, d.requeue, SettlementKind::Discard);
         true
     }
 
@@ -2059,7 +2318,9 @@ impl Connection {
             .get(&channel_id)
             .map(|ch| ch.unacked.keys().copied().collect())
             .unwrap_or_default();
-        self.apply_settlement(channel_id, tags, true);
+        // recover requeues everything; nothing is terminal, so no journal
+        // record (Discard kind is only recorded when requeue=false).
+        self.apply_settlement(channel_id, tags, true, SettlementKind::Discard);
         let ok = basic::AMQPMethod::RecoverOk(basic::RecoverOk {});
         self.send(AMQPFrame::Method(channel_id, AMQPClass::Basic(ok)))
             .await

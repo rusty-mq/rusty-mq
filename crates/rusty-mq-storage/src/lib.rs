@@ -14,6 +14,7 @@
 //! positively claim persistence).
 
 pub mod journal;
+pub mod rebuild;
 pub mod record;
 
 pub use journal::{

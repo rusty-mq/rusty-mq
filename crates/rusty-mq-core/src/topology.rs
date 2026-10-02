@@ -97,6 +97,11 @@ pub enum TopologyError {
     QueueInUse,
     #[error("queue not empty")]
     QueueNotEmpty,
+    /// Journal commit failed for a durable mutation; live state unchanged.
+    /// (Storage-layer failure surfaced through the topology vocabulary so
+    /// handlers map it uniformly to 506.)
+    #[error("durable journal commit failed")]
+    ResourceErrorJournal,
 }
 
 /// Declaration-rejection reasons for unsupported V1 profiles (§5.3 table).
@@ -348,6 +353,121 @@ impl Topology {
 
     pub fn exchange_record(&self, id: ExchangeId) -> Option<&ExchangeRecord> {
         self.exchanges.get(&id)
+    }
+
+    /// Replay-only: restore a queue exactly as journaled (durable
+    /// declarations only). Idempotent on identity.
+    pub fn restore_queue(
+        &mut self,
+        vhost: VhostId,
+        name: &str,
+        id: QueueId,
+        profile: QueueProfile,
+    ) {
+        if self.queues.contains_key(&id) {
+            return;
+        }
+        self.queues.insert(
+            id,
+            QueueRecord {
+                id,
+                vhost,
+                name: name.to_string(),
+                profile,
+                owner_connection: None, // ownership is session state, never restored (§9.3)
+                has_had_consumer: false,
+            },
+        );
+        self.queue_names
+            .entry(vhost)
+            .or_default()
+            .insert(name.to_string(), id);
+    }
+
+    /// Replay-only: restore an exchange exactly as journaled.
+    #[allow(clippy::too_many_arguments)] // replay mirror of the journal record
+    pub fn restore_exchange(
+        &mut self,
+        vhost: VhostId,
+        name: &str,
+        id: ExchangeId,
+        kind: crate::routing::ExchangeType,
+        durable: bool,
+        auto_delete: bool,
+        internal: bool,
+    ) {
+        if self.exchanges.contains_key(&id) {
+            return;
+        }
+        self.exchanges.insert(
+            id,
+            ExchangeRecord {
+                id,
+                vhost,
+                name: name.to_string(),
+                kind,
+                durable,
+                auto_delete,
+                internal,
+            },
+        );
+        self.exchange_names
+            .entry(vhost)
+            .or_default()
+            .insert(name.to_string(), id);
+    }
+
+    /// Remove an exchange by id (replay path); drops its bindings.
+    pub fn remove_exchange_by_id(&mut self, vhost: VhostId, id: ExchangeId) {
+        if let Some(rec) = self.exchanges.remove(&id) {
+            if let Some(names) = self.exchange_names.get_mut(&vhost) {
+                names.remove(&rec.name);
+            }
+            if let Some(vb) = self.bindings.get_mut(&vhost) {
+                vb.remove(&id);
+            }
+        }
+    }
+
+    /// Remove one binding by identity (replay path); no error if absent.
+    pub fn remove_binding(
+        &mut self,
+        vhost: VhostId,
+        exchange: ExchangeId,
+        queue: QueueId,
+        key: &str,
+    ) {
+        if let Some(list) = self
+            .bindings
+            .get_mut(&vhost)
+            .and_then(|m| m.get_mut(&exchange))
+        {
+            list.retain(|b| !(b.queue == queue && b.key == key));
+        }
+    }
+
+    /// Replay-only: restore a binding (idempotent).
+    pub fn restore_binding(
+        &mut self,
+        vhost: VhostId,
+        exchange: ExchangeId,
+        queue: QueueId,
+        key: &str,
+    ) {
+        let list = self
+            .bindings
+            .entry(vhost)
+            .or_default()
+            .entry(exchange)
+            .or_default();
+        if list.iter().any(|b| b.queue == queue && b.key == key) {
+            return;
+        }
+        list.push(crate::routing::Binding {
+            exchange,
+            queue,
+            key: key.to_string(),
+        });
     }
 
     /// Remove every queue owned by `connection` (exclusive queues and their

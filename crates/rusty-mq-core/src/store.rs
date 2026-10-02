@@ -93,6 +93,36 @@ impl MessageStore {
             .map_or(0, |q| q.entries.len() as u64)
     }
 
+    /// Sequences of the current ready set (purge records must name the
+    /// exact set selected at the ordering point — §9.4).
+    pub fn ready_seqs(&self, queue: QueueId) -> Vec<u64> {
+        self.queues
+            .get(&queue)
+            .map(|q| q.entries.iter().map(|e| e.seq).collect())
+            .unwrap_or_default()
+    }
+
+    /// The sequence the next enqueue on this queue will receive (pure
+    /// peek: does NOT consume; the caller holds the store lock across the
+    /// journal commit and the following enqueue, so the value cannot
+    /// change in between).
+    pub fn next_seq_of(&self, queue: QueueId) -> u64 {
+        self.queues.get(&queue).map_or(0, |q| q.next_seq)
+    }
+
+    /// Replay-only: restore an entry with its journaled identity (queue id
+    /// + sequence); the next mint continues past it. Idempotent per seq.
+    pub fn restore_with_seq(&mut self, queue: QueueId, seq: u64, message: StoredMessage) {
+        let size = message.size_bytes();
+        let q = self.queues.entry(queue).or_default();
+        q.next_seq = q.next_seq.max(seq + 1);
+        if q.entries.iter().any(|e| e.seq == seq) {
+            return; // idempotent replay
+        }
+        q.entries.push_back(QueueEntry { seq, message });
+        self.total_bytes += size;
+    }
+
     /// Aggregate ready bytes (budget accounting and metrics).
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
