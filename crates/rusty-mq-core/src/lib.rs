@@ -9,10 +9,12 @@
 
 pub mod ids;
 pub mod routing;
+pub mod store;
 pub mod topology;
 
 pub use ids::{ChannelGeneration, ConnectionId, ExchangeId, QueueId, VhostId};
 pub use routing::{route_message, ExchangeType};
+pub use store::{AdmitError, MessageStore, QueueEntry, StoredMessage};
 pub use topology::{
     BindingKey, DeclareExchangeError, DeclareQueueError, QueueProfile, Topology, TopologyError,
 };

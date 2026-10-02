@@ -15,7 +15,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | --- | --- | --- |
 | M0 — contracts | complete (partial evidence) | Workspace, ledger, baseline fixtures, ADRs exist; baseline digest pinning is a standing TODO for the first CI runner with Docker |
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
-| M2 — topology and routing | in_progress | Topology methods (exchange/queue declare+delete, bind/unbind, purge-ok) wired to core with frozen error profile; lapin-verified (T04/T05/T22 slices). basic.publish + routing to queue entries is the next slice |
+| M2 — topology and routing | in_progress | Publish→route→get round trips verified with lapin: direct/topic/fanout/default-exchange routing, INV-05 dedup, typed property roundtrip, mandatory NO_ROUTE returns, manual-ack settlement + requeue-on-channel-close, real message counts. Remaining for the M2 exit gate: publish-time permission surface review + differential fixtures |
 | M3 — delivery state | not_started | |
 | M4 — durable authority | not_started | Storage crate scaffold only |
 | M5 — confirms and failure safety | not_started | |
@@ -48,9 +48,9 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-E02 | complete (partial evidence) | declare + passive + equivalence | `topology_lapin.rs` roundtrip + 406/404 tests | delete paths tested; auto-delete lifecycle unit-tested in core |
 | FR-E03 | in_progress | durability flags stored; auto-delete exchange lifecycle in core | core unit tests | internal=true publish gate lands with publish slice |
 | FR-E04 | complete (partial evidence) | bind/unbind idempotent | lapin roundtrip (`duplicate bind idempotent`) | |
-| FR-E05 | in_progress | matchers done; publish routing next | unit + property tests (T27 oracle) | |
-| FR-E06 | in_progress | destination-set dedup in router | unit tests | exercised end-to-end with publish slice |
-| FR-E07 | not_started | | | default-exchange routing lands with publish slice |
+| FR-E05 | complete (partial evidence) | routing end-to-end on publish | `topic_fanout_routing_and_inv05`, `publish_route_get_roundtrip_with_properties`, `default_exchange_routes_by_queue_name` | |
+| FR-E06 | complete (partial evidence) | destination-set dedup | `topic_fanout_routing_and_inv05` (two matching bindings → one copy) | |
+| FR-E07 | complete (partial evidence) | default exchange routes by queue name | `default_exchange_routes_by_queue_name` | |
 | FR-E08 | not_started | | | needs M4 journal |
 
 ### Queues (§5.3)
@@ -62,14 +62,29 @@ Updated: 2026-10-02 (M0/M1 development start).
 | FR-Q03 | complete (partial evidence) | equivalence 406 | `conflicting_redeclare_is_406` | |
 | FR-Q04 | complete (partial evidence) | exclusivity incl. passive-inspect lockout (405) | `exclusive_queue_dies_with_connection` | publish-through-exchange gate lands with publish slice |
 | FR-Q05 | not_started | | | auto-delete after last consumer needs M3 consumers |
-| FR-Q06 | in_progress | delete with if_unused/if_empty; purge-ok zero-count stub | lapin roundtrip delete | conditions pass trivially until messages/consumers exist; purge counts real from message store |
+| FR-Q06 | complete (partial evidence) | delete with if_unused/if_empty (real ready counts), purge ready-only with counts | store unit tests (`purge_counts_and_frees_budget`) | if_unused consumer check arrives with M3 consumers |
 | FR-Q07 | complete (partial evidence) | x-queue-type absent or classic accepted | `unsupported_arguments_are_540` (rejects non-classic) | |
 | FR-Q08 | complete (partial evidence) | quorum/stream + all other args 540 | same test (x-message-ttl 540) | |
 | FR-Q09 | not_started | | | consumer-cancel negotiation lands with M3 |
 
 ### Messages (§5.4), delivery/settlement (§6), resource limits (§10)
 
-All `not_started` except routing groundwork noted above.
+| ID | Status | Implementation | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| FR-M01 | complete (partial evidence) | arbitrary bodies incl. zero bytes and 0xCE octets | `publish_route_get_roundtrip_with_properties` | zero-length via assembler unit tests |
+| FR-M02 | complete (partial evidence) | properties preserved as encoded blobs through store | same test (typed headers/props roundtrip) | |
+| FR-M03 | complete (partial evidence) | absent=transient, 1/2 valid, else 503 | `invalid_delivery_mode_is_rejected` | |
+| FR-M04 | complete (partial evidence) | user_id mismatch → 403 | unit-level gate in `admit_properties` | dedicated lapin test pending (M7 auth suite) |
+| FR-M05 | complete (partial evidence) | expiration property → 540 | `expiration_property_is_rejected` | |
+| FR-M06 | in_progress | priority preserved as property; FIFO scheduling | property roundtrip test | priority-queue args still 540 ✓ |
+| FR-PUB01 | complete (partial evidence) | publish+envelope on delivery | roundtrip tests | |
+| FR-PUB02 | complete (partial evidence) | mandatory NO_ROUTE return + content | `mandatory_return_frame_level` | lapin surfaces returns only in confirm mode |
+| FR-PUB03 | complete (partial evidence) | nonexistent exchange → 404 at publish | exchange gate in publish handler | |
+| FR-PUB04 | complete (partial evidence) | immediate=true → 540 | gate in publish handler | |
+| FR-C02 | complete (partial evidence) | basic.get with get-ok/get-empty | all get-based tests | |
+| FR-C04 | in_progress | channel-scoped monotonic tags (get path) | manual-ack test | confirm numbering separate (M5) |
+| FR-C05 | in_progress | basic.ack single+multiple implemented | `manual_ack_settles_and_requeues_on_channel_close` | reject/nack land in M3 |
+| FR-C06 | in_progress | requeue on channel close with redelivered hint | same test | connection-loss requeue via teardown path |
 
 ### Security (§11), management (§12), CLI/config (§13)
 
@@ -82,12 +97,26 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T01 | in_progress | `crates/rusty-mq/tests/handshake_lapin.rs` — lapin client handshake + channel open/close (1 of 5 clients) |
 | T02 | in_progress | `rusty-mq-protocol` framing unit tests: split frames, merged chunks, bad frame-end, oversize |
 | T03 | not_started | |
-| T04 | in_progress | `topology_lapin.rs` roundtrip (declare/bind/unbind/delete) + core routing unit/property tests |
+| T04 | in_progress | `topology_lapin.rs` roundtrip + `publish_lapin.rs` routing matrix (direct/topic/fanout/default, INV-05) |
 | T05 | in_progress | `topology_lapin.rs`: equivalence, passive, generated names, exclusivity, reclaim |
-| T06–T30 | not_started | |
+| T06 | in_progress | `publish_route_get_roundtrip_with_properties`: bit-identical bodies, typed headers/props |
+| T12 | in_progress | `mandatory_return_frame_level`: return-before-any-success, 312 NO_ROUTE |
+| T07–T11, T13–T30 | not_started | |
 
 ## Client-library findings (evidence-backed)
 
+- **lapin `basic_publish` resolves on write, not on broker outcome**: without
+  confirm mode the returned future completes when frames are written, so
+  server-side publish rejections (404 exchange, 503 delivery-mode, 540
+  expiration) surface on the *next* channel operation or as a local
+  "channel not open" error, depending on timing. Tests observe the closure
+  plus the substantive outcome (message absent). Confirms rejections
+  deterministically once confirm.select lands (M5).
+- **Close-handshake interlude is required**: a server channel.close while
+  client content frames are in flight must NOT be treated as a fatal
+  unexpected-frame 505/504 — RabbitMQ drops in-flight frames for channels
+  awaiting close-ok. Implemented as an `awaiting_close_ok` set; found via
+  lapin treating the 504 as connection-fatal.
 - **Dependency version split**: lapin 4.12 resolves `amq-protocol-types`
   10.6.3 while the broker uses `amq-protocol` 7.2.3 — two codec versions coexist
   in the test tree. They interoperate on the wire (integration tests pass),

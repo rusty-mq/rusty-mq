@@ -21,7 +21,7 @@ pub use amq_protocol::{
 };
 
 pub use error::ProtocolError;
-pub use framing::{encode_frame, FrameReader, MessageAssembler};
+pub use framing::{encode_frame, encode_properties, FrameReader, MessageAssembler};
 pub use limits::{NegotiatedLimits, ProtocolLimits};
 
 /// AMQP 0-9-1 frame-end octet.

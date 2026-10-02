@@ -229,6 +229,14 @@ pub fn check_protocol_header(bytes: &[u8; 8]) -> HeaderCheck {
     }
 }
 
+/// Serialize a basic property list to its opaque encoded form (used by the
+/// wire-free core message store).
+pub fn encode_properties(props: &amq_protocol::protocol::basic::AMQPProperties) -> Vec<u8> {
+    use amq_protocol::protocol::basic::gen_properties;
+    cookie_factory::gen_simple(gen_properties(props), Vec::new())
+        .expect("property serialization into Vec is infallible")
+}
+
 /// Serialize one frame to bytes (connection writer side, FR-P07).
 pub fn encode_frame(frame: &AMQPFrame) -> Vec<u8> {
     use amq_protocol::frame::gen_frame;

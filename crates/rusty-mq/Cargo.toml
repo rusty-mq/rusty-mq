@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 lapin = { workspace = true }
+amq-protocol = { workspace = true }
 tokio-test = { workspace = true }
 
 [lints]

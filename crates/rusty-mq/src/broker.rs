@@ -6,8 +6,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use rusty_mq_core::store::MessageStore;
 use rusty_mq_core::topology::{CompatibilitySwitches, Topology};
 use rusty_mq_core::ConnectionId;
+
+/// Aggregate in-memory message budget for the development broker
+/// (bounded by construction, INV-09; configurable in M7's config surface).
+const MESSAGE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Permitted credentials for the development alpha.
 #[derive(Clone)]
@@ -19,6 +24,8 @@ pub struct TestUser {
 /// The broker singleton shared by all connections.
 pub struct Broker {
     pub topology: Mutex<Topology>,
+    /// In-memory message store (M2); the durable journal augments this in M4.
+    pub store: Mutex<MessageStore>,
     /// M1: exactly one test user; M7 replaces this with durable principals.
     pub test_user: TestUser,
     connection_seq: AtomicU64,
@@ -28,6 +35,7 @@ impl Broker {
     pub fn new(user: String, password: String) -> Self {
         Self {
             topology: Mutex::new(Topology::new(CompatibilitySwitches::default())),
+            store: Mutex::new(MessageStore::new(MESSAGE_BYTE_BUDGET)),
             test_user: TestUser {
                 username: user,
                 password,

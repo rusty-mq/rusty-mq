@@ -78,6 +78,24 @@ not silently skipped.
 Anything outside this set (e.g. `tx.*`, `basic.recover-async`,
 `exchange.bind`) is rejected with `540 NOT_IMPLEMENTED` at channel scope.
 
+## Publish-time gates (frozen in this slice)
+
+| Condition | Response |
+| --- | --- |
+| `immediate=true` | 540 NOT_IMPLEMENTED (channel) |
+| `expiration` property present | 540 NOT_IMPLEMENTED (channel) |
+| `delivery_mode` not in {absent, 1, 2} | 503 COMMAND_INVALID (channel) |
+| `user_id` set and ≠ authenticated principal | 403 ACCESS_REFUSED (channel) |
+| Nonexistent exchange | 404 NOT_FOUND (channel), before content processing |
+| Internal exchange publication | 403 ACCESS_REFUSED (channel) |
+| Aggregate in-memory byte budget exceeded | 506 RESOURCE_ERROR (channel); never silent acceptance |
+| `mandatory=true`, zero destinations | basic.return 312 NO_ROUTE + content, on the publishing channel |
+
+Content frames arriving for a channel the server has closed (close-handshake
+interlude) are dropped, not escalated — matches RabbitMQ and prevents
+in-flight client content from killing the connection after a publish-time
+rejection.
+
 ## Error profile
 
 | Condition | Reply code | Scope |

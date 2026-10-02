@@ -13,18 +13,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use amq_protocol::frame::AMQPFrame;
+use amq_protocol::frame::{AMQPContentHeader, AMQPFrame};
+use amq_protocol::protocol::basic::{self, parse_properties, AMQPProperties};
 use amq_protocol::protocol::{channel, connection, exchange, queue, AMQPClass};
 use amq_protocol::types::{FieldTable, LongString};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
+use rusty_mq_core::store::{AdmitError, QueueEntry, StoredMessage};
 use rusty_mq_core::topology::TopologyError;
-use rusty_mq_core::{ChannelGeneration, ConnectionId, VhostId};
+use rusty_mq_core::{ChannelGeneration, ConnectionId, QueueId, VhostId};
 use rusty_mq_protocol::error::reply_code;
 use rusty_mq_protocol::{
-    encode_frame, FrameReader, NegotiatedLimits, ProtocolError, ProtocolLimits,
+    encode_frame, FrameReader, MessageAssembler, NegotiatedLimits, ProtocolError, ProtocolLimits,
     PROTOCOL_HEADER_0_9_1,
 };
 
@@ -53,13 +55,36 @@ enum Phase {
     Closing,
 }
 
-/// Per-channel state (ADR-0003 generations; FR-Q02 last-declared-queue
-/// shorthand for empty queue names).
+/// Per-channel state (ADR-0003): generations, last-declared-queue
+/// shorthand, in-flight publish content assembly, and outstanding
+/// manual-ack deliveries with channel-scoped tags (FR-C04).
 struct ChannelState {
     #[allow(dead_code)] // consumed by delivery ownership from M3
     generation: ChannelGeneration,
     /// Most recently declared queue on this channel (empty-name shorthand).
     last_queue: Option<String>,
+    /// Content assembly for the basic.publish in flight on this channel.
+    content: Option<InFlightPublish>,
+    /// Next channel-scoped delivery tag (monotonic, FR-C04).
+    next_delivery_tag: u64,
+    /// Outstanding manual-ack deliveries: tag -> held entry.
+    unacked: HashMap<u64, UnackedDelivery>,
+}
+
+/// A basic.publish whose content frames are still arriving.
+struct InFlightPublish {
+    exchange: String,
+    routing_key: String,
+    mandatory: bool,
+    property_bytes: Vec<u8>,
+    persistent: bool,
+    assembler: MessageAssembler,
+}
+
+/// A delivery held out of the ready set pending settlement (§6.1).
+struct UnackedDelivery {
+    queue: QueueId,
+    entry: QueueEntry,
 }
 
 /// Owns one accepted connection until it ends.
@@ -68,6 +93,10 @@ pub struct Connection {
     conn_id: ConnectionId,
     /// Vhost bound at `connection.open` (None until then).
     vhost: Option<VhostId>,
+    /// Channels we closed and whose close-ok has not arrived: frames for
+    /// these channels are ignored (close-handshake interlude; content may
+    /// still be in flight from the client).
+    awaiting_close_ok: HashMap<u16, ()>,
     limits: ProtocolLimits,
     negotiated: Option<NegotiatedLimits>,
     phase: Phase,
@@ -92,6 +121,7 @@ impl Connection {
             broker,
             conn_id,
             vhost: None,
+            awaiting_close_ok: HashMap::new(),
             limits: ProtocolLimits::default(),
             negotiated: None,
             phase: Phase::AwaitStartOk,
@@ -104,6 +134,7 @@ impl Connection {
 
         // Reclaim connection-scoped resources (FR-P09): exclusive queues
         // disappear with their owning connection (FR-Q04).
+        conn.drop_all_channel_state();
         if let Some(vhost) = conn.vhost {
             let removed = conn
                 .broker
@@ -111,6 +142,10 @@ impl Connection {
                 .lock()
                 .unwrap()
                 .remove_owned_queues(vhost, conn.conn_id);
+            let mut store = conn.broker.store.lock().unwrap();
+            for q in &removed {
+                store.drain(*q);
+            }
             if !removed.is_empty() {
                 tracing::debug!(connection = %conn_id, count = removed.len(), "exclusive queues reclaimed");
             }
@@ -262,21 +297,10 @@ impl Connection {
     async fn handle_frame(&mut self, frame: AMQPFrame) -> bool {
         match frame {
             AMQPFrame::Heartbeat(_) => self.send(AMQPFrame::Heartbeat(0)).await.is_ok(),
-            AMQPFrame::Header(channel_id, _class_id, _header) => {
-                // No publish path until M2: content frames are unexpected.
-                let e = ProtocolError::unexpected_frame(format!(
-                    "content header on channel {channel_id} (publishing lands in M2)"
-                ))
-                .with_fatal();
-                self.protocol_error(channel_id, &e).await
+            AMQPFrame::Header(channel_id, _class_id, header) => {
+                self.handle_content_header(channel_id, *header).await
             }
-            AMQPFrame::Body(channel_id, _) => {
-                let e = ProtocolError::unexpected_frame(format!(
-                    "content body on channel {channel_id} (publishing lands in M2)"
-                ))
-                .with_fatal();
-                self.protocol_error(channel_id, &e).await
-            }
+            AMQPFrame::Body(channel_id, data) => self.handle_content_body(channel_id, &data).await,
             AMQPFrame::Method(channel_id, class) => self.handle_method(channel_id, class).await,
             AMQPFrame::ProtocolHeader(_) => {
                 self.protocol_error(
@@ -449,6 +473,15 @@ impl Connection {
     }
 
     async fn phase_running(&mut self, channel_id: u16, class: AMQPClass) -> bool {
+        if channel_id != 0
+            && self.awaiting_close_ok.contains_key(&channel_id)
+            && !matches!(class, AMQPClass::Channel(channel::AMQPMethod::CloseOk(_)))
+        {
+            // Close-handshake interlude: content or methods still in flight
+            // for a server-closed channel are dropped (RabbitMQ behavior);
+            // close-ok falls through to its real handler below.
+            return true;
+        }
         if self.phase == Phase::Closing {
             // Only the close-ok we are waiting for is meaningful now.
             return match class {
@@ -490,6 +523,9 @@ impl Connection {
                     ChannelState {
                         generation: ChannelGeneration::new(),
                         last_queue: None,
+                        content: None,
+                        next_delivery_tag: 1,
+                        unacked: HashMap::new(),
                     },
                 );
                 let ok = channel::AMQPMethod::OpenOk(channel::OpenOk {});
@@ -504,15 +540,18 @@ impl Connection {
                     "channel closed by client: {}",
                     close.reply_text
                 );
-                self.channels.remove(&channel_id);
+                // FR-C06: unacked manual-ack deliveries requeue.
+                self.drop_channel_state(channel_id);
+                self.awaiting_close_ok.remove(&channel_id);
                 let ok = channel::AMQPMethod::CloseOk(channel::CloseOk {});
                 self.send(AMQPFrame::Method(channel_id, AMQPClass::Channel(ok)))
                     .await
                     .is_ok()
             }
             AMQPClass::Channel(channel::AMQPMethod::CloseOk(_)) => {
-                // Response to a channel.close we sent.
+                // Response to a channel.close we sent: handshake done.
                 self.channels.remove(&channel_id);
+                self.awaiting_close_ok.remove(&channel_id);
                 true
             }
             AMQPClass::Exchange(exchange::AMQPMethod::Declare(d)) => {
@@ -535,6 +574,15 @@ impl Connection {
             }
             AMQPClass::Queue(queue::AMQPMethod::Purge(d)) => {
                 self.handle_queue_purge(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Publish(d)) => {
+                self.handle_basic_publish(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Get(d)) => {
+                self.handle_basic_get(channel_id, d).await
+            }
+            AMQPClass::Basic(basic::AMQPMethod::Ack(d)) => {
+                self.handle_basic_ack(channel_id, d).await
             }
             other => {
                 if !self.channels.contains_key(&channel_id) {
@@ -917,7 +965,7 @@ impl Connection {
         if d.passive {
             // Passive: existence + exclusivity check; 404/405 otherwise.
             // Ok(None) = missing; Err = locked.
-            let inspected: Result<Option<String>, ProtocolError> = {
+            let inspected: Result<Option<(String, u32)>, ProtocolError> = {
                 let topo = self.broker.topology.lock().unwrap();
                 let found = topo
                     .find_queue(vhost, d.queue.as_str())
@@ -940,27 +988,31 @@ impl Connection {
                             method,
                         ))
                     }
-                    Some(id) => Ok(Some(
-                        topo.queue_record(id)
+                    Some(id) => {
+                        let name = topo
+                            .queue_record(id)
                             .map(|r| r.name.clone())
-                            .unwrap_or_default(),
-                    )),
+                            .unwrap_or_default();
+                        drop(topo);
+                        let ready = self.broker.store.lock().unwrap().len(id);
+                        Ok(Some((name, ready as u32)))
+                    }
                 }
             };
             return match inspected {
-                Ok(Some(name)) if !d.nowait => {
+                Ok(Some((name, message_count))) if !d.nowait => {
                     let ok = queue::AMQPMethod::DeclareOk(queue::DeclareOk {
                         queue: name.into(),
-                        // Counts are real from the message store and consumer
-                        // registry (M3); zero until then.
-                        message_count: 0,
+                        // Ready count from the store; consumer count arrives
+                        // with the M3 consumer registry.
+                        message_count,
                         consumer_count: 0,
                     });
                     self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
                         .await
                         .is_ok()
                 }
-                Ok(Some(_)) => true,
+                Ok(Some((_, _))) => true,
                 Ok(None) => {
                     let e = ProtocolError::not_found(
                         format!("no queue '{}' in vhost", d.queue),
@@ -994,9 +1046,15 @@ impl Connection {
                     // otherwise (FR-P08, spec guidance).
                     return true;
                 }
+                let ready = {
+                    let topo = self.broker.topology.lock().unwrap();
+                    topo.find_queue(vhost, &name)
+                        .map(|id| self.broker.store.lock().unwrap().len(id))
+                        .unwrap_or(0)
+                };
                 let ok = queue::AMQPMethod::DeclareOk(queue::DeclareOk {
                     queue: name.into(),
-                    message_count: 0,
+                    message_count: ready as u32,
                     consumer_count: 0,
                 });
                 self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
@@ -1180,9 +1238,9 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
-        // Exclusive access gate: purging another connection's exclusive
-        // queue is refused (405).
-        let outcome: Result<(), ProtocolError> = {
+        // Existence + exclusivity gates, then purge the ready set only
+        // (FR-Q06: unacked deliveries are held out of ready and survive).
+        let purged: Result<u64, ProtocolError> = {
             let topo = self.broker.topology.lock().unwrap();
             let found = topo.find_queue(vhost, &name);
             match found {
@@ -1205,23 +1263,544 @@ impl Connection {
                         method,
                     ))
                 }
-                Some(_) => Ok(()),
+                Some(id) => {
+                    drop(topo);
+                    Ok(self.broker.store.lock().unwrap().purge(id))
+                }
             }
         };
-        if let Err(e) = outcome {
-            return self.protocol_error(channel_id, &e).await;
-        }
-        // The message store lands with the publish slice; there are no ready
-        // messages to purge yet, so a zero count is currently accurate
-        // (FR-Q06 ready-only semantics arrive with the store).
+        let purged = match purged {
+            Ok(n) => n,
+            Err(e) => return self.protocol_error(channel_id, &e).await,
+        };
         if d.nowait {
             true
         } else {
-            let ok = queue::AMQPMethod::PurgeOk(queue::PurgeOk { message_count: 0 });
+            let ok = queue::AMQPMethod::PurgeOk(queue::PurgeOk {
+                message_count: purged as u32,
+            });
             self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
                 .await
                 .is_ok()
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Publishing, content assembly, and polling delivery (M2).
+    // ------------------------------------------------------------------
+
+    /// Reclaim a channel's state: requeue unacked manual-ack deliveries
+    /// (FR-C06) and drop any half-assembled publish.
+    fn drop_channel_state(&mut self, channel_id: u16) {
+        if let Some(mut ch) = self.channels.remove(&channel_id) {
+            ch.content = None;
+            if !ch.unacked.is_empty() {
+                let mut store = self.broker.store.lock().unwrap();
+                for (_, u) in ch.unacked.drain() {
+                    store.requeue(u.queue, u.entry);
+                }
+            }
+        }
+    }
+
+    /// Requeue every channel's unacked deliveries (connection teardown).
+    fn drop_all_channel_state(&mut self) {
+        let channel_ids: Vec<u16> = self.channels.keys().copied().collect();
+        for id in channel_ids {
+            self.drop_channel_state(id);
+        }
+    }
+
+    /// Max body-frame payload under the negotiated frame_max.
+    fn frame_payload_budget(&self) -> usize {
+        const MIN_BODY_CHUNK: usize = 512;
+        self.negotiated
+            .as_ref()
+            .map(|n| n.max_frame_payload() as usize)
+            .unwrap_or(MIN_BODY_CHUNK)
+            .max(MIN_BODY_CHUNK)
+    }
+
+    /// Encode+validate properties at publish admission. Returns the opaque
+    /// property blob and the persistence flag.
+    fn admit_properties(
+        props: &AMQPProperties,
+        username: &str,
+        class_id: u16,
+    ) -> Result<(Vec<u8>, bool), ProtocolError> {
+        // FR-M05: per-message expiration is a deferred feature; reject it
+        // rather than silently ignoring a requested TTL.
+        if let Some(exp) = props.expiration() {
+            let _ = exp;
+            return Err(ProtocolError::not_implemented(
+                format!("basic.publish expiration property ('{exp}')"),
+                class_id,
+                40, // basic.publish
+            ));
+        }
+        // FR-M03: absent delivery mode = transient; 1 and 2 valid; anything
+        // else is invalid input (frozen as 503 in the protocol profile).
+        let persistent = match props.delivery_mode() {
+            None => false,
+            Some(1) => false,
+            Some(2) => true,
+            Some(other) => {
+                return Err(ProtocolError::connection_with_method(
+                    reply_code::COMMAND_INVALID,
+                    format!("COMMAND_INVALID - invalid delivery-mode {other} (1 or 2)"),
+                    class_id,
+                    40,
+                ));
+            }
+        };
+        // FR-M04: a supplied user_id must match the authenticated principal.
+        if let Some(uid) = props.user_id() {
+            if uid.as_str() != username {
+                return Err(ProtocolError::channel(
+                    reply_code::ACCESS_REFUSED,
+                    "ACCESS_REFUSED - user_id property does not match authenticated user",
+                    class_id,
+                    40,
+                ));
+            }
+        }
+        let blob = rusty_mq_protocol::encode_properties(props);
+        Ok((blob, persistent))
+    }
+
+    async fn handle_basic_publish(&mut self, channel_id: u16, d: basic::Publish) -> bool {
+        const CLASS: u16 = 60;
+        // FR-PUB04: immediate is a deferred feature; never simulate it.
+        if d.immediate {
+            let e = ProtocolError::not_implemented(
+                "basic.publish immediate=true",
+                CLASS,
+                d.get_amqp_method_id(),
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let vhost = self.vhost();
+        // FR-PUB03: publishing to a nonexistent exchange is a channel error.
+        let exchange_check = {
+            let topo = self.broker.topology.lock().unwrap();
+            match topo.find_exchange(vhost, d.exchange.as_str()) {
+                None => Err(ProtocolError::not_found(
+                    format!("no exchange '{}' in vhost", d.exchange),
+                    CLASS,
+                    d.get_amqp_method_id(),
+                )),
+                // FR-E03: internal exchanges cannot receive client publishes.
+                Some(id) if topo.exchange_record(id).is_some_and(|r| r.internal) => {
+                    Err(ProtocolError::channel(
+                        reply_code::ACCESS_REFUSED,
+                        format!(
+                            "ACCESS_REFUSED - cannot publish to internal exchange '{}'",
+                            d.exchange
+                        ),
+                        CLASS,
+                        d.get_amqp_method_id(),
+                    ))
+                }
+                Some(_) => Ok(()),
+            }
+        };
+        if let Err(e) = exchange_check {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let Some(ch) = self.channels.get_mut(&channel_id) else {
+            return self
+                .protocol_error(
+                    channel_id,
+                    &ProtocolError::connection(
+                        reply_code::CHANNEL_ERROR,
+                        format!("channel {channel_id} is not open"),
+                    ),
+                )
+                .await;
+        };
+        if ch.content.is_some() {
+            // Overlapping publishes without waiting for content completion.
+            let e = ProtocolError::unexpected_frame(format!(
+                "basic.publish on channel {channel_id} while previous message incomplete"
+            ))
+            .with_fatal();
+            return self.protocol_error(channel_id, &e).await;
+        }
+        ch.content = Some(InFlightPublish {
+            exchange: d.exchange.as_str().to_string(),
+            routing_key: d.routing_key.as_str().to_string(),
+            mandatory: d.mandatory,
+            property_bytes: Vec::new(),
+            persistent: false,
+            assembler: MessageAssembler::new(self.limits.max_message_bytes),
+        });
+        true
+    }
+
+    async fn handle_content_header(&mut self, channel_id: u16, header: AMQPContentHeader) -> bool {
+        if self.awaiting_close_ok.contains_key(&channel_id) {
+            return true; // stale content for a closed channel
+        }
+        let Some(ch) = self.channels.get_mut(&channel_id) else {
+            return self
+                .protocol_error(
+                    channel_id,
+                    &ProtocolError::connection(
+                        reply_code::CHANNEL_ERROR,
+                        format!("channel {channel_id} is not open"),
+                    ),
+                )
+                .await;
+        };
+        let Some(inflight) = ch.content.as_mut() else {
+            let e = ProtocolError::unexpected_frame(format!(
+                "content header on channel {channel_id} without a pending publish"
+            ))
+            .with_fatal();
+            return self.protocol_error(channel_id, &e).await;
+        };
+        if let Err(e) = inflight.assembler.start(header.class_id, header.body_size) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let (blob, persistent) =
+            match Self::admit_properties(&header.properties, &self.broker.test_user.username, 60) {
+                Ok(x) => x,
+                Err(e) => return self.protocol_error(channel_id, &e).await,
+            };
+        inflight.property_bytes = blob;
+        inflight.persistent = persistent;
+        if inflight.assembler.is_complete() {
+            let inflight = ch.content.take().expect("checked above");
+            return self.finish_publish(channel_id, inflight).await;
+        }
+        true
+    }
+
+    async fn handle_content_body(&mut self, channel_id: u16, chunk: &[u8]) -> bool {
+        if self.awaiting_close_ok.contains_key(&channel_id) {
+            return true; // stale content for a closed channel
+        }
+        let Some(ch) = self.channels.get_mut(&channel_id) else {
+            return self
+                .protocol_error(
+                    channel_id,
+                    &ProtocolError::connection(
+                        reply_code::CHANNEL_ERROR,
+                        format!("channel {channel_id} is not open"),
+                    ),
+                )
+                .await;
+        };
+        let Some(inflight) = ch.content.as_mut() else {
+            let e = ProtocolError::unexpected_frame(format!(
+                "content body on channel {channel_id} without a pending publish"
+            ))
+            .with_fatal();
+            return self.protocol_error(channel_id, &e).await;
+        };
+        if let Err(e) = inflight.assembler.push_body(chunk) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        if inflight.assembler.is_complete() {
+            let inflight = ch.content.take().expect("checked above");
+            return self.finish_publish(channel_id, inflight).await;
+        }
+        true
+    }
+
+    /// Content assembly complete: route to the destination set, one enqueue
+    /// per queue (INV-05), and honor mandatory returns (FR-PUB02).
+    async fn finish_publish(&mut self, channel_id: u16, inflight: InFlightPublish) -> bool {
+        let vhost = self.vhost();
+        let mut inflight = inflight;
+        let body = inflight
+            .assembler
+            .take()
+            .expect("finish_publish called only with complete content");
+        let message = StoredMessage {
+            property_bytes: inflight.property_bytes,
+            body,
+            exchange: inflight.exchange.clone(),
+            routing_key: inflight.routing_key.clone(),
+            persistent: inflight.persistent,
+            redelivered: false,
+        };
+
+        // Resolve the destination set at a consistent ordering point.
+        let destinations = {
+            let topo = self.broker.topology.lock().unwrap();
+            if inflight.exchange.is_empty() {
+                // FR-E07: default exchange routes by queue name.
+                topo.find_queue(vhost, &inflight.routing_key)
+                    .into_iter()
+                    .collect()
+            } else {
+                let ex_id = topo.find_exchange(vhost, &inflight.exchange);
+                match ex_id
+                    .and_then(|id| topo.exchange_record(id))
+                    .map(|r| r.kind)
+                {
+                    Some(kind) => {
+                        let bindings = ex_id.map(|id| topo.bindings_of(vhost, id)).unwrap_or(&[]);
+                        rusty_mq_core::routing::route_message(kind, bindings, &inflight.routing_key)
+                    }
+                    None => Default::default(),
+                }
+            }
+        };
+
+        // Admit to every destination under the store budget.
+        for queue in &destinations {
+            let admitted = self
+                .broker
+                .store
+                .lock()
+                .unwrap()
+                .enqueue(*queue, message.clone());
+            match admitted {
+                Ok(_) => {}
+                // Never fabricate success on admission failure (§6.4).
+                Err(AdmitError::BudgetExceeded) => {
+                    let e = ProtocolError::channel(
+                        reply_code::RESOURCE_ERROR,
+                        "RESOURCE_ERROR - in-memory message budget exceeded",
+                        rusty_mq_protocol::error::class_id::BASIC,
+                        40, // basic.publish
+                    );
+                    return self.protocol_error(channel_id, &e).await;
+                }
+            }
+        }
+
+        // FR-PUB02: mandatory + zero destinations returns the message.
+        if destinations.is_empty() && inflight.mandatory {
+            return self
+                .send_return(channel_id, reply_code::NO_ROUTE, "NO_ROUTE", &message)
+                .await;
+        }
+        true
+    }
+
+    /// basic.return with the full message content (FR-PUB02).
+    async fn send_return(
+        &mut self,
+        channel_id: u16,
+        code: u16,
+        text: &str,
+        message: &StoredMessage,
+    ) -> bool {
+        let ret = basic::AMQPMethod::Return(basic::Return {
+            reply_code: code,
+            reply_text: text.into(),
+            exchange: message.exchange.as_str().into(),
+            routing_key: message.routing_key.as_str().into(),
+        });
+        if self
+            .send(AMQPFrame::Method(channel_id, AMQPClass::Basic(ret)))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let props = parse_properties(&message.property_bytes[..]).map(|(_, p)| p);
+        let header = AMQPFrame::Header(
+            channel_id,
+            60,
+            Box::new(AMQPContentHeader {
+                class_id: 60,
+                body_size: message.body.len() as u64,
+                properties: props.unwrap_or_default(),
+            }),
+        );
+        if self.send(header).await.is_err() {
+            return false;
+        }
+        let budget = self.frame_payload_budget();
+        for chunk in message.body.chunks(budget) {
+            if self
+                .send(AMQPFrame::Body(channel_id, chunk.to_vec()))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Deliver get-ok/deliver + content frames for a stored entry.
+    async fn send_content(
+        &self,
+        channel_id: u16,
+        method_frame: AMQPFrame,
+        message: &StoredMessage,
+    ) -> Result<(), ()> {
+        self.send(method_frame).await?;
+        let props = parse_properties(&message.property_bytes[..])
+            .map(|(_, p)| p)
+            .unwrap_or_default();
+        let header = AMQPFrame::Header(
+            channel_id,
+            60,
+            Box::new(AMQPContentHeader {
+                class_id: 60,
+                body_size: message.body.len() as u64,
+                properties: props,
+            }),
+        );
+        self.send(header).await?;
+        let budget = self.frame_payload_budget();
+        for chunk in message.body.chunks(budget) {
+            self.send(AMQPFrame::Body(channel_id, chunk.to_vec()))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_basic_get(&mut self, channel_id: u16, d: basic::Get) -> bool {
+        const CLASS: u16 = 60;
+        let method = d.get_amqp_method_id();
+        let Ok(name) = self.resolve_queue_name(channel_id, d.queue.as_str()) else {
+            let e = ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        };
+        let vhost = self.vhost();
+        // Resolve queue + exclusivity, then pop one entry.
+        let outcome: Result<Option<(QueueEntry, u64)>, ProtocolError> = {
+            let topo = self.broker.topology.lock().unwrap();
+            let found = topo.find_queue(vhost, &name);
+            match found {
+                None => Err(ProtocolError::not_found(
+                    format!("no queue '{name}' in vhost"),
+                    CLASS,
+                    method,
+                )),
+                Some(id)
+                    if !topo
+                        .check_exclusive_access(id, self.conn_id)
+                        .unwrap_or(false) =>
+                {
+                    Err(ProtocolError::channel(
+                        reply_code::RESOURCE_LOCKED,
+                        format!(
+                            "RESOURCE_LOCKED - queue '{name}' is exclusive to another connection"
+                        ),
+                        CLASS,
+                        method,
+                    ))
+                }
+                Some(id) => {
+                    drop(topo);
+                    let mut store = self.broker.store.lock().unwrap();
+                    let remaining = store.len(id);
+                    Ok(store
+                        .pop_ready(id)
+                        .map(|e| (e, remaining.saturating_sub(1))))
+                }
+            }
+        };
+        let entry = match outcome {
+            Err(e) => return self.protocol_error(channel_id, &e).await,
+            Ok(None) => {
+                // Empty queue (FR-C02).
+                let empty = basic::AMQPMethod::GetEmpty(basic::GetEmpty {});
+                return self
+                    .send(AMQPFrame::Method(channel_id, AMQPClass::Basic(empty)))
+                    .await
+                    .is_ok();
+            }
+            Ok(Some((entry, remaining))) => (entry, remaining),
+        };
+        let (entry, remaining) = entry;
+
+        let delivery_tag = if d.no_ack {
+            // Settled at delivery (§9.6 no-ack boundary, memory-backed form).
+            0
+        } else {
+            let Some(ch) = self.channels.get_mut(&channel_id) else {
+                return false;
+            };
+            let tag = ch.next_delivery_tag;
+            ch.next_delivery_tag += 1;
+            let queue = {
+                let topo = self.broker.topology.lock().unwrap();
+                topo.find_queue(vhost, &name)
+            };
+            let Some(queue_id) = queue else {
+                return false;
+            };
+            ch.unacked.insert(
+                tag,
+                UnackedDelivery {
+                    queue: queue_id,
+                    entry: entry.clone(),
+                },
+            );
+            tag
+        };
+
+        let get_ok = basic::AMQPMethod::GetOk(basic::GetOk {
+            delivery_tag,
+            redelivered: entry.message.redelivered,
+            exchange: entry.message.exchange.as_str().into(),
+            routing_key: entry.message.routing_key.as_str().into(),
+            message_count: remaining as u32,
+        });
+        self.send_content(
+            channel_id,
+            AMQPFrame::Method(channel_id, AMQPClass::Basic(get_ok)),
+            &entry.message,
+        )
+        .await
+        .is_ok()
+    }
+
+    async fn handle_basic_ack(&mut self, channel_id: u16, d: basic::Ack) -> bool {
+        const CLASS: u16 = 60;
+        let method = d.get_amqp_method_id();
+        let Some(ch) = self.channels.get_mut(&channel_id) else {
+            return self
+                .protocol_error(
+                    channel_id,
+                    &ProtocolError::connection(
+                        reply_code::CHANNEL_ERROR,
+                        format!("channel {channel_id} is not open"),
+                    ),
+                )
+                .await;
+        };
+        let settled: Vec<u64> = if d.multiple {
+            if d.delivery_tag == 0 {
+                ch.unacked.keys().copied().collect()
+            } else {
+                ch.unacked
+                    .keys()
+                    .copied()
+                    .filter(|t| *t <= d.delivery_tag)
+                    .collect()
+            }
+        } else {
+            if !ch.unacked.contains_key(&d.delivery_tag) {
+                // Invalid/duplicate settlement is a protocol error (§6.1).
+                let e = ProtocolError::precondition_failed(
+                    format!("unknown delivery tag {}", d.delivery_tag),
+                    CLASS,
+                    method,
+                );
+                return self.protocol_error(channel_id, &e).await;
+            }
+            vec![d.delivery_tag]
+        };
+        // Positive acknowledgement is terminal: the entry was already held
+        // out of the ready set, so settling just drops it.
+        for tag in settled {
+            ch.unacked.remove(&tag);
+        }
+        true
     }
 
     /// Emit the proper close frame for a protocol error (frozen error
@@ -1243,8 +1822,11 @@ impl Connection {
                     .send(AMQPFrame::Method(channel_id, AMQPClass::Channel(close)))
                     .await;
                 // The channel is logically closed now; drop state immediately
-                // so a stale settlement cannot act on it (INV-04).
-                self.channels.remove(&channel_id);
+                // so a stale settlement cannot act on it (INV-04). Unacked
+                // manual-ack deliveries requeue (FR-C06). Frames still in
+                // flight for this channel are ignored until close-ok.
+                self.drop_channel_state(channel_id);
+                self.awaiting_close_ok.insert(channel_id, ());
                 true
             }
             rusty_mq_protocol::error::ErrorScope::Connection => {
