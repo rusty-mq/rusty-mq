@@ -20,7 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-use rusty_mq_core::ChannelGeneration;
+use rusty_mq_core::topology::TopologyError;
+use rusty_mq_core::{ChannelGeneration, ConnectionId, VhostId};
+use rusty_mq_protocol::error::reply_code;
 use rusty_mq_protocol::{
     encode_frame, FrameReader, NegotiatedLimits, ProtocolError, ProtocolLimits,
     PROTOCOL_HEADER_0_9_1,
@@ -51,15 +53,21 @@ enum Phase {
     Closing,
 }
 
-/// Per-channel state (ADR-0003 generations).
+/// Per-channel state (ADR-0003 generations; FR-Q02 last-declared-queue
+/// shorthand for empty queue names).
 struct ChannelState {
     #[allow(dead_code)] // consumed by delivery ownership from M3
     generation: ChannelGeneration,
+    /// Most recently declared queue on this channel (empty-name shorthand).
+    last_queue: Option<String>,
 }
 
 /// Owns one accepted connection until it ends.
 pub struct Connection {
     broker: Arc<Broker>,
+    conn_id: ConnectionId,
+    /// Vhost bound at `connection.open` (None until then).
+    vhost: Option<VhostId>,
     limits: ProtocolLimits,
     negotiated: Option<NegotiatedLimits>,
     phase: Phase,
@@ -82,6 +90,8 @@ impl Connection {
 
         let mut conn = Self {
             broker,
+            conn_id,
+            vhost: None,
             limits: ProtocolLimits::default(),
             negotiated: None,
             phase: Phase::AwaitStartOk,
@@ -92,8 +102,19 @@ impl Connection {
         tracing::info!(connection = %conn_id, peer = %peer, "connection opened");
         conn.drive(read_half).await;
 
-        // Reclaim connection-scoped resources (FR-P09): channels now;
-        // exclusive/auto-delete queues from M2.
+        // Reclaim connection-scoped resources (FR-P09): exclusive queues
+        // disappear with their owning connection (FR-Q04).
+        if let Some(vhost) = conn.vhost {
+            let removed = conn
+                .broker
+                .topology
+                .lock()
+                .unwrap()
+                .remove_owned_queues(vhost, conn.conn_id);
+            if !removed.is_empty() {
+                tracing::debug!(connection = %conn_id, count = removed.len(), "exclusive queues reclaimed");
+            }
+        }
         conn.channels.clear();
         drop(conn.outbound);
         let _ = writer.await;
@@ -400,11 +421,11 @@ impl Connection {
                 )
                 .await;
         }
-        let vhost_ok = {
+        let vhost = {
             let topo = self.broker.topology.lock().unwrap();
-            topo.find_vhost(open.virtual_host.as_str()).is_some()
+            topo.find_vhost(open.virtual_host.as_str())
         };
-        if !vhost_ok {
+        if vhost.is_none() {
             return self
                 .protocol_error(
                     0,
@@ -418,6 +439,7 @@ impl Connection {
                 )
                 .await;
         }
+        self.vhost = vhost;
         self.phase = Phase::Running;
         self.broker.connections_opened();
         let ok = connection::AMQPMethod::OpenOk(connection::OpenOk {});
@@ -467,6 +489,7 @@ impl Connection {
                     channel_id,
                     ChannelState {
                         generation: ChannelGeneration::new(),
+                        last_queue: None,
                     },
                 );
                 let ok = channel::AMQPMethod::OpenOk(channel::OpenOk {});
@@ -491,6 +514,27 @@ impl Connection {
                 // Response to a channel.close we sent.
                 self.channels.remove(&channel_id);
                 true
+            }
+            AMQPClass::Exchange(exchange::AMQPMethod::Declare(d)) => {
+                self.handle_exchange_declare(channel_id, d).await
+            }
+            AMQPClass::Exchange(exchange::AMQPMethod::Delete(d)) => {
+                self.handle_exchange_delete(channel_id, d).await
+            }
+            AMQPClass::Queue(queue::AMQPMethod::Declare(d)) => {
+                self.handle_queue_declare(channel_id, d).await
+            }
+            AMQPClass::Queue(queue::AMQPMethod::Delete(d)) => {
+                self.handle_queue_delete(channel_id, d).await
+            }
+            AMQPClass::Queue(queue::AMQPMethod::Bind(d)) => {
+                self.handle_queue_bind(channel_id, d).await
+            }
+            AMQPClass::Queue(queue::AMQPMethod::Unbind(d)) => {
+                self.handle_queue_unbind(channel_id, d).await
+            }
+            AMQPClass::Queue(queue::AMQPMethod::Purge(d)) => {
+                self.handle_queue_purge(channel_id, d).await
             }
             other => {
                 if !self.channels.contains_key(&channel_id) {
@@ -536,6 +580,647 @@ impl Connection {
                 )
                 .await
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Topology methods (M2): declare/delete/bind/unbind for exchanges and
+    // queues, wired to rusty-mq-core with the frozen error profile.
+    //
+    // Lock discipline: every std-mutex section is block-scoped so no guard
+    // is alive across an await (the future must stay Send).
+    // ------------------------------------------------------------------
+
+    /// Vhost bound at open; Running-phase handlers may assume it.
+    fn vhost(&self) -> VhostId {
+        self.vhost
+            .expect("phase Running implies connection.open-ok")
+    }
+
+    /// Map a core topology error onto the frozen error profile.
+    fn topology_error(e: TopologyError, class_id: u16, method_id: u16) -> ProtocolError {
+        match e {
+            TopologyError::VhostNotFound => ProtocolError::channel(
+                reply_code::NOT_FOUND,
+                "NOT_FOUND - vhost",
+                class_id,
+                method_id,
+            ),
+            TopologyError::ExchangeNotFound(n) => ProtocolError::channel(
+                reply_code::NOT_FOUND,
+                format!("NOT_FOUND - no exchange '{n}' in vhost"),
+                class_id,
+                method_id,
+            ),
+            TopologyError::QueueNotFound(n) => ProtocolError::channel(
+                reply_code::NOT_FOUND,
+                format!("NOT_FOUND - no queue '{n}' in vhost"),
+                class_id,
+                method_id,
+            ),
+            TopologyError::ExchangePreconditionFailed(n) => ProtocolError::channel(
+                reply_code::PRECONDITION_FAILED,
+                format!("PRECONDITION_FAILED - inequivalent arg for exchange '{n}'"),
+                class_id,
+                method_id,
+            ),
+            TopologyError::QueuePreconditionFailed(n) => ProtocolError::channel(
+                reply_code::PRECONDITION_FAILED,
+                format!("PRECONDITION_FAILED - inequivalent arg for queue '{n}'"),
+                class_id,
+                method_id,
+            ),
+            TopologyError::QueueLocked(n) => ProtocolError::channel(
+                reply_code::RESOURCE_LOCKED,
+                format!("RESOURCE_LOCKED - queue '{n}' is exclusive to another connection"),
+                class_id,
+                method_id,
+            ),
+            TopologyError::BindingExists => {
+                ProtocolError::channel(reply_code::NO_ROUTE, "BINDING_EXISTS", class_id, method_id)
+            }
+            TopologyError::BindingNotFound => ProtocolError::channel(
+                reply_code::NOT_FOUND,
+                "NOT_FOUND - no such binding",
+                class_id,
+                method_id,
+            ),
+            TopologyError::ReservedName(n) => ProtocolError::channel(
+                reply_code::ACCESS_REFUSED,
+                format!("ACCESS_REFUSED - operation not permitted on '{n}'"),
+                class_id,
+                method_id,
+            ),
+            TopologyError::QueueInUse => ProtocolError::channel(
+                reply_code::PRECONDITION_FAILED,
+                "PRECONDITION_FAILED - queue in use",
+                class_id,
+                method_id,
+            ),
+            TopologyError::QueueNotEmpty => ProtocolError::channel(
+                reply_code::PRECONDITION_FAILED,
+                "PRECONDITION_FAILED - queue not empty",
+                class_id,
+                method_id,
+            ),
+        }
+    }
+
+    /// Queue-declare rejections: V1 profile gates + wrapped topology errors.
+    fn queue_declare_error(
+        e: rusty_mq_core::topology::DeclareQueueError,
+        class_id: u16,
+        method_id: u16,
+    ) -> ProtocolError {
+        use rusty_mq_core::topology::DeclareQueueError;
+        match e {
+            DeclareQueueError::DurableExclusive => ProtocolError::precondition_failed(
+                "durable+exclusive queues are not supported by rusty-mq in V1",
+                class_id,
+                method_id,
+            ),
+            DeclareQueueError::DurableAutoDelete => ProtocolError::precondition_failed(
+                "durable+auto-delete queues are not supported by rusty-mq in V1",
+                class_id,
+                method_id,
+            ),
+            DeclareQueueError::TransientNonExclusive => ProtocolError::precondition_failed(
+                "transient non-exclusive queues require the compatibility switch",
+                class_id,
+                method_id,
+            ),
+            DeclareQueueError::Topology(t) => Self::topology_error(t, class_id, method_id),
+        }
+    }
+
+    /// Exchange-declare rejections.
+    fn exchange_declare_error(
+        e: rusty_mq_core::topology::DeclareExchangeError,
+        class_id: u16,
+        method_id: u16,
+    ) -> ProtocolError {
+        use rusty_mq_core::topology::DeclareExchangeError;
+        match e {
+            DeclareExchangeError::UnsupportedType(t) => ProtocolError::not_implemented(
+                format!("exchange type '{t}' (direct, fanout, topic only in V1)"),
+                class_id,
+                method_id,
+            ),
+            DeclareExchangeError::InternalConflict => ProtocolError::precondition_failed(
+                "internal-exchange conflict",
+                class_id,
+                method_id,
+            ),
+            DeclareExchangeError::Topology(t) => Self::topology_error(t, class_id, method_id),
+        }
+    }
+
+    /// Strict argument policy (ADR-0005): queue arguments accept only
+    /// `x-queue-type=classic`; anything behavior-bearing is 540.
+    fn validate_queue_arguments(args: &FieldTable) -> Result<(), ProtocolError> {
+        for (key, value) in args.inner().iter() {
+            match key.as_str() {
+                "x-queue-type" => {
+                    let ok = matches!(
+                        value,
+                        amq_protocol::types::AMQPValue::LongString(s) if s.as_bytes() == b"classic"
+                    );
+                    if !ok {
+                        return Err(ProtocolError::not_implemented(
+                            "queue type (only x-queue-type=classic is supported)",
+                            rusty_mq_protocol::error::class_id::QUEUE,
+                            10, // queue.declare
+                        ));
+                    }
+                }
+                other => {
+                    return Err(ProtocolError::not_implemented(
+                        format!("queue argument '{other}'"),
+                        rusty_mq_protocol::error::class_id::QUEUE,
+                        10, // queue.declare
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Exchange/bind/unbind arguments accept nothing in V1.
+    fn require_no_arguments(
+        args: &FieldTable,
+        what: &str,
+        class_id: u16,
+        method_id: u16,
+    ) -> Result<(), ProtocolError> {
+        if let Some((key, _)) = args.inner().first_key_value() {
+            return Err(ProtocolError::not_implemented(
+                format!("{what} argument '{key}'"),
+                class_id,
+                method_id,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve an empty queue name via the channel's last declared queue
+    /// (FR-Q02); `None` yields the 404 the frozen profile requires.
+    fn resolve_queue_name(&self, channel_id: u16, name: &str) -> Result<String, ProtocolError> {
+        if !name.is_empty() {
+            return Ok(name.to_string());
+        }
+        match self
+            .channels
+            .get(&channel_id)
+            .and_then(|c| c.last_queue.clone())
+        {
+            Some(last) => Ok(last),
+            None => Err(ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                rusty_mq_protocol::error::class_id::QUEUE,
+                10,
+            )),
+        }
+    }
+
+    async fn handle_exchange_declare(&mut self, channel_id: u16, d: exchange::Declare) -> bool {
+        const CLASS: u16 = 40;
+        let method = d.get_amqp_method_id();
+        if let Err(e) = Self::require_no_arguments(&d.arguments, "exchange", CLASS, method) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let vhost = self.vhost();
+
+        if d.passive {
+            // Passive: existence check only; 404 when missing (FR-E02).
+            let found = {
+                let topo = self.broker.topology.lock().unwrap();
+                topo.find_exchange(vhost, d.exchange.as_str())
+            };
+            return match found {
+                Some(_) if !d.nowait => {
+                    let ok = exchange::AMQPMethod::DeclareOk(exchange::DeclareOk {});
+                    self.send(AMQPFrame::Method(channel_id, AMQPClass::Exchange(ok)))
+                        .await
+                        .is_ok()
+                }
+                Some(_) => true,
+                None => {
+                    let e = ProtocolError::not_found(
+                        format!("no exchange '{}' in vhost", d.exchange),
+                        CLASS,
+                        method,
+                    );
+                    self.protocol_error(channel_id, &e).await
+                }
+            };
+        }
+
+        // Active declare.
+        let kind = match rusty_mq_core::routing::ExchangeType::from_wire_name(d.kind.as_str()) {
+            Some(k) => k,
+            None => {
+                let e = ProtocolError::not_implemented(
+                    format!(
+                        "exchange type '{}' (direct, fanout, topic only in V1)",
+                        d.kind
+                    ),
+                    CLASS,
+                    method,
+                );
+                return self.protocol_error(channel_id, &e).await;
+            }
+        };
+        let declared: Result<(), rusty_mq_core::topology::DeclareExchangeError> = {
+            let mut topo = self.broker.topology.lock().unwrap();
+            topo.declare_exchange(
+                vhost,
+                d.exchange.as_str(),
+                kind,
+                d.durable,
+                d.auto_delete,
+                d.internal,
+            )
+            .map(|_| ())
+        };
+        match declared {
+            Ok(()) if !d.nowait => {
+                let ok = exchange::AMQPMethod::DeclareOk(exchange::DeclareOk {});
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Exchange(ok)))
+                    .await
+                    .is_ok()
+            }
+            Ok(()) => true,
+            Err(e) => {
+                let e = Self::exchange_declare_error(e, CLASS, method);
+                self.protocol_error(channel_id, &e).await
+            }
+        }
+    }
+
+    async fn handle_exchange_delete(&mut self, channel_id: u16, d: exchange::Delete) -> bool {
+        const CLASS: u16 = 40;
+        let method = d.get_amqp_method_id();
+        let vhost = self.vhost();
+        let outcome: Result<(), ProtocolError> = {
+            let mut topo = self.broker.topology.lock().unwrap();
+            let found = topo.find_exchange(vhost, d.exchange.as_str());
+            match found {
+                None => Err(ProtocolError::not_found(
+                    format!("no exchange '{}' in vhost", d.exchange),
+                    CLASS,
+                    method,
+                )),
+                Some(id) if d.if_unused && topo.binding_count(vhost, id) > 0 => {
+                    Err(ProtocolError::precondition_failed(
+                        format!("exchange '{}' in use", d.exchange),
+                        CLASS,
+                        method,
+                    ))
+                }
+                Some(_) => topo
+                    .delete_exchange(vhost, d.exchange.as_str())
+                    .map(|_| ())
+                    .map_err(|e| Self::topology_error(e, CLASS, method)),
+            }
+        };
+        match outcome {
+            Ok(()) if !d.nowait => {
+                let ok = exchange::AMQPMethod::DeleteOk(exchange::DeleteOk {});
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Exchange(ok)))
+                    .await
+                    .is_ok()
+            }
+            Ok(()) => true,
+            Err(e) => self.protocol_error(channel_id, &e).await,
+        }
+    }
+
+    async fn handle_queue_declare(&mut self, channel_id: u16, d: queue::Declare) -> bool {
+        const CLASS: u16 = 50;
+        let method = d.get_amqp_method_id();
+        if let Err(e) = Self::validate_queue_arguments(&d.arguments) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let vhost = self.vhost();
+        let generated = d.queue.as_str().is_empty();
+        let profile = rusty_mq_core::topology::QueueProfile {
+            durable: d.durable,
+            exclusive: d.exclusive,
+            auto_delete: d.auto_delete,
+        };
+        let owner = if d.exclusive {
+            Some(self.conn_id)
+        } else {
+            None
+        };
+
+        if d.passive {
+            // Passive: existence + exclusivity check; 404/405 otherwise.
+            // Ok(None) = missing; Err = locked.
+            let inspected: Result<Option<String>, ProtocolError> = {
+                let topo = self.broker.topology.lock().unwrap();
+                let found = topo
+                    .find_queue(vhost, d.queue.as_str())
+                    .filter(|_| !generated);
+                match found {
+                    None => Ok(None),
+                    // FR-Q04: exclusivity gates inspection by other connections.
+                    Some(id)
+                        if !topo
+                            .check_exclusive_access(id, self.conn_id)
+                            .unwrap_or(false) =>
+                    {
+                        Err(ProtocolError::channel(
+                            reply_code::RESOURCE_LOCKED,
+                            format!(
+                                "RESOURCE_LOCKED - queue '{}' is exclusive to another connection",
+                                d.queue
+                            ),
+                            CLASS,
+                            method,
+                        ))
+                    }
+                    Some(id) => Ok(Some(
+                        topo.queue_record(id)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default(),
+                    )),
+                }
+            };
+            return match inspected {
+                Ok(Some(name)) if !d.nowait => {
+                    let ok = queue::AMQPMethod::DeclareOk(queue::DeclareOk {
+                        queue: name.into(),
+                        // Counts are real from the message store and consumer
+                        // registry (M3); zero until then.
+                        message_count: 0,
+                        consumer_count: 0,
+                    });
+                    self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
+                        .await
+                        .is_ok()
+                }
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    let e = ProtocolError::not_found(
+                        format!("no queue '{}' in vhost", d.queue),
+                        CLASS,
+                        method,
+                    );
+                    self.protocol_error(channel_id, &e).await
+                }
+                Err(e) => self.protocol_error(channel_id, &e).await,
+            };
+        }
+
+        // Active declare.
+        let declared: Result<String, rusty_mq_core::topology::DeclareQueueError> = {
+            let mut topo = self.broker.topology.lock().unwrap();
+            topo.declare_queue(vhost, d.queue.as_str(), profile, owner)
+                .map(|id| {
+                    topo.queue_record(id)
+                        .map(|r| r.name.clone())
+                        .unwrap_or_default()
+                })
+        };
+        match declared {
+            Ok(name) => {
+                if let Some(ch) = self.channels.get_mut(&channel_id) {
+                    ch.last_queue = Some(name.clone());
+                }
+                if d.nowait && !generated {
+                    // nowait suppresses replies — except server-generated
+                    // names, where the client could not learn the name
+                    // otherwise (FR-P08, spec guidance).
+                    return true;
+                }
+                let ok = queue::AMQPMethod::DeclareOk(queue::DeclareOk {
+                    queue: name.into(),
+                    message_count: 0,
+                    consumer_count: 0,
+                });
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
+                    .await
+                    .is_ok()
+            }
+            Err(e) => {
+                let e = Self::queue_declare_error(e, CLASS, method);
+                self.protocol_error(channel_id, &e).await
+            }
+        }
+    }
+
+    async fn handle_queue_delete(&mut self, channel_id: u16, d: queue::Delete) -> bool {
+        const CLASS: u16 = 50;
+        let method = d.get_amqp_method_id();
+        let Ok(name) = self.resolve_queue_name(channel_id, d.queue.as_str()) else {
+            let e = ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        };
+        let vhost = self.vhost();
+        let outcome: Result<(), ProtocolError> = {
+            let mut topo = self.broker.topology.lock().unwrap();
+            let found = topo.find_queue(vhost, &name);
+            match found {
+                None => Err(ProtocolError::not_found(
+                    format!("no queue '{name}' in vhost"),
+                    CLASS,
+                    method,
+                )),
+                Some(id)
+                    if !topo
+                        .check_exclusive_access(id, self.conn_id)
+                        .unwrap_or(false) =>
+                {
+                    Err(ProtocolError::channel(
+                        reply_code::RESOURCE_LOCKED,
+                        format!(
+                            "RESOURCE_LOCKED - queue '{name}' is exclusive to another connection"
+                        ),
+                        CLASS,
+                        method,
+                    ))
+                }
+                Some(_) => {
+                    // Consumer/ready counts come from the scheduler (M3):
+                    // zero for now, so if_unused/if_empty pass trivially.
+                    topo.delete_queue(vhost, &name, d.if_unused, d.if_empty, 0, 0)
+                        .map(|_| ())
+                        .map_err(|e| Self::topology_error(e, CLASS, method))
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                if let Some(ch) = self.channels.get_mut(&channel_id) {
+                    if ch.last_queue.as_deref() == Some(name.as_str()) {
+                        ch.last_queue = None;
+                    }
+                }
+                if d.nowait {
+                    true
+                } else {
+                    let ok = queue::AMQPMethod::DeleteOk(queue::DeleteOk { message_count: 0 });
+                    self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
+                        .await
+                        .is_ok()
+                }
+            }
+            Err(e) => self.protocol_error(channel_id, &e).await,
+        }
+    }
+
+    async fn handle_queue_bind(&mut self, channel_id: u16, d: queue::Bind) -> bool {
+        const CLASS: u16 = 50;
+        let method = d.get_amqp_method_id();
+        if let Err(e) = Self::require_no_arguments(&d.arguments, "bind", CLASS, method) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let Ok(queue_name) = self.resolve_queue_name(channel_id, d.queue.as_str()) else {
+            let e = ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        };
+        let vhost = self.vhost();
+        let outcome: Result<(), ProtocolError> = {
+            let mut topo = self.broker.topology.lock().unwrap();
+            let queue_id = topo.find_queue(vhost, &queue_name);
+            let exchange_id = topo.find_exchange(vhost, d.exchange.as_str());
+            match (queue_id, exchange_id) {
+                (None, _) => Err(ProtocolError::not_found(
+                    format!("no queue '{queue_name}' in vhost"),
+                    CLASS,
+                    method,
+                )),
+                (_, None) => Err(ProtocolError::not_found(
+                    format!("no exchange '{}' in vhost", d.exchange),
+                    CLASS,
+                    method,
+                )),
+                (Some(q), Some(e)) => topo
+                    .bind(vhost, e, q, d.routing_key.as_str())
+                    .map_err(|err| Self::topology_error(err, CLASS, method)),
+            }
+        };
+        match outcome {
+            Ok(()) if !d.nowait => {
+                let ok = queue::AMQPMethod::BindOk(queue::BindOk {});
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
+                    .await
+                    .is_ok()
+            }
+            Ok(()) => true,
+            Err(e) => self.protocol_error(channel_id, &e).await,
+        }
+    }
+
+    async fn handle_queue_unbind(&mut self, channel_id: u16, d: queue::Unbind) -> bool {
+        const CLASS: u16 = 50;
+        let method = d.get_amqp_method_id();
+        if let Err(e) = Self::require_no_arguments(&d.arguments, "unbind", CLASS, method) {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        let Ok(queue_name) = self.resolve_queue_name(channel_id, d.queue.as_str()) else {
+            let e = ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        };
+        let vhost = self.vhost();
+        let outcome: Result<(), ProtocolError> = {
+            let mut topo = self.broker.topology.lock().unwrap();
+            let queue_id = topo.find_queue(vhost, &queue_name);
+            let exchange_id = topo.find_exchange(vhost, d.exchange.as_str());
+            match (queue_id, exchange_id) {
+                (None, _) => Err(ProtocolError::not_found(
+                    format!("no queue '{queue_name}' in vhost"),
+                    CLASS,
+                    method,
+                )),
+                (_, None) => Err(ProtocolError::not_found(
+                    format!("no exchange '{}' in vhost", d.exchange),
+                    CLASS,
+                    method,
+                )),
+                (Some(q), Some(e)) => topo
+                    .unbind(vhost, e, q, d.routing_key.as_str())
+                    .map_err(|err| Self::topology_error(err, CLASS, method)),
+            }
+        };
+        match outcome {
+            // queue.unbind carries no nowait bit in 0-9-1.
+            Ok(()) => {
+                let ok = queue::AMQPMethod::UnbindOk(queue::UnbindOk {});
+                self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
+                    .await
+                    .is_ok()
+            }
+            Err(e) => self.protocol_error(channel_id, &e).await,
+        }
+    }
+
+    async fn handle_queue_purge(&mut self, channel_id: u16, d: queue::Purge) -> bool {
+        const CLASS: u16 = 50;
+        let method = d.get_amqp_method_id();
+        let Ok(name) = self.resolve_queue_name(channel_id, d.queue.as_str()) else {
+            let e = ProtocolError::not_found(
+                "no previously declared queue to use as default",
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        };
+        let vhost = self.vhost();
+        // Exclusive access gate: purging another connection's exclusive
+        // queue is refused (405).
+        let outcome: Result<(), ProtocolError> = {
+            let topo = self.broker.topology.lock().unwrap();
+            let found = topo.find_queue(vhost, &name);
+            match found {
+                None => Err(ProtocolError::not_found(
+                    format!("no queue '{name}' in vhost"),
+                    CLASS,
+                    method,
+                )),
+                Some(id)
+                    if !topo
+                        .check_exclusive_access(id, self.conn_id)
+                        .unwrap_or(false) =>
+                {
+                    Err(ProtocolError::channel(
+                        reply_code::RESOURCE_LOCKED,
+                        format!(
+                            "RESOURCE_LOCKED - queue '{name}' is exclusive to another connection"
+                        ),
+                        CLASS,
+                        method,
+                    ))
+                }
+                Some(_) => Ok(()),
+            }
+        };
+        if let Err(e) = outcome {
+            return self.protocol_error(channel_id, &e).await;
+        }
+        // The message store lands with the publish slice; there are no ready
+        // messages to purge yet, so a zero count is currently accurate
+        // (FR-Q06 ready-only semantics arrive with the store).
+        if d.nowait {
+            true
+        } else {
+            let ok = queue::AMQPMethod::PurgeOk(queue::PurgeOk { message_count: 0 });
+            self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
+                .await
+                .is_ok()
         }
     }
 

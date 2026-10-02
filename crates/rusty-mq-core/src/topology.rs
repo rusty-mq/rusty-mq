@@ -286,11 +286,15 @@ impl Topology {
                 let rec = &self.queues[existing];
                 let equivalent =
                     rec.profile == profile && rec.owner_connection.is_some() == profile.exclusive;
-                return if equivalent {
-                    Ok(*existing)
-                } else {
-                    Err(TopologyError::QueuePreconditionFailed(name.to_string()).into())
-                };
+                if !equivalent {
+                    return Err(TopologyError::QueuePreconditionFailed(name.to_string()).into());
+                }
+                // An equivalent redeclare by a *different* connection is a
+                // lock conflict when the queue is exclusive (405, FR-Q04).
+                if rec.profile.exclusive && rec.owner_connection != owner {
+                    return Err(TopologyError::QueueLocked(name.to_string()).into());
+                }
+                return Ok(*existing);
             }
         }
         // V1 profile gate (§5.3).
@@ -344,6 +348,32 @@ impl Topology {
 
     pub fn exchange_record(&self, id: ExchangeId) -> Option<&ExchangeRecord> {
         self.exchanges.get(&id)
+    }
+
+    /// Remove every queue owned by `connection` (exclusive queues and their
+    /// bindings) — called when the owning connection ends (FR-Q04/FR-P09).
+    /// Returns the removed queue ids so callers can drop associated state.
+    pub fn remove_owned_queues(
+        &mut self,
+        vhost: VhostId,
+        connection: crate::ids::ConnectionId,
+    ) -> Vec<QueueId> {
+        let owned: Vec<QueueId> = self
+            .queues
+            .values()
+            .filter(|q| q.vhost == vhost && q.owner_connection == Some(connection))
+            .map(|q| q.id)
+            .collect();
+        for id in &owned {
+            self.remove_queue_by_id(vhost, *id);
+        }
+        owned
+    }
+
+    /// Number of bindings attached to an exchange (for `exchange.delete
+    /// if_unused`).
+    pub fn binding_count(&self, vhost: VhostId, exchange: ExchangeId) -> usize {
+        self.bindings_of(vhost, exchange).len()
     }
 
     /// Add a binding; idempotent on (exchange, queue, key).
@@ -486,15 +516,25 @@ impl Topology {
     /// Remove a queue by id (used by connection teardown for exclusive and
     /// auto-delete queues). Idempotent.
     pub fn remove_queue_by_id(&mut self, vhost: VhostId, id: QueueId) {
+        let mut affected: Vec<ExchangeId> = Vec::new();
         if let Some(rec) = self.queues.remove(&id) {
             if let Some(names) = self.queue_names.get_mut(&vhost) {
                 names.remove(&rec.name);
             }
             if let Some(vb) = self.bindings.get_mut(&vhost) {
-                for list in vb.values_mut() {
+                for (exchange, list) in vb.iter_mut() {
+                    let before = list.len();
                     list.retain(|b| b.queue != id);
+                    if list.len() != before {
+                        affected.push(*exchange);
+                    }
                 }
             }
+        }
+        // An auto-delete exchange whose last binding disappeared with this
+        // queue is itself deleted (FR-E03 lifecycle).
+        for exchange in affected {
+            self.maybe_auto_delete_exchange(vhost, exchange);
         }
     }
 

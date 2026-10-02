@@ -15,7 +15,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | --- | --- | --- |
 | M0 — contracts | complete (partial evidence) | Workspace, ledger, baseline fixtures, ADRs exist; baseline digest pinning is a standing TODO for the first CI runner with Docker |
 | M1 — connection path | in_progress | lapin (1 of 5 clients) handshakes, opens/closes channels, cleans up; wrong credentials/vhost refused with correct codes; heartbeats (type-8 frames) answered; pika/amqplib/Java/Go fixtures pending (M8 gate) |
-| M2 — topology and routing | in_progress | In-memory topology registry and routing matchers landed with tests; not yet wired to protocol methods |
+| M2 — topology and routing | in_progress | Topology methods (exchange/queue declare+delete, bind/unbind, purge-ok) wired to core with frozen error profile; lapin-verified (T04/T05/T22 slices). basic.publish + routing to queue entries is the next slice |
 | M3 — delivery state | not_started | |
 | M4 — durable authority | not_started | Storage crate scaffold only |
 | M5 — confirms and failure safety | not_started | |
@@ -44,20 +44,28 @@ Updated: 2026-10-02 (M0/M1 development start).
 
 | ID | Status | Implementation | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| FR-E01 | in_progress | `rusty-mq-core` topology registry | unit tests | not yet behind protocol methods |
-| FR-E02 | not_started | | | |
-| FR-E03 | not_started | | | |
-| FR-E04 | not_started | | | |
-| FR-E05 | in_progress | direct/fanout/topic matchers | unit + property tests | |
-| FR-E06 | in_progress | destination-set dedup in router | unit tests | |
-| FR-E07 | not_started | | | |
+| FR-E01 | in_progress | built-ins predeclared per vhost | core unit tests; lapin `builtin_amq_direct_is_declared_passively` | |
+| FR-E02 | complete (partial evidence) | declare + passive + equivalence | `topology_lapin.rs` roundtrip + 406/404 tests | delete paths tested; auto-delete lifecycle unit-tested in core |
+| FR-E03 | in_progress | durability flags stored; auto-delete exchange lifecycle in core | core unit tests | internal=true publish gate lands with publish slice |
+| FR-E04 | complete (partial evidence) | bind/unbind idempotent | lapin roundtrip (`duplicate bind idempotent`) | |
+| FR-E05 | in_progress | matchers done; publish routing next | unit + property tests (T27 oracle) | |
+| FR-E06 | in_progress | destination-set dedup in router | unit tests | exercised end-to-end with publish slice |
+| FR-E07 | not_started | | | default-exchange routing lands with publish slice |
 | FR-E08 | not_started | | | needs M4 journal |
 
 ### Queues (§5.3)
 
 | ID | Status | Implementation | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| FR-Q01..FR-Q09 | not_started | profile types defined in core | — | |
+| FR-Q01 | complete (partial evidence) | declare + passive + counts | `topology_lapin.rs` roundtrip; counts are 0 until M3 | |
+| FR-Q02 | complete (partial evidence) | server-generated names + per-channel last-queue shorthand | `server_generated_queue_name` lapin test; core unit tests | |
+| FR-Q03 | complete (partial evidence) | equivalence 406 | `conflicting_redeclare_is_406` | |
+| FR-Q04 | complete (partial evidence) | exclusivity incl. passive-inspect lockout (405) | `exclusive_queue_dies_with_connection` | publish-through-exchange gate lands with publish slice |
+| FR-Q05 | not_started | | | auto-delete after last consumer needs M3 consumers |
+| FR-Q06 | in_progress | delete with if_unused/if_empty; purge-ok zero-count stub | lapin roundtrip delete | conditions pass trivially until messages/consumers exist; purge counts real from message store |
+| FR-Q07 | complete (partial evidence) | x-queue-type absent or classic accepted | `unsupported_arguments_are_540` (rejects non-classic) | |
+| FR-Q08 | complete (partial evidence) | quorum/stream + all other args 540 | same test (x-message-ttl 540) | |
+| FR-Q09 | not_started | | | consumer-cancel negotiation lands with M3 |
 
 ### Messages (§5.4), delivery/settlement (§6), resource limits (§10)
 
@@ -74,10 +82,21 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
 | T01 | in_progress | `crates/rusty-mq/tests/handshake_lapin.rs` — lapin client handshake + channel open/close (1 of 5 clients) |
 | T02 | in_progress | `rusty-mq-protocol` framing unit tests: split frames, merged chunks, bad frame-end, oversize |
 | T03 | not_started | |
-| T04 | in_progress | `rusty-mq-core` routing unit + property tests (below protocol layer) |
-| T05–T30 | not_started | |
+| T04 | in_progress | `topology_lapin.rs` roundtrip (declare/bind/unbind/delete) + core routing unit/property tests |
+| T05 | in_progress | `topology_lapin.rs`: equivalence, passive, generated names, exclusivity, reclaim |
+| T06–T30 | not_started | |
 
 ## Client-library findings (evidence-backed)
+
+- **Dependency version split**: lapin 4.12 resolves `amq-protocol-types`
+  10.6.3 while the broker uses `amq-protocol` 7.2.3 — two codec versions coexist
+  in the test tree. They interoperate on the wire (integration tests pass),
+  but the workspace should converge on one family (upgrade the server codec
+  to 10.x or pin lapin accordingly) during the M2 publish slice. Tracked as
+  the next run's housekeeping item.
+- **lapin method signatures take `ShortString`/`FieldTable` by value** and
+  `queue_unbind` has no options struct; error text renders codes as
+  `NOT-FOUND`/`not_found`, not "not found" (assertion convention).
 
 - **lapin 4.12 connect-future hang on server close during open-wait**: when
   the server sends `connection.close` while lapin awaits `connection.open-ok`
