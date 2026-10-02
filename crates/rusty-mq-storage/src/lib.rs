@@ -15,6 +15,7 @@
 
 pub mod backup;
 pub mod journal;
+pub mod projection;
 pub mod rebuild;
 pub mod record;
 pub mod snapshot;

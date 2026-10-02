@@ -35,6 +35,9 @@ cookie-factory = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal", "fs"] }
 bytes = "1"
 
+# Embedded index: derived, rebuildable projection (PRD §8.2; MIT OR Apache-2.0).
+redb = "4"
+
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

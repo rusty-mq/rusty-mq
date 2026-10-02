@@ -137,6 +137,11 @@ pub struct Broker {
     /// Durable journal (None = memory-backed development mode: accepted
     /// durable declarations make no persistence claim).
     pub journal: Mutex<Option<JournalWriter>>,
+    /// Derived redb projection (None in memory mode). Rebuildable;
+    /// advanced after journal commits with the fence LSN (§9.7).
+    pub projection: Mutex<Option<rusty_mq_storage::projection::Projection>>,
+    /// Last fence LSN committed to the journal (projection target).
+    last_fence_lsn: AtomicU64,
     /// Consumer registry (M3).
     pub consumers: Mutex<Consumers>,
     /// M1: exactly one test user; M7 replaces this with durable principals.
@@ -155,6 +160,8 @@ impl Broker {
             topology: Mutex::new(Topology::new(CompatibilitySwitches::default())),
             store: Mutex::new(MessageStore::new(MESSAGE_BYTE_BUDGET)),
             journal: Mutex::new(None),
+            projection: Mutex::new(None),
+            last_fence_lsn: AtomicU64::new(0),
             consumers: Mutex::new(Consumers::new()),
             test_user: TestUser {
                 username: user,
@@ -177,24 +184,26 @@ impl Broker {
     /// into live state first (the journal is the only source of truth,
     /// ADR-0002), then open the writer for appends.
     pub fn open_persistent(user: String, password: String, data_dir: &std::path::Path) -> Self {
-        let (rebuilt, writer) = rusty_mq_storage::rebuild::open_persistent(
-            data_dir,
-            MESSAGE_BYTE_BUDGET,
-            JournalConfig::default(),
-        )
-        .expect("recovery must succeed or startup must fail explicitly");
+        let (topology, store, projection, writer) =
+            rusty_mq_storage::rebuild::open_persistent_with_projection(
+                data_dir,
+                MESSAGE_BYTE_BUDGET,
+                JournalConfig::default(),
+            )
+            .expect("recovery must succeed or startup must fail explicitly");
         tracing::info!(
-            replayed = rebuilt.replayed,
             data_dir = %data_dir.display(),
-            "recovered durable state from journal"
+            "recovered durable state (journal + projection)"
         );
         Self {
             data_dir: Some(data_dir.to_path_buf()),
             snapshot_generation: AtomicU64::new(0),
             compact_threshold: std::sync::atomic::AtomicU64::new(COMPACT_THRESHOLD_BYTES),
-            topology: Mutex::new(rebuilt.topology),
-            store: Mutex::new(rebuilt.store),
+            topology: Mutex::new(topology),
+            store: Mutex::new(store),
             journal: Mutex::new(Some(writer)),
+            projection: Mutex::new(Some(projection)),
+            last_fence_lsn: AtomicU64::new(0),
             consumers: Mutex::new(Consumers::new()),
             test_user: TestUser {
                 username: user,
@@ -213,17 +222,30 @@ impl Broker {
         &self,
         records: &[Record],
     ) -> std::result::Result<(), JournalCommitError> {
-        let result = {
+        let fence = {
             let mut journal = self.journal.lock().unwrap();
             match journal.as_mut() {
-                Some(writer) => writer.commit(records).map(|_| ()).map_err(|e| {
+                Some(writer) => writer.commit(records).map_err(|e| {
                     tracing::error!(error = %e, "journal commit failed");
                     JournalCommitError
                 }),
-                None => Ok(()),
+                None => return Ok(()),
             }
-        };
-        result?;
+        }?;
+        // Advance the derived projection with the fence LSN atomically
+        // with its index updates (§9.7). A projection failure NEVER fails
+        // the committed transaction: the journal is authoritative and a
+        // broken projection rebuilds at the next startup.
+        {
+            let mut guard = self.projection.lock().unwrap();
+            if let Some(projection) = guard.as_ref() {
+                if let Err(e) = projection.apply(records, fence) {
+                    tracing::warn!(error = %e, "projection apply failed; will rebuild");
+                    *guard = None;
+                }
+            }
+        }
+        self.last_fence_lsn.store(fence, Ordering::SeqCst);
         self.maybe_compact();
         Ok(())
     }

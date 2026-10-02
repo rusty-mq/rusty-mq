@@ -111,7 +111,7 @@ Updated: 2026-10-02 (M0/M1 development start).
 | Settlements | complete (partial evidence) | terminal ack/discard of persistent entries in durable queues journaled | INV-02 evidence: acked entry absent after restart |
 | Purge | complete (partial evidence) | exact ready-set list journaled before live purge (§9.4) | store unit tests + seq identity via restart test |
 | Delivery-attempt markers | complete (partial evidence) | Delivered record (0x23); journaled before manual-ack exposure on both consumer and get paths; replay sets the conservative hint | `manual_ack_delivery_comes_back_redelivered_after_kill`, `no_ack_delivery_settles_before_exposure` |
-| redb projection | not_started | | derived index, applied-LSN watermark |
+| redb projection | complete (partial evidence) | `projection.rs` (redb 4.3): queues/exchanges/bindings/entries/delivered tables, applied_lsn advanced atomically with index updates (Immediate durability), schema eager-init; startup load-or-rebuild with journal-suffix replay; broker advances it after every commit and drops a failed handle (never blocks the committed transaction) | 5 projection tests: fresh build, load-on-second-startup, trailing-suffix replay, truncated-index rebuild-not-trust, settlement reflected in loaded state |
 | Offline backup/restore | complete (partial evidence) | `backup.rs`: create (live-writer refusal via LOCK liveness), verify (real-fold recovery of the copy), restore (empty-target enforced, verify-first); CLI wired | storage tests: roundtrip equivalence + append-after-restore, live-writer refusal, stale-lock tolerance, nonempty-target refusal, tampered-backup verification failure |
 | Data-directory LOCK | in_progress | pid-based cross-process lock at writer open; foreign live pid refuses, own pid takes over (abort-restart path), stale LOCK tolerated | restart tests + live-writer backup refusal test | OS-level flock (kernel-released) deferred to multi-process hardening; PID-reuse limitation documented |
 | Snapshots & compaction | complete (partial evidence) | `snapshot.rs` + `Broker::compact`; covered-LSN read after capture (≥ every event); reclaim only fully-covered non-tail segments + superseded snapshots | storage unit tests (roundtrip, corruption, reclaim, snapshot+suffix) + `compaction_reclaims_disk_and_state_survives_restart` |
@@ -158,6 +158,14 @@ All `not_started`. Pre-M7 binaries bind loopback only (PRD early safety constrai
   unexpected-frame 505/504 — RabbitMQ drops in-flight frames for channels
   awaiting close-ok. Implemented as an `awaiting_close_ok` set; found via
   lapin treating the 504 as connection-fatal.
+- **redb v4 iterator guards**: rows yield `(AccessGuard, AccessGuard)` —
+  `.value()` each side; `range` takes tuple bounds over the full key type;
+  tables don't exist until a write creates them (the projection
+  eager-creates its schema at open so reads never hit "does not exist").
+- **redb page checksums are lazy**: overwriting middle bytes of state.redb
+  can go undetected on read; the corruption test uses truncation (detected
+  at open). Full read-time integrity checking is redb's `check_integrity`
+  — a candidate for the M9 doctor pass.
 - **Dependency version split**: lapin 4.12 resolves `amq-protocol-types`
   10.6.3 while the broker uses `amq-protocol` 7.2.3 — two codec versions coexist
   in the test tree. They interoperate on the wire (integration tests pass),

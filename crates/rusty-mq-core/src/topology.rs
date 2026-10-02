@@ -355,6 +355,11 @@ impl Topology {
         self.exchanges.get(&id)
     }
 
+    /// Fresh topology for projection loading (same shape as `new`).
+    pub fn default_for_projection() -> Self {
+        Self::new(CompatibilitySwitches::default())
+    }
+
     /// Replay-only: restore a queue exactly as journaled (durable
     /// declarations only). Idempotent on identity.
     pub fn restore_queue(

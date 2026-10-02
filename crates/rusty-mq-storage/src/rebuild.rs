@@ -124,6 +124,16 @@ fn apply_record(
     }
 }
 
+/// Public alias for the fold (the projection's suffix replay uses it).
+pub fn apply_record_pub(
+    topology: &mut Topology,
+    store: &mut MessageStore,
+    max_entity_id: &mut u64,
+    record: &Record,
+) {
+    apply_record(topology, store, max_entity_id, record)
+}
+
 /// Rebuild live state from the recovery root at `dir`:
 /// manifest → snapshot + journal suffix, or the journal alone before the
 /// first snapshot. The byte budget mirrors the runtime store budget.
@@ -179,6 +189,30 @@ pub fn rebuild(
         replayed,
         max_entity_id,
     })
+}
+
+/// Projection-aware recovery: load the redb index as a checkpoint when
+/// valid (suffix replay only), otherwise rebuild it from the journal —
+/// then open the writer. The broker keeps the projection handle and
+/// advances it after every journal commit (§9.7).
+pub fn open_persistent_with_projection(
+    dir: &std::path::Path,
+    byte_budget: usize,
+    config: crate::journal::JournalConfig,
+) -> Result<
+    (
+        Topology,
+        MessageStore,
+        crate::projection::Projection,
+        JournalWriter,
+    ),
+    crate::record::FormatError,
+> {
+    std::fs::create_dir_all(dir).map_err(|e| crate::record::FormatError::Io(e.to_string()))?;
+    let (topology, store, projection, _status) =
+        crate::projection::recover_with_projection(dir, byte_budget)?;
+    let writer = JournalWriter::open(dir, config)?;
+    Ok((topology, store, projection, writer))
 }
 
 /// Open a persistent broker backend: recover first (rebuild live state),

@@ -556,6 +556,15 @@ pub fn recover(dir: &Path) -> Result<Vec<RecoveredRecord>, FormatError> {
     recover_with_options(dir, false)
 }
 
+/// The highest committed (fenced) LSN in the journal, 0 when empty.
+pub fn last_committed_lsn(dir: &Path) -> Result<u64, FormatError> {
+    let mut max = 0u64;
+    for item in recover(dir)? {
+        max = max.max(item.fence_lsn);
+    }
+    Ok(max)
+}
+
 /// `allow_orphan_first`: a manifest-published reclamation removed the head
 /// of the chain; the first remaining segment's `previous` legitimately
 /// points at a deleted id (§9.9 step 5). Only legal when the caller has a

@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+redb = { workspace = true }
 rusty-mq-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
