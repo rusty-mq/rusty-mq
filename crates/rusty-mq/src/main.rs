@@ -58,6 +58,10 @@ enum Command {
         password: String,
     },
     /// Validate a configuration file without starting the broker.
+    Doctor {
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -256,6 +260,23 @@ fn main() {
             }
             if let Err(e) = runtime.block_on(rusty_mq::server::serve_shared(listen, broker)) {
                 tracing::error!("server failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Doctor { data_dir } => {
+            let report = rusty_mq_storage::doctor::doctor(&data_dir);
+            for f in &report.findings {
+                let tag = match f.level {
+                    rusty_mq_storage::doctor::Level::Ok => "ok",
+                    rusty_mq_storage::doctor::Level::Warn => "WARN",
+                    rusty_mq_storage::doctor::Level::Error => "ERROR",
+                };
+                println!("[{tag}] {:>10}: {}", f.area, f.detail);
+            }
+            if report.healthy {
+                println!("doctor: healthy");
+            } else {
+                eprintln!("doctor: problems found; startup would refuse or data needs attention");
                 std::process::exit(1);
             }
         }

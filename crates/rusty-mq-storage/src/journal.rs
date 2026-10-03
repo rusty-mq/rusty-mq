@@ -556,6 +556,12 @@ pub fn recover(dir: &Path) -> Result<Vec<RecoveredRecord>, FormatError> {
     recover_with_options(dir, false)
 }
 
+/// Segment ids present, sorted (doctor inventory); None when the
+/// directory cannot be read.
+pub fn segment_inventory(dir: &Path) -> Option<Vec<u64>> {
+    scan_segments(dir).ok()
+}
+
 /// The highest committed (fenced) LSN in the journal, 0 when empty.
 pub fn last_committed_lsn(dir: &Path) -> Result<u64, FormatError> {
     let mut max = 0u64;

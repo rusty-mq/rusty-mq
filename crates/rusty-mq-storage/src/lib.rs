@@ -14,6 +14,7 @@
 //! positively claim persistence).
 
 pub mod backup;
+pub mod doctor;
 pub mod journal;
 pub mod projection;
 pub mod rebuild;

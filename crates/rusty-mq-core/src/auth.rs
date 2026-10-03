@@ -110,6 +110,11 @@ impl AuthState {
         rows
     }
 
+    /// Doctor summary: (principal count, permission grant count).
+    pub fn list_counts_for_doctor(&self) -> (usize, usize) {
+        (self.principals.len(), self.permissions.len())
+    }
+
     /// Direct permissions read (management listings).
     pub fn get_permissions(&self, username: &str, vhost: &str) -> Option<Permissions> {
         self.permissions
