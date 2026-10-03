@@ -499,7 +499,9 @@ async fn delete_if_unused_respects_live_consumers() {
 /// Soft-window delivery poll for drain loops: None when nothing arrives
 /// within the window (credit held / queue drained).
 async fn maybe_delivery(consumer: &mut lapin::Consumer) -> Option<lapin::message::Delivery> {
-    match tokio::time::timeout(Duration::from_millis(300), consumer.next()).await {
+    // 1s soft window: only "nothing more is coming" ends a drain — slow
+    // CI runners must not truncate a live stream mid-drain.
+    match tokio::time::timeout(Duration::from_secs(1), consumer.next()).await {
         Ok(Some(Ok(d))) => Some(d),
         Ok(Some(Err(e))) => panic!("delivery error: {e}"),
         Ok(None) => panic!("consumer stream ended"),

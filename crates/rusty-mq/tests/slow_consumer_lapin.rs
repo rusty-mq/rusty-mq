@@ -41,7 +41,7 @@ async fn connect(addr: std::net::SocketAddr) -> Connection {
 }
 
 async fn next_delivery(consumer: &mut lapin::Consumer) -> Option<lapin::message::Delivery> {
-    match tokio::time::timeout(Duration::from_secs(2), consumer.next()).await {
+    match tokio::time::timeout(Duration::from_secs(5), consumer.next()).await {
         Ok(Some(Ok(d))) => Some(d),
         Ok(Some(Err(e))) => panic!("delivery error: {e}"),
         Ok(None) => panic!("consumer stream ended"),
