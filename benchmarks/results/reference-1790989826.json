@@ -1,0 +1,20 @@
+{
+  "confirm_latency_us": {
+    "max": 77286874,
+    "p50": 53328231,
+    "p99": 77286781,
+    "p999": 77286855
+  },
+  "confirmed_total": 3136,
+  "consumed_total": 4154,
+  "consumers": 4,
+  "measure_seconds": 80.031670708,
+  "mode": "persistent+confirms",
+  "note": "short-run harness; §14.1 full runs (60s warmup, 5min measure, x3) execute in nightly CI",
+  "payload_bytes": 1024,
+  "prefetch": 100,
+  "profile": "reference-14.1",
+  "publishers": 4,
+  "throughput_confirmed_per_sec": 39.18448749423051,
+  "warmup_seconds": 1
+}

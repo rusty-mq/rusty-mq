@@ -3202,17 +3202,15 @@ impl Connection {
         }
     }
 
-    /// Send a frame; on a full or closed writer the connection is dropped
-    /// (bounded by construction; FR-R06 arrives with alarms).
+    /// Send a frame with bounded backpressure: the writer queue is
+    /// capacity-bounded (memory stays capped); a full queue AWAITs here —
+    /// TCP backpressure propagates to the client — instead of dropping the
+    /// connection. Under sustained publish load the try-send-and-drop M1
+    /// posture killed healthy connections (found by the §14 benchmark:
+    /// connection reset by peer on all publishers).
     async fn send(&self, frame: AMQPFrame) -> Result<(), ()> {
         let bytes = encode_frame(&frame);
-        match self.outbound.try_send(bytes) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                tracing::warn!("outbound queue full or closed; dropping connection");
-                Err(())
-            }
-        }
+        self.outbound.send(bytes).await.map_err(|_| ())
     }
 }
 

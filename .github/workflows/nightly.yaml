@@ -1,0 +1,50 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"  # off-peak
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: reference benchmark (short CI shape)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Reference profile (2 min measured)
+        run: |
+          RMQ_BENCH_SECS=120 cargo test --release -p rusty-mq --test bench_reference reference_profile -- --noc --nocapture
+        env:
+          RUST_LOG: info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmarks/results/
+
+  soak:
+    name: churn soak + extended recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Churn soak (bounded journal through compaction)
+        run: |
+          RMQ_SOAK_CYCLES=500 cargo test --release -p rusty-mq --test bench_reference churn_soak -- --nocapture
+      - name: Durability + backup suites (extended)
+        run: cargo test --release -p rusty-mq --test durability_lapin --test failure_safety_lapin --test alarms_lapin
+      - name: Storage suites (journal/snapshot/projection/backup)
+        run: cargo test --release -p rusty-mq-storage
+      - name: Adversarial corpora (larger cases)
+        run: cargo test --release -p rusty-mq-protocol --test fuzz_frames -p rusty-mq-storage --test fuzz_storage
+        env:
+          PROPTEST_CASES: "2048"
+
+  # The 24-hour soak (§14.1) is a manually dispatched long-run job; the
+  # recipe: RMQ_BENCH_SECS=86400 with a dedicated self-hosted runner and
+  # RSS/FD/disk sampling — gate is "no unbounded growth".
