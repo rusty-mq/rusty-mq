@@ -39,6 +39,30 @@ pub enum HeaderCheck {
     NotAmqp,
 }
 
+/// Channel-scoped method policy over RAW payload bytes — for fields the
+/// amq-protocol codec does not model (and therefore silently drops).
+/// Currently: basic.qos (class 60, method 10) reserves a u32
+/// `prefetch_size` at offset 4; the frozen profile allows only 0.
+fn policy_violation(payload: &[u8]) -> Option<ProtocolError> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let class_id = u16::from_be_bytes([payload[0], payload[1]]);
+    let method_id = u16::from_be_bytes([payload[2], payload[3]]);
+    if (class_id, method_id) != (60, 10) {
+        return None;
+    }
+    let prefetch_size = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if prefetch_size == 0 {
+        return None;
+    }
+    Some(ProtocolError::not_implemented(
+        format!("basic.qos prefetch_size ({prefetch_size}): only 0 is supported"),
+        60,
+        10,
+    ))
+}
+
 /// Incremental frame decoder for one connection direction.
 ///
 /// Feed chunks as they arrive from the socket; call [`FrameReader::next_frame`]
@@ -54,6 +78,11 @@ pub struct FrameReader {
     /// Total buffer cap guarding against runaway feed() accumulation.
     buf_cap: usize,
     header_seen: bool,
+    /// Channel-scoped method-policy violation detected while decoding the
+    /// last method frame (see policy_violation); the connection drains it
+    /// via take_policy_violation and rejects the channel without tearing
+    /// down the connection.
+    pending_policy: Option<crate::error::ProtocolError>,
 }
 
 impl FrameReader {
@@ -79,6 +108,7 @@ impl FrameReader {
             // One frame in assembly + one chunk in flight.
             buf_cap: frame_max.saturating_mul(2).max(FRAME_MIN as usize),
             header_seen,
+            pending_policy: None,
         }
     }
 
@@ -95,6 +125,13 @@ impl FrameReader {
         }
         self.buf.extend_from_slice(chunk);
         Ok(())
+    }
+
+    /// Take the channel-scoped policy violation detected while decoding
+    /// the most recent method frame, if any. The connection must send it
+    /// as a channel error and skip dispatching that frame.
+    pub fn take_policy_violation(&mut self) -> Option<ProtocolError> {
+        self.pending_policy.take()
     }
 
     /// Bytes currently buffered awaiting frame completion.
@@ -141,6 +178,10 @@ impl FrameReader {
                 // without its own guard (see tables.rs).
                 crate::tables::validate_method(&payload, &self.static_limits)
                     .map_err(|e| ProtocolError::frame_error(e.message()).with_fatal())?;
+                // Channel-scoped method policy over raw bytes the codec
+                // cannot express (differential-matrix finding: the frozen
+                // prefetch_size 540 was silently unenforced).
+                self.pending_policy = policy_violation(&payload);
                 let (_, class) = parse_class(&payload[..]).map_err(|e| {
                     ProtocolError::frame_error(format!("invalid method payload: {e}")).with_fatal()
                 })?;
@@ -459,6 +500,26 @@ mod tests {
         // type 9, channel 0, size 0, end 0xCE
         r.feed(&[9, 0, 0, 0, 0, 0, 0, 0xCE]).unwrap();
         assert!(r.next_frame().is_err());
+    }
+
+    #[test]
+    fn qos_prefetch_size_policy_matches_frozen_profile() {
+        let qos = |size: u32, count: u16| {
+            let mut p = vec![0, 60, 0, 10];
+            p.extend_from_slice(&size.to_be_bytes());
+            p.extend_from_slice(&count.to_be_bytes());
+            p.push(0); // global bit
+            p
+        };
+        // Nonzero is the frozen channel-scoped 540.
+        let e = policy_violation(&qos(10, 5)).expect("nonzero must violate");
+        assert_eq!(e.reply_code, 540);
+        assert_eq!((e.class_id, e.method_id), (60, 10));
+        assert!(!e.fatal, "channel-scoped, not connection-fatal");
+        // Zero and unrelated methods pass through untouched.
+        assert!(policy_violation(&qos(0, 5)).is_none());
+        assert!(policy_violation(&[0, 60, 0, 20, 0, 0, 0, 10]).is_none()); // consume
+        assert!(policy_violation(&[0, 60, 0, 10, 0]).is_none()); // truncated
     }
 
     #[test]

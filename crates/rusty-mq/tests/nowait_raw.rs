@@ -623,3 +623,59 @@ async fn connection_close_completes_after_async_channel_error() {
         Err(_) => panic!("connection close handshake hung after async channel error"),
     }
 }
+
+/// M9-20: basic.qos prefetch_size != 0 is frozen as a channel-scoped 540,
+/// but the codec drops the reserved field — enforcement is raw-frame.
+/// Hand-crafted method bytes (the codec cannot express a nonzero value),
+/// then verify the channel closes with 540 and the connection survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn qos_prefetch_size_nonzero_is_channel_540() {
+    let addr = start_broker().await;
+    let mut s = handshake(addr).await;
+
+    // basic.qos: class 60, method 10, prefetch_size u32=10,
+    // prefetch_count u16=5, global bit=0.
+    let mut payload = vec![0, 60, 0, 10];
+    payload.extend_from_slice(&10u32.to_be_bytes());
+    payload.extend_from_slice(&5u16.to_be_bytes());
+    payload.push(0);
+    let mut frame = vec![1u8, 0, 1]; // method frame, channel 1
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame.push(0xCE);
+    use tokio::io::AsyncWriteExt;
+    s.sock.write_all(&frame).await.unwrap();
+
+    match s.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Channel(ch7::AMQPMethod::Close(c))) => {
+            assert_eq!(c.reply_code, 540);
+            assert!(c.reply_text.as_str().contains("prefetch_size"));
+        }
+        other => panic!("expected channel.close 540, got {other:?}"),
+    }
+
+    // Channel-scoped: a fresh channel on the same connection works.
+    s.send(&AMQPFrame::Method(
+        2,
+        AMQPClass::Channel(ch7::AMQPMethod::Open(ch7::Open {})),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(2, AMQPClass::Channel(ch7::AMQPMethod::OpenOk(_))) => {}
+        other => panic!("connection must survive the channel 540: {other:?}"),
+    }
+    // And the legal form (prefetch_size 0) still answers qos-ok.
+    s.send(&AMQPFrame::Method(
+        2,
+        AMQPClass::Basic(basic7::AMQPMethod::Qos(basic7::Qos {
+            prefetch_count: 5,
+            global: false,
+        })),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(2, AMQPClass::Basic(basic7::AMQPMethod::QosOk(_))) => {}
+        other => panic!("expected qos-ok on the fresh channel, got {other:?}"),
+    }
+    let _ = conn_close(&mut s).await;
+}

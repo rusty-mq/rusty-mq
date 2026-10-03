@@ -296,6 +296,18 @@ impl Connection {
             loop {
                 match reader.next_frame() {
                     Ok(Some(frame)) => {
+                        // Raw method-policy violations (fields the codec
+                        // drops, e.g. basic.qos prefetch_size != 0) close
+                        // the frame's CHANNEL only; the frame itself is
+                        // not dispatched.
+                        if let Some(e) = reader.take_policy_violation() {
+                            let ch = match &frame {
+                                AMQPFrame::Method(id, _) => *id,
+                                _ => 0,
+                            };
+                            self.protocol_error(ch, &e).await;
+                            continue;
+                        }
                         if !self.handle_frame(frame).await {
                             return;
                         }

@@ -111,11 +111,9 @@ def _qos_prefetch_size(ch):
     ch.basic_qos(prefetch_size=10, prefetch_count=0)
 
 
-# KNOWN ENFORCEMENT GAP (M9-19 finding): amq-protocol 7.x does not model
-# the reserved prefetch_size field, so a nonzero value is silently
-# accepted (qos-ok) instead of the frozen 540. Recorded as it IS until
-# the raw-frame enforcement lands; features.yaml/profile updated to match.
-case("basic_qos_prefetch_size", "channel_error", "pending-540", _qos_prefetch_size)
+# Enforced since M9-20 via raw-frame policy (the codec drops the field):
+# nonzero prefetch_size closes the channel with the frozen 540.
+case("basic_qos_prefetch_size", "channel_error", 540, _qos_prefetch_size)
 
 
 def _consume_sac(ch):
@@ -224,9 +222,6 @@ def main():
                 or (r["reply_code"] is not None
                     and str(r["reply_code"]) != r["frozen_expect"].split(":")[1])))
         ]
-        # The known prefetch_size gap is EXPECTED to mismatch until the
-        # raw-frame enforcement lands (recorded, not asserted).
-        mismatches = [r for r in mismatches if "pending" not in str(r["frozen_expect"])]
         for r in mismatches:
             print(f"PROFILE MISMATCH {r['case']}: got {r['outcome']}:{r['reply_code']}, "
                   f"frozen {r['frozen_expect']}", file=sys.stderr)

@@ -66,10 +66,10 @@
   },
   {
    "case": "basic_qos_prefetch_size",
-   "outcome": "ok",
-   "reply_code": null,
-   "reply_text": null,
-   "frozen_expect": "channel_error:pending-540"
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - basic.qos prefetch_size (10): only 0 is supported is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
   },
   {
    "case": "consume_x_single_active_consumer",
