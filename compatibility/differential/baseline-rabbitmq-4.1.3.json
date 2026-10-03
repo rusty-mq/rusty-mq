@@ -6,112 +6,136 @@
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": null
+   "frozen_expect": null,
+   "url_vhost": null
   },
   {
    "case": "queue_x_message_ttl",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_x_queue_type_quorum",
    "outcome": "channel_error",
    "reply_code": 406,
    "reply_text": "PRECONDITION_FAILED - invalid property 'non-durable' for queue 'diff.quorum' in vhost '/'",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_x_max_priority",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_durable_exclusive",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:406"
+   "frozen_expect": "channel_error:406",
+   "url_vhost": null
   },
   {
    "case": "queue_durable_auto_delete",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:406"
+   "frozen_expect": "channel_error:406",
+   "url_vhost": null
   },
   {
    "case": "exchange_type_headers",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "publish_expiration_property",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "tx_select",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "basic_qos_prefetch_size",
    "outcome": "connection_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - prefetch_size!=0 (10)",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "consume_x_single_active_consumer",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "basic_recover_requeue_false",
    "outcome": "connection_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - requeue=false",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_passive_missing",
    "outcome": "channel_error",
    "reply_code": 404,
    "reply_text": "NOT_FOUND - no queue 'diff.nope' in vhost '/'",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
   },
   {
    "case": "queue_delete_missing",
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
   },
   {
    "case": "queue_bind_missing_exchange",
    "outcome": "channel_error",
    "reply_code": 404,
    "reply_text": "NOT_FOUND - no exchange 'diff.nox' in vhost '/'",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
   },
   {
    "case": "publish_missing_exchange",
    "outcome": "channel_error",
    "reply_code": null,
    "reply_text": "channel closed asynchronously",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
+  },
+  {
+   "case": "wrong_vhost",
+   "outcome": "connection_error",
+   "reply_code": 530,
+   "reply_text": "ConnectionClosedByBroker: (530) 'NOT_ALLOWED - vhost does-not-exist not found'",
+   "frozen_expect": "connection_error:403",
+   "url_vhost": "/does-not-exist"
   }
  ]
 }

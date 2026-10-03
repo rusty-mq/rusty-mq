@@ -6,112 +6,136 @@
    "outcome": "ok",
    "reply_code": null,
    "reply_text": null,
-   "frozen_expect": null
+   "frozen_expect": null,
+   "url_vhost": null
   },
   {
    "case": "queue_x_message_ttl",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - queue argument 'x-message-ttl' is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_x_queue_type_quorum",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - queue type (only x-queue-type=classic is supported) is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_x_max_priority",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - queue argument 'x-max-priority' is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_durable_exclusive",
    "outcome": "channel_error",
    "reply_code": 406,
    "reply_text": "PRECONDITION_FAILED - durable+exclusive queues are not supported by rusty-mq in V1",
-   "frozen_expect": "channel_error:406"
+   "frozen_expect": "channel_error:406",
+   "url_vhost": null
   },
   {
    "case": "queue_durable_auto_delete",
    "outcome": "channel_error",
    "reply_code": 406,
    "reply_text": "PRECONDITION_FAILED - durable+auto-delete queues are not supported by rusty-mq in V1",
-   "frozen_expect": "channel_error:406"
+   "frozen_expect": "channel_error:406",
+   "url_vhost": null
   },
   {
    "case": "exchange_type_headers",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - exchange type 'headers' (direct, fanout, topic only in V1) is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "publish_expiration_property",
    "outcome": "channel_error",
    "reply_code": null,
    "reply_text": "channel closed asynchronously",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "tx_select",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - method (class 90, method 10) is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "basic_qos_prefetch_size",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - basic.qos prefetch_size (10): only 0 is supported is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "consume_x_single_active_consumer",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - consume argument 'x-single-active-consumer' is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "basic_recover_requeue_false",
    "outcome": "channel_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - basic.recover requeue=false is not supported by rusty-mq",
-   "frozen_expect": "channel_error:540"
+   "frozen_expect": "channel_error:540",
+   "url_vhost": null
   },
   {
    "case": "queue_passive_missing",
    "outcome": "channel_error",
    "reply_code": 404,
    "reply_text": "NOT_FOUND - no queue 'diff.nope' in vhost",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
   },
   {
    "case": "queue_delete_missing",
    "outcome": "channel_error",
    "reply_code": 404,
    "reply_text": "NOT_FOUND - no queue 'diff.nope' in vhost",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
   },
   {
    "case": "queue_bind_missing_exchange",
    "outcome": "channel_error",
    "reply_code": 404,
    "reply_text": "NOT_FOUND - no exchange 'diff.nox' in vhost",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
   },
   {
    "case": "publish_missing_exchange",
    "outcome": "channel_error",
    "reply_code": null,
    "reply_text": "channel closed asynchronously",
-   "frozen_expect": "channel_error:404"
+   "frozen_expect": "channel_error:404",
+   "url_vhost": null
+  },
+  {
+   "case": "wrong_vhost",
+   "outcome": "connection_error",
+   "reply_code": 403,
+   "reply_text": "ConnectionClosedByBroker: (403) \"ACCESS_REFUSED - vhost 'does-not-exist' not found or access refused\"",
+   "frozen_expect": "connection_error:403",
+   "url_vhost": "/does-not-exist"
   }
  ]
 }

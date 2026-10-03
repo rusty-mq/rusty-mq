@@ -15,6 +15,7 @@ Usage:
 """
 
 import json
+import re
 import sys
 
 import pika
@@ -26,8 +27,8 @@ import pika
 CASES = []
 
 
-def case(name, expect_kind, expect_code, fn):
-    CASES.append((name, expect_kind, expect_code, fn))
+def case(name, expect_kind, expect_code, fn, url_vhost=None):
+    CASES.append((name, expect_kind, expect_code, fn, url_vhost))
 
 
 def declare(queue, durable=False, exclusive=False, auto_delete=False, args=None):
@@ -168,6 +169,16 @@ def _publish_missing_exchange(ch):
 case("publish_missing_exchange", "channel_error", 404, _publish_missing_exchange)
 
 
+# --- 403 ACCESS_REFUSED family (connection scope at open) ---
+
+def _noop(_ch):
+    pass
+
+
+# Unknown vhost: refused at connection.open with 403 on both brokers.
+case("wrong_vhost", "connection_error", 403, _noop, url_vhost="/does-not-exist")
+
+
 def _safe_close(conn):
     try:
         conn.close()
@@ -177,11 +188,12 @@ def _safe_close(conn):
 
 def run_all(url):
     results = []
-    for name, expect_kind, expect_code, fn in CASES:
+    for name, expect_kind, expect_code, fn, url_vhost in CASES:
+        case_url = url if url_vhost is None else url.rsplit("/", 1)[0] + url_vhost
         # Fresh connection per case: channel errors kill the channel and
-        # some cases may close the connection.
+        # some cases may close the connection (or refuse it at open).
         try:
-            conn = pika.BlockingConnection(pika.URLParameters(url))
+            conn = pika.BlockingConnection(pika.URLParameters(case_url))
             ch = conn.channel()
             # A probe queue that exists for the whole connection: the
             # post-case probe (passive declare of it) surfaces async
@@ -223,6 +235,19 @@ def run_all(url):
                 t = threading.Thread(target=lambda: _safe_close(conn), daemon=True)
                 t.start()
                 t.join(2.0)
+        except pika.exceptions.ConnectionClosedByBroker as e:
+            # Refused AT open (e.g. unknown vhost -> 403): a protocol
+            # outcome, not a transport failure.
+            outcome = {"case": name, "outcome": "connection_error",
+                       "reply_code": e.reply_code, "reply_text": e.reply_text}
+        except (pika.exceptions.ProbableAccessDeniedError,
+                pika.exceptions.ProbableAuthenticationError) as e:
+            # pika wraps open-time broker closes in these; the reply code
+            # is embedded in the message.
+            m = re.search(r"\((\d+)\)", str(e))
+            outcome = {"case": name, "outcome": "connection_error",
+                       "reply_code": int(m.group(1)) if m else None,
+                       "reply_text": str(e)}
         except Exception as e:  # transport-level failure
             outcome = {"case": name, "outcome": "transport_error",
                        "reply_code": None,
@@ -230,6 +255,7 @@ def run_all(url):
         outcome["frozen_expect"] = (
             None if expect_kind == "ok" else f"{expect_kind}:{expect_code}"
         )
+        outcome["url_vhost"] = url_vhost
         results.append(outcome)
         print(f"{name}: {outcome['outcome']}"
               f"{' code=' + str(outcome['reply_code']) if outcome['reply_code'] else ''}")
