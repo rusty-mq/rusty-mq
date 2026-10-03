@@ -185,6 +185,12 @@ pub struct Broker {
     snapshot_generation: AtomicU64,
     /// Journal-size ceiling before inline compaction (test hook).
     compact_threshold: std::sync::atomic::AtomicU64,
+    /// Per-connection protocol limits (config-driven; §13.2).
+    pub protocol_limits: rusty_mq_protocol::ProtocolLimits,
+    /// Memory-alarm trigger bytes (limits.memory_alarm_bytes).
+    pub memory_alarm_bytes: u64,
+    /// Message-store byte budget (limits.managed_buffer_bytes).
+    pub message_budget: usize,
     pub topology: Mutex<Topology>,
     /// In-memory message store (M2); the durable journal augments this in M4.
     pub store: Mutex<MessageStore>,
@@ -236,6 +242,9 @@ impl Broker {
             data_dir: None,
             snapshot_generation: AtomicU64::new(0),
             compact_threshold: std::sync::atomic::AtomicU64::new(COMPACT_THRESHOLD_BYTES),
+            protocol_limits: rusty_mq_protocol::ProtocolLimits::default(),
+            memory_alarm_bytes: MESSAGE_BYTE_BUDGET as u64,
+            message_budget: MESSAGE_BYTE_BUDGET,
             topology: Mutex::new(Topology::new(CompatibilitySwitches::default())),
             store: Mutex::new(MessageStore::new(MESSAGE_BYTE_BUDGET)),
             journal: Mutex::new(None),
@@ -365,6 +374,42 @@ impl Broker {
         Self::open_persistent_with_journal(user, password, data_dir, JournalConfig::default())
     }
 
+    /// Memory-mode broker honoring a §13.2 configuration (switches,
+    /// limits, budgets, alarm settings).
+    pub fn new_from_config(user: String, password: String, cfg: &crate::config::Config) -> Self {
+        let mut broker = Self::new(user, password);
+        broker.apply_config(cfg);
+        broker
+    }
+
+    /// Persistent-mode broker honoring a §13.2 configuration (also sets
+    /// journal shape via the doc-hidden journal-config constructor).
+    pub fn open_persistent_from_config(
+        user: String,
+        password: String,
+        data_dir: &std::path::Path,
+        cfg: &crate::config::Config,
+    ) -> Self {
+        let mut broker =
+            Self::open_persistent_with_journal(user, password, data_dir, cfg.journal_config());
+        broker.apply_config(cfg);
+        broker
+    }
+
+    /// Apply the config-driven surfaces after construction. Runs BEFORE
+    /// the listener accepts (serve path), so no connection observes the
+    /// defaults.
+    fn apply_config(&mut self, cfg: &crate::config::Config) {
+        self.protocol_limits = cfg.protocol_limits();
+        self.message_budget = cfg.limits.managed_buffer_bytes as usize;
+        self.memory_alarm_bytes = cfg.limits.memory_alarm_bytes;
+        *self.topology.lock().unwrap() = Topology::new(cfg.compatibility());
+        let (min_bytes, ratio) = cfg.alarm_settings();
+        let mut alarms = self.alarms.lock().unwrap();
+        alarms.disk_free_min_bytes = min_bytes;
+        alarms.disk_free_min_ratio = ratio;
+    }
+
     /// Test/ops variant of [`Broker::open_persistent`] with an explicit
     /// journal configuration (e.g. no-rotation segments to exercise the
     /// seal-on-compact path; T28 regression).
@@ -437,6 +482,9 @@ impl Broker {
             data_dir: Some(data_dir.to_path_buf()),
             snapshot_generation: AtomicU64::new(0),
             compact_threshold: std::sync::atomic::AtomicU64::new(COMPACT_THRESHOLD_BYTES),
+            protocol_limits: rusty_mq_protocol::ProtocolLimits::default(),
+            memory_alarm_bytes: MESSAGE_BYTE_BUDGET as u64,
+            message_budget: MESSAGE_BYTE_BUDGET,
             auth: Mutex::new(auth),
             topology: Mutex::new(topology),
             store: Mutex::new(store),
@@ -694,7 +742,11 @@ impl Broker {
         let transitions = {
             let store_bytes = self.store.lock().unwrap().total_bytes();
             let mut alarms = self.alarms.lock().unwrap();
-            alarms.evaluate(store_bytes, MESSAGE_BYTE_BUDGET, self.data_dir.as_deref())
+            alarms.evaluate(
+                store_bytes,
+                self.memory_alarm_bytes as usize,
+                self.data_dir.as_deref(),
+            )
         };
         if !transitions.any() {
             return;

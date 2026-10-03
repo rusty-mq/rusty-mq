@@ -181,6 +181,7 @@ impl Connection {
             username: String::new(), // enriched post-auth with the registry pass
             control: control_tx,
         });
+        let limits = broker.protocol_limits.clone();
         let mut conn = Self {
             broker,
             conn_id,
@@ -191,7 +192,7 @@ impl Connection {
             client_blocking: false,
             username: String::new(),
             peer: peer.clone(),
-            limits: ProtocolLimits::default(),
+            limits,
             negotiated: None,
             phase: Phase::AwaitStartOk,
             channels: HashMap::new(),

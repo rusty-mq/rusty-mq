@@ -319,6 +319,61 @@ fn default_log_level() -> String {
 
 /// Load from a TOML file (missing file is an explicit error — never a
 /// silent default when the operator pointed at a path).
+impl Config {
+    /// §13.2 -> protocol limits in force per connection.
+    pub fn protocol_limits(&self) -> rusty_mq_protocol::ProtocolLimits {
+        rusty_mq_protocol::ProtocolLimits {
+            max_frame_max: self.amqp.frame_max_bytes,
+            max_channel_max: self.amqp.channel_max,
+            heartbeat_seconds: self.amqp.heartbeat_seconds,
+            handshake_timeout_seconds: self.amqp.handshake_timeout_seconds,
+            assembly_timeout_seconds: self.amqp.assembly_timeout_seconds,
+            max_message_bytes: self.amqp.max_message_bytes,
+            max_header_bytes: self.amqp.max_header_bytes,
+            max_table_depth: self.limits_table_depth(),
+            max_table_fields: self.limits_table_fields(),
+        }
+    }
+
+    fn limits_table_depth(&self) -> u8 {
+        // The frozen profile fixes table budgets; the config schema does
+        // not carry them (see docs/protocol-profile.md).
+        rusty_mq_protocol::ProtocolLimits::default().max_table_depth
+    }
+
+    fn limits_table_fields(&self) -> u32 {
+        rusty_mq_protocol::ProtocolLimits::default().max_table_fields
+    }
+
+    /// §13.2 -> journal writer settings.
+    pub fn journal_config(&self) -> rusty_mq_storage::journal::JournalConfig {
+        rusty_mq_storage::journal::JournalConfig {
+            segment_bytes: self.storage.segment_bytes as usize,
+            commit_batch_delay_ms: self.storage.commit_batch_delay_ms,
+            commit_batch_bytes: self.storage.commit_batch_bytes as usize,
+            ..Default::default()
+        }
+    }
+
+    /// §13.2 -> compatibility switches.
+    pub fn compatibility(&self) -> rusty_mq_core::topology::CompatibilitySwitches {
+        rusty_mq_core::topology::CompatibilitySwitches {
+            allow_transient_nonexclusive_queues: self
+                .compatibility
+                .allow_transient_nonexclusive_queues,
+            reject_unknown_arguments: self.compatibility.reject_unknown_arguments,
+        }
+    }
+
+    /// §13.2 -> (disk_free_min_bytes, disk_free_min_ratio).
+    pub fn alarm_settings(&self) -> (u64, f64) {
+        (
+            self.storage.disk_free_min_bytes,
+            self.storage.disk_free_min_ratio,
+        )
+    }
+}
+
 pub fn load_file(path: &Path) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;

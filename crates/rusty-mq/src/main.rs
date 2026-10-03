@@ -34,8 +34,11 @@ enum Command {
     /// Run the broker.
     Serve {
         /// Listen address; loopback only until M7 (PRD early safety constraint).
-        #[arg(long, default_value = "127.0.0.1:5672")]
-        listen: SocketAddr,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+        /// §13.2 configuration file; flags override file values.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
         /// Data directory for the durable journal; absent = memory-backed
         /// development mode (no persistence claim).
         #[arg(long)]
@@ -44,9 +47,10 @@ enum Command {
         #[arg(long)]
         management_listen: Option<std::net::SocketAddr>,
         /// Separate metrics listener (§12.3; unauthenticated Prometheus
-        /// text — loopback default). "disabled" turns it off.
-        #[arg(long, default_value = "127.0.0.1:15692")]
-        metrics_listen: String,
+        /// text — loopback default). "disabled" turns it off. Flag wins
+        /// over the config file's metrics.listen.
+        #[arg(long)]
+        metrics_listen: Option<String>,
         /// TLS material for the management listener (§13: required when
         /// exposed non-loopback).
         #[arg(long, requires = "management_listen")]
@@ -205,6 +209,7 @@ fn main() {
     match cli.command {
         Command::Serve {
             listen,
+            config,
             data_dir,
             metrics_listen,
             management_listen,
@@ -221,9 +226,39 @@ fn main() {
                     "default development credentials guest/guest in use; rotate via `admin users` + `credentials`"
                 );
             }
+            // §13.2: the config file is the configuration surface;
+            // explicit flags override file values (load+validate first —
+            // an invalid file never starts a half-configured broker).
+            let file_cfg = config
+                .as_ref()
+                .map(|p| rusty_mq::config::load_file(p))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("invalid --config {}: {e}", config.unwrap().display());
+                    std::process::exit(2);
+                });
+            let data_dir =
+                data_dir.or_else(|| file_cfg.as_ref().map(|c| c.server.data_dir.clone()));
+            let effective_listen: SocketAddr = listen.unwrap_or_else(|| {
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.amqp.listen.parse().ok())
+                    .unwrap_or_else(|| "127.0.0.1:5672".parse().unwrap())
+            });
+            let effective_metrics: Option<String> = metrics_listen
+                .clone()
+                .or_else(|| file_cfg.as_ref().map(|c| c.metrics.listen.clone()));
             let broker = match &data_dir {
-                Some(dir) => rusty_mq::Broker::open_persistent(user, password, dir),
-                None => rusty_mq::Broker::new(user, password),
+                Some(dir) => match &file_cfg {
+                    Some(cfg) => {
+                        rusty_mq::Broker::open_persistent_from_config(user, password, dir, cfg)
+                    }
+                    None => rusty_mq::Broker::open_persistent(user, password, dir),
+                },
+                None => match &file_cfg {
+                    Some(cfg) => rusty_mq::Broker::new_from_config(user, password, cfg),
+                    None => rusty_mq::Broker::new(user, password),
+                },
             };
             let broker = std::sync::Arc::new(broker);
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -233,6 +268,7 @@ fn main() {
             // PRD §12.3: a SEPARATE metrics listener (loopback default,
             // unauthenticated Prometheus text; the config layer refuses
             // remote binds without the explicit opt-in).
+            let metrics_listen = effective_metrics.unwrap_or_else(|| "127.0.0.1:15692".into());
             if metrics_listen != "disabled" {
                 let broker = broker.clone();
                 let listen: std::net::SocketAddr = metrics_listen.parse().unwrap_or_else(|e| {
@@ -314,7 +350,9 @@ fn main() {
                     rusty_mq::server::serve_tls_shared(listener, broker, acceptor).await;
                 });
             }
-            if let Err(e) = runtime.block_on(rusty_mq::server::serve_shared(listen, broker)) {
+            if let Err(e) =
+                runtime.block_on(rusty_mq::server::serve_shared(effective_listen, broker))
+            {
                 tracing::error!("server failed: {e}");
                 std::process::exit(1);
             }
