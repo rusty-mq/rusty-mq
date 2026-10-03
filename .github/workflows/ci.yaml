@@ -41,3 +41,15 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: License + advisory + source checks (gate 7)
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny --version
+          cargo deny check licenses advisories bans sources
