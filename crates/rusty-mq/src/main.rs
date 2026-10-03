@@ -205,7 +205,7 @@ fn main() {
         } => {
             if user == "guest" && password == "guest" {
                 tracing::warn!(
-                    "development credentials guest/guest in use; real authentication lands in M7"
+                    "default development credentials guest/guest in use; rotate via `admin users` + `credentials`"
                 );
             }
             let broker = match &data_dir {

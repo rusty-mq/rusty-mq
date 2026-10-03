@@ -81,6 +81,31 @@ never logged.
 Clients that declared `connection.blocked` receive
 `connection.blocked`/`unblocked` on transitions.
 
+## Storage growth and compaction
+
+The journal is append-only; reclamation keeps it bounded:
+
+- **Automatic compaction** runs after commits once live journal bytes
+  exceed `server.compact_threshold_bytes` (see `config validate` for the
+  effective value). It snapshots durable state, atomically publishes the
+  manifest, then deletes fully-covered segments.
+- **Sealing**: the active segment is normally only reclaimable after a
+  size-based rotation (default 256 MiB). Compaction therefore SEALS a
+  fully-covered active segment and rolls the writer to a fresh one, so
+  reclamation is not rotation-dependent (this closed an unbounded-growth
+  bug found by the 24-hour churn soak — a no-rotation workload's journal
+  grew ~9 KiB per cycle forever).
+- **Expected steady state**: journal bytes oscillate in a band whose top
+  is roughly one compaction threshold plus one segment of in-flight
+  writes. Sustained monotonic growth ACROSS compactions is a bug, not a
+  tuning problem — the nightly 500-cycle churn job and the 24-hour soak
+  gate assert exactly this (`rusty_mq_journal_bytes` after a forced
+  compaction stays in the KiB range on an idle system).
+- **Disk alarms quiesce durable admissions** before growth can hit the
+  floor (§6.4); free-space recovery re-enables commits automatically.
+- `rusty-mq doctor --data-dir` reports the segment inventory and
+  manifest/snapshot consistency read-only, for growth forensics.
+
 ## Backup & restore (offline, §9.10)
 
 ```sh
@@ -115,3 +140,5 @@ rusty-mq backup-restore --input /mnt/backup/rmq-2026-10-03 --data-dir /var/lib/r
   triggers, fsync-inclusive boundary); single-publisher latency is still
   one fsync per transaction, so fsync-slow filesystems remain the
   persistent-throughput limiter (see benchmarks/README).
+- The 24-hour soak evidence is from a single dev-class machine (APFS);
+  §14.1-grade runs (dedicated runner, RSS/FD sampling) are pending.
