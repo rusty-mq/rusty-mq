@@ -19,7 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Reference profile (2 min measured)
         run: |
-          RMQ_BENCH_SECS=120 cargo test --release -p rusty-mq --test bench_reference reference_profile -- --noc --nocapture
+          RMQ_BENCH_SECS=120 cargo test --release -p rusty-mq --test bench_reference reference_profile -- --nocapture
         env:
           RUST_LOG: info
       - uses: actions/upload-artifact@v4
