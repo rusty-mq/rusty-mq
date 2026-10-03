@@ -136,6 +136,38 @@ def _recover_requeue_false(ch):
 case("basic_recover_requeue_false", "channel_error", 540, _recover_requeue_false)
 
 
+# --- 404 NOT_FOUND family (channel scope, frozen error table) ---
+
+def _passive_missing(ch):
+    ch.queue_declare(queue="diff.nope", passive=True)
+
+
+case("queue_passive_missing", "channel_error", 404, _passive_missing)
+
+
+def _delete_missing(ch):
+    ch.queue_delete(queue="diff.nope")
+
+
+case("queue_delete_missing", "channel_error", 404, _delete_missing)
+
+
+def _bind_missing_exchange(ch):
+    ch.queue_bind(queue="diff.plain", exchange="diff.nox", routing_key="k")
+
+
+case("queue_bind_missing_exchange", "channel_error", 404, _bind_missing_exchange)
+
+
+def _publish_missing_exchange(ch):
+    # 404 is emitted before content processing (frozen publish gates);
+    # the post-case probe surfaces the async close.
+    ch.basic_publish(exchange="diff.nox", routing_key="k", body=b"x")
+
+
+case("publish_missing_exchange", "channel_error", 404, _publish_missing_exchange)
+
+
 def _safe_close(conn):
     try:
         conn.close()
@@ -193,7 +225,8 @@ def run_all(url):
                 t.join(2.0)
         except Exception as e:  # transport-level failure
             outcome = {"case": name, "outcome": "transport_error",
-                       "reply_code": None, "reply_text": str(e)}
+                       "reply_code": None,
+                       "reply_text": f"{type(e).__name__}: {e}"}
         outcome["frozen_expect"] = (
             None if expect_kind == "ok" else f"{expect_kind}:{expect_code}"
         )

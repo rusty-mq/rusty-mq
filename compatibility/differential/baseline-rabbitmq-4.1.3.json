@@ -69,7 +69,7 @@
    "outcome": "connection_error",
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - prefetch_size!=0 (10)",
-   "frozen_expect": "channel_error:pending-540"
+   "frozen_expect": "channel_error:540"
   },
   {
    "case": "consume_x_single_active_consumer",
@@ -84,6 +84,34 @@
    "reply_code": 540,
    "reply_text": "NOT_IMPLEMENTED - requeue=false",
    "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_passive_missing",
+   "outcome": "channel_error",
+   "reply_code": 404,
+   "reply_text": "NOT_FOUND - no queue 'diff.nope' in vhost '/'",
+   "frozen_expect": "channel_error:404"
+  },
+  {
+   "case": "queue_delete_missing",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:404"
+  },
+  {
+   "case": "queue_bind_missing_exchange",
+   "outcome": "channel_error",
+   "reply_code": 404,
+   "reply_text": "NOT_FOUND - no exchange 'diff.nox' in vhost '/'",
+   "frozen_expect": "channel_error:404"
+  },
+  {
+   "case": "publish_missing_exchange",
+   "outcome": "channel_error",
+   "reply_code": null,
+   "reply_text": "channel closed asynchronously",
+   "frozen_expect": "channel_error:404"
   }
  ]
 }

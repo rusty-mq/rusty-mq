@@ -208,6 +208,36 @@ async fn five_client_interop_matrix() {
         }
     }
 
+    // --- Frozen error-profile conformance (differential matrix) ---
+    // Runs the profile cases with assertions against THIS broker; the
+    // same driver records baseline outcomes in CI/local differential
+    // runs. Skips without python3+pika (never counted).
+    if !pika_available {
+        eprintln!("SKIP profile matrix (pika unavailable)");
+    } else {
+        let out = Command::new("python3")
+            .arg(root.join("tests/interop/differential/profile_matrix.py"))
+            .arg("--expect")
+            .arg(&url)
+            .arg(
+                std::env::temp_dir()
+                    .join(format!("rmq-profile-matrix-{}.json", std::process::id())),
+            )
+            .output()
+            .expect("profile matrix spawn");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success() && stdout.contains("PROFILE CONFORMANCE"),
+            "profile matrix failed:
+stdout:
+{stdout}
+stderr:
+{stderr}"
+        );
+        eprintln!("profile matrix: {}", stdout.lines().last().unwrap_or(""));
+    }
+
     // --- Java (RabbitMQ amqp-client) --- needs a JDK plus the pinned jar
     // (RMQ_JAVA_HOME / RMQ_AMQP_CLIENT_JAR with the documented defaults);
     // compiles into a per-run temp dir, so no build artifacts leak.

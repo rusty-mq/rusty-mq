@@ -1,0 +1,117 @@
+{
+ "url_sanitized": "127.0.0.1:56799/%2F",
+ "cases": [
+  {
+   "case": "queue_plain_durable_ok",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": null
+  },
+  {
+   "case": "queue_x_message_ttl",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - queue argument 'x-message-ttl' is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_x_queue_type_quorum",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - queue type (only x-queue-type=classic is supported) is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_x_max_priority",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - queue argument 'x-max-priority' is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_durable_exclusive",
+   "outcome": "channel_error",
+   "reply_code": 406,
+   "reply_text": "PRECONDITION_FAILED - durable+exclusive queues are not supported by rusty-mq in V1",
+   "frozen_expect": "channel_error:406"
+  },
+  {
+   "case": "queue_durable_auto_delete",
+   "outcome": "channel_error",
+   "reply_code": 406,
+   "reply_text": "PRECONDITION_FAILED - durable+auto-delete queues are not supported by rusty-mq in V1",
+   "frozen_expect": "channel_error:406"
+  },
+  {
+   "case": "exchange_type_headers",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - exchange type 'headers' (direct, fanout, topic only in V1) is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "publish_expiration_property",
+   "outcome": "channel_error",
+   "reply_code": null,
+   "reply_text": "channel closed asynchronously",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "tx_select",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - method (class 90, method 10) is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "basic_qos_prefetch_size",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - basic.qos prefetch_size (10): only 0 is supported is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "consume_x_single_active_consumer",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - consume argument 'x-single-active-consumer' is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "basic_recover_requeue_false",
+   "outcome": "channel_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - basic.recover requeue=false is not supported by rusty-mq",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_passive_missing",
+   "outcome": "channel_error",
+   "reply_code": 404,
+   "reply_text": "NOT_FOUND - no queue 'diff.nope' in vhost",
+   "frozen_expect": "channel_error:404"
+  },
+  {
+   "case": "queue_delete_missing",
+   "outcome": "channel_error",
+   "reply_code": 404,
+   "reply_text": "NOT_FOUND - no queue 'diff.nope' in vhost",
+   "frozen_expect": "channel_error:404"
+  },
+  {
+   "case": "queue_bind_missing_exchange",
+   "outcome": "channel_error",
+   "reply_code": 404,
+   "reply_text": "NOT_FOUND - no exchange 'diff.nox' in vhost",
+   "frozen_expect": "channel_error:404"
+  },
+  {
+   "case": "publish_missing_exchange",
+   "outcome": "channel_error",
+   "reply_code": null,
+   "reply_text": "channel closed asynchronously",
+   "frozen_expect": "channel_error:404"
+  }
+ ]
+}
