@@ -29,6 +29,9 @@ rejected explicitly, never silently accepted. See:
 - [compatibility/baseline.yaml](compatibility/baseline.yaml) — frozen reference baseline
 - [compatibility/features.yaml](compatibility/features.yaml) — feature/error matrix
 - [docs/protocol-profile.md](docs/protocol-profile.md) — methods, limits, deviations
+- [docs/operations.md](docs/operations.md) — lifecycle, metrics, alarms, backup/restore
+- [docs/migration.md](docs/migration.md) — RabbitMQ preflight, cutover, rollback
+- [docs/release-report-v0.1.0-alpha.md](docs/release-report-v0.1.0-alpha.md) — honest gate assessment (prerelease)
 
 ## Building
 
