@@ -49,7 +49,6 @@ const CONSUMER_MAILBOX_CAP: usize = 256;
 /// Outstanding unconfirmed publishes per channel (FR-PUB07 protective
 /// ceiling; exceeding it closes the channel with 506 rather than letting a
 /// publisher monopolize server bookkeeping).
-const MAX_PENDING_CONFIRMS: u64 = 10_000;
 
 /// Handshake phase of the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2167,11 +2166,12 @@ impl Connection {
             .with_fatal();
             return self.protocol_error(channel_id, &e).await;
         }
-        if ch.pending_confirms >= MAX_PENDING_CONFIRMS {
+        let pending_cap = self.broker.admission.max_pending_confirms_per_channel as u64;
+        if ch.pending_confirms >= pending_cap {
             let e = ProtocolError::channel(
                 reply_code::RESOURCE_ERROR,
                 format!(
-                    "RESOURCE_ERROR - outstanding publisher confirms exceed the ceiling ({MAX_PENDING_CONFIRMS})"
+                    "RESOURCE_ERROR - outstanding publisher confirms exceed the ceiling ({pending_cap})"
                 ),
                 rusty_mq_protocol::error::class_id::BASIC,
                 40, // basic.publish
@@ -2317,6 +2317,23 @@ impl Connection {
                 }
             }
         };
+
+        // §10/FR-PUB07: destination expansion is bounded — a fanout or
+        // wildcard publish over the cap is a channel 506, never a silent
+        // partial delivery.
+        let dest_cap = self.broker.admission.max_destinations_per_publish as usize;
+        if destinations.len() > dest_cap {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                format!(
+                    "RESOURCE_ERROR - publish expands to {} destinations, over the limit ({dest_cap})",
+                    destinations.len()
+                ),
+                rusty_mq_protocol::error::class_id::BASIC,
+                40, // basic.publish
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
 
         // §10/FR-R02: a memory alarm stops new message admissions (bounded
         // memory; confirmed persistent messages are never evicted).
