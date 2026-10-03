@@ -237,17 +237,25 @@ fn main() {
                     eprintln!("invalid --config {}: {e}", config.unwrap().display());
                     std::process::exit(2);
                 });
-            let data_dir =
-                data_dir.or_else(|| file_cfg.as_ref().map(|c| c.server.data_dir.clone()));
-            let effective_listen: SocketAddr = listen.unwrap_or_else(|| {
-                file_cfg
-                    .as_ref()
-                    .and_then(|c| c.amqp.listen.parse().ok())
-                    .unwrap_or_else(|| "127.0.0.1:5672".parse().unwrap())
-            });
-            let effective_metrics: Option<String> = metrics_listen
-                .clone()
-                .or_else(|| file_cfg.as_ref().map(|c| c.metrics.listen.clone()));
+            // Single precedence authority: flag > file > default
+            // (serve_settings::resolve, unit-tested).
+            let settings = rusty_mq::serve_settings::resolve(
+                rusty_mq::serve_settings::ServeFlags {
+                    listen,
+                    data_dir,
+                    metrics_listen,
+                    management_listen,
+                    management_tls_cert,
+                    management_tls_key,
+                    tls_listen,
+                    tls_cert,
+                    tls_key,
+                },
+                file_cfg.as_ref(),
+            );
+            let data_dir = settings.data_dir;
+            let effective_listen = settings.listen;
+            let effective_metrics = settings.metrics;
             let broker = match &data_dir {
                 Some(dir) => match &file_cfg {
                     Some(cfg) => {
@@ -288,13 +296,12 @@ fn main() {
                     }
                 });
             }
-            if let Some(addr) = management_listen {
+            if let Some(addr) = settings.management {
                 let broker = broker.clone();
-                // Either both TLS paths or neither (validated above).
-                let mgmt_tls = match (&management_tls_cert, &management_tls_key) {
-                    (Some(cert), Some(key)) => Some(rusty_mq::tls::load(cert, key)),
-                    _ => None,
-                };
+                // Either both TLS paths or neither (resolver-enforced).
+                let mgmt_tls = settings
+                    .management_tls
+                    .map(|(cert, key)| rusty_mq::tls::load(&cert, &key));
                 runtime.spawn(async move {
                     let app = rusty_mq_management::router(broker);
                     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -326,12 +333,9 @@ fn main() {
                     }
                 });
             }
-            if let Some(tls_addr) = tls_listen {
+            if let Some((tls_addr, tls_cert, tls_key)) = settings.tls {
                 let broker = broker.clone();
-                let acceptor = match rusty_mq::tls::load(
-                    tls_cert.as_ref().expect("clap requires"),
-                    tls_key.as_ref().expect("clap requires"),
-                ) {
+                let acceptor = match rusty_mq::tls::load(&tls_cert, &tls_key) {
                     Ok(setup) => setup.acceptor,
                     Err(e) => {
                         eprintln!("TLS material error: {e}");

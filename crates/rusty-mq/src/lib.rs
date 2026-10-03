@@ -11,6 +11,7 @@ pub mod definitions;
 pub mod management_impl;
 pub mod metrics;
 pub mod migration;
+pub mod serve_settings;
 pub mod server;
 pub mod throttle;
 pub mod tls;

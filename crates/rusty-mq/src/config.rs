@@ -374,6 +374,14 @@ impl Config {
     }
 }
 
+/// Parse + validate from a string (tests; the file path is load_file).
+pub fn load_str(body: &str) -> Result<Config, String> {
+    let mut cfg: Config = toml::from_str(body).map_err(|e| format!("parse: {e}"))?;
+    apply_env_overrides(&mut cfg)?;
+    validate(&cfg, None)?;
+    Ok(cfg)
+}
+
 pub fn load_file(path: &Path) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
