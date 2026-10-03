@@ -151,25 +151,34 @@ async fn request_reply_over_exclusive_reply_queue() {
     // Cleanup: dropping the client connection must delete the exclusive
     // reply queue (FR-Q04); the rpc queue survives.
     client.close(200, "done".into()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Queue death races the close-ok the client saw (the admin_close CI
+    // flake class): poll to a deadline instead of sleeping a guess.
     let probe = Connection::connect(&uri, ConnectionProperties::default())
         .await
         .unwrap();
-    let pch = probe.create_channel().await.unwrap();
-    let gone = pch
-        .queue_declare(
-            reply_name.clone().into(),
-            lapin::options::QueueDeclareOptions {
-                passive: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await;
-    assert!(
-        gone.is_err(),
-        "exclusive reply queue died with its connection"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let pch = probe.create_channel().await.unwrap();
+        if pch
+            .queue_declare(
+                reply_name.clone().into(),
+                lapin::options::QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .is_err()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "exclusive reply queue did not die with its connection"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     // The 404 closed the probe channel (correct channel-scoped error);
     // verify the durable queue on a fresh one.
     let pch2 = probe.create_channel().await.unwrap();

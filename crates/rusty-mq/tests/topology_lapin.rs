@@ -293,26 +293,39 @@ async fn exclusive_queue_dies_with_connection() {
 
     // Closing the owner reclaims the queue (FR-P09).
     conn_a.close(200, "bye".into()).await.unwrap();
-    // Give the server a moment to run teardown.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    // Reclaim races the close-ok the client already saw (the admin_close
+    // CI flake class): poll to a deadline instead of sleeping a guess.
     let conn_c = connect(addr).await;
-    let ch_c = conn_c.create_channel().await.unwrap();
-    let err = ch_c
-        .queue_declare(
-            name.clone().into(),
-            QueueDeclareOptions {
-                passive: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await
-        .expect_err("exclusive queue must be gone after owner close");
-    assert!(
-        err.to_string().to_lowercase().contains("not_found"),
-        "expected NOT_FOUND after reclaim, got: {err}"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ch_c = conn_c.create_channel().await.unwrap();
+        let err = ch_c
+            .queue_declare(
+                name.clone().into(),
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await;
+        match err {
+            Err(e) => {
+                assert!(
+                    e.to_string().to_lowercase().contains("not_found"),
+                    "expected NOT_FOUND after reclaim, got: {e}"
+                );
+                break;
+            }
+            Ok(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "exclusive queue not reclaimed after owner close"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
     let _ = conn_c.close(200, "bye".into()).await;
 }
 
