@@ -42,7 +42,7 @@ after abort).
 
 ## Observability
 
-### Metrics (`GET /metrics`, Prometheus text)
+### Metrics (`GET /metrics` on the separate metrics listener)
 
 | Metric | Kind | Meaning |
 | --- | --- | --- |
@@ -56,6 +56,13 @@ after abort).
 | `rusty_mq_ready_messages` | gauge | Ready entries across queues |
 | `rusty_mq_queues` | gauge | Queue count |
 | `rusty_mq_journal_bytes` | gauge | Live journal bytes on disk |
+
+The metrics plane is a SEPARATE listener (`--metrics-listen`, config
+`metrics.listen`, default `127.0.0.1:15692`; `--metrics-listen disabled`
+turns it off). It is unauthenticated Prometheus text — loopback by
+default, and non-loopback binds are refused at validation without
+`metrics.allow_insecure_remote = true`. `/metrics` no longer rides on
+the authenticated management router.
 
 Labels are bounded by construction (no message ids, routing keys, or
 consumer tags; per-queue labels remain off). A `rusty_mq_confirm_latency`

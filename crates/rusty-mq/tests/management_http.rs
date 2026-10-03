@@ -346,11 +346,17 @@ async fn queues_listing_and_purge_with_real_counts() {
 }
 
 #[tokio::test]
-async fn metrics_text_endpoint() {
-    let broker = broker();
-    let app = rusty_mq_management::router(broker);
+async fn metrics_live_on_their_own_listener_router() {
+    // PRD §12.3: /metrics belongs to the SEPARATE metrics plane.
+    let handle = broker();
+    let app = rusty_mq_management::metrics_router(handle);
     let (status, _, text) = call(&app, "GET", "/metrics", None, None).await;
     assert_eq!(status, 200);
     assert!(text.contains("rusty_mq_messages_published_total"));
     assert!(text.contains("# TYPE rusty_mq_ready_messages gauge"));
+
+    // ...and no longer on the (authenticated) management router.
+    let mgmt = rusty_mq_management::router(broker()); // shadowed-name safe
+    let (status, _, _) = call(&mgmt, "GET", "/metrics", None, None).await;
+    assert_eq!(status, 404, "metrics moved off the management plane");
 }

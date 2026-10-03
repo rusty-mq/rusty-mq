@@ -51,6 +51,8 @@ max_request_bytes = 1048576
 [metrics]
 listen = "127.0.0.1:15692"
 queue_labels_enabled = false
+# Unauthenticated plane: non-loopback binds need this explicit opt-in.
+# allow_insecure_remote = false
 
 [logging]
 format = "json"

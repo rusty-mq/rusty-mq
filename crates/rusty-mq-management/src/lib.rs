@@ -44,12 +44,20 @@ fn status(code: StatusCode, code_str: &str, message: impl Into<String>) -> Respo
     (code, error_body(code_str, message)).into_response()
 }
 
+/// The PRD §12.3 metrics plane: a SEPARATE loopback listener exposing
+/// only Prometheus text (`GET /metrics`) — unauthenticated, hence
+/// loopback-by-default with an explicit opt-in for remote binds.
+pub fn metrics_router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Router<()> {
+    Router::new()
+        .route("/metrics", get(metrics_text))
+        .with_state(std::sync::Arc::new(broker))
+}
+
 /// Build the management router over a broker handle.
 pub fn router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Router {
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics_text))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/status", get(status_ep))
         .route("/v1/vhosts", get(list_vhosts).post(create_vhost))

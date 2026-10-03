@@ -43,6 +43,10 @@ enum Command {
         /// Native HTTP management listener (§12.1; None disables).
         #[arg(long)]
         management_listen: Option<std::net::SocketAddr>,
+        /// Separate metrics listener (§12.3; unauthenticated Prometheus
+        /// text — loopback default). "disabled" turns it off.
+        #[arg(long, default_value = "127.0.0.1:15692")]
+        metrics_listen: String,
         /// TLS material for the management listener (§13: required when
         /// exposed non-loopback).
         #[arg(long, requires = "management_listen")]
@@ -202,6 +206,7 @@ fn main() {
         Command::Serve {
             listen,
             data_dir,
+            metrics_listen,
             management_listen,
             management_tls_cert,
             management_tls_key,
@@ -225,6 +230,28 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
+            // PRD §12.3: a SEPARATE metrics listener (loopback default,
+            // unauthenticated Prometheus text; the config layer refuses
+            // remote binds without the explicit opt-in).
+            if metrics_listen != "disabled" {
+                let broker = broker.clone();
+                let listen: std::net::SocketAddr = metrics_listen.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --metrics-listen {metrics_listen}: {e}");
+                    std::process::exit(2);
+                });
+                runtime.spawn(async move {
+                    let app = rusty_mq_management::metrics_router(broker);
+                    match tokio::net::TcpListener::bind(listen).await {
+                        Ok(listener) => {
+                            tracing::info!(%listen, "metrics listener started");
+                            if let Err(e) = axum::serve(listener, app).await {
+                                tracing::error!("metrics server failed: {e}");
+                            }
+                        }
+                        Err(e) => tracing::warn!(%listen, error = %e, "metrics bind failed"),
+                    }
+                });
+            }
             if let Some(addr) = management_listen {
                 let broker = broker.clone();
                 // Either both TLS paths or neither (validated above).

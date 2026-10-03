@@ -279,6 +279,10 @@ pub struct Metrics {
     pub listen: String,
     #[serde(default)]
     pub queue_labels_enabled: bool,
+    /// The metrics plane is unauthenticated: non-loopback binds need
+    /// this explicit opt-in (§13 posture).
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
 }
 
 impl Default for Metrics {
@@ -347,6 +351,9 @@ fn apply_env_overrides(cfg: &mut Config) -> Result<(), String> {
             ["MANAGEMENT", "TLS_CERT"] => cfg.management.tls_cert = Some(value),
             ["MANAGEMENT", "TLS_KEY"] => cfg.management.tls_key = Some(value),
             ["METRICS", "LISTEN"] => cfg.metrics.listen = value,
+            ["METRICS", "ALLOW_INSECURE_REMOTE"] => {
+                cfg.metrics.allow_insecure_remote = value == "true"
+            }
             ["LOGGING", "LEVEL"] => cfg.logging.level = value,
             _ => {
                 return Err(format!(
@@ -440,6 +447,16 @@ pub fn validate(cfg: &Config, origin: Option<&Path>) -> Result<(), String> {
                 );
             }
         }
+    }
+    // The metrics plane is unauthenticated Prometheus text: it binds
+    // loopback by default and needs an explicit opt-in to expose
+    // remotely (§12.3/§13 posture).
+    if !cfg.metrics.allow_insecure_remote && !is_loopback(&cfg.metrics.listen) {
+        return Err(
+            "metrics.listen is not loopback; set metrics.allow_insecure_remote = true to force \
+             an unauthenticated remote metrics bind"
+                .into(),
+        );
     }
     // Non-loopback plaintext AMQP requires the explicit insecure opt-in.
     if !cfg.amqp.allow_insecure_remote && !is_loopback(&cfg.amqp.listen) {

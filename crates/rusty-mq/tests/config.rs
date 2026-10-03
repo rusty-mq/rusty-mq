@@ -145,3 +145,25 @@ fn management_remote_requires_tls_material() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn metrics_listener_is_loopback_by_default() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("rmq-cfg-{}-mtr", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |body: String| {
+        let path = dir.join("m.toml");
+        std::fs::write(&path, body).unwrap();
+        rusty_mq::config::load_file(&path)
+    };
+    // Remote unauthenticated metrics bind: refused without the opt-in.
+    let err = write("[metrics]\nlisten = \"0.0.0.0:15692\"\n".into()).unwrap_err();
+    assert!(err.contains("allow_insecure_remote"), "got: {err}");
+    // Explicit opt-in allows it.
+    write("[metrics]\nlisten = \"0.0.0.0:15692\"\nallow_insecure_remote = true\n".into())
+        .expect("opt-in remote metrics validates");
+    // Loopback default posture unchanged.
+    write("[metrics]\nlisten = \"127.0.0.1:15692\"\n".into()).expect("loopback metrics validates");
+    let _ = std::fs::remove_dir_all(&dir);
+}
