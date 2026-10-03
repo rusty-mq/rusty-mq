@@ -13,6 +13,7 @@
 pub mod error;
 pub mod framing;
 pub mod limits;
+pub mod tables;
 
 pub use amq_protocol::{
     frame::AMQPFrame,

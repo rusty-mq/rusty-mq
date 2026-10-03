@@ -46,6 +46,9 @@ pub enum HeaderCheck {
 /// frames: one partially-assembled frame plus one incoming chunk.
 pub struct FrameReader {
     buf: Vec<u8>,
+    /// Static ceilings (table depth/fields, header budget) from the
+    /// negotiated limits; kept for pre-decode validation.
+    static_limits: crate::limits::ProtocolLimits,
     /// Byte budget for one frame payload (frame_max minus overhead).
     max_payload: usize,
     /// Total buffer cap guarding against runaway feed() accumulation.
@@ -71,6 +74,7 @@ impl FrameReader {
         let frame_max = limits.frame_max as usize;
         Self {
             buf: Vec::with_capacity(frame_max.min(16 * 1024)),
+            static_limits: limits.static_limits.clone(),
             max_payload: limits.max_frame_payload() as usize,
             // One frame in assembly + one chunk in flight.
             buf_cap: frame_max.saturating_mul(2).max(FRAME_MIN as usize),
@@ -132,12 +136,19 @@ impl FrameReader {
 
         match ftype {
             frame_type::METHOD => {
+                // Table budgets are enforced on the raw bytes BEFORE the
+                // parser runs: amq-protocol recurses per nesting level
+                // without its own guard (see tables.rs).
+                crate::tables::validate_method(&payload, &self.static_limits)
+                    .map_err(|e| ProtocolError::frame_error(e.message()).with_fatal())?;
                 let (_, class) = parse_class(&payload[..]).map_err(|e| {
                     ProtocolError::frame_error(format!("invalid method payload: {e}")).with_fatal()
                 })?;
                 Ok(Some(AMQPFrame::Method(channel, class)))
             }
             frame_type::HEADER => {
+                crate::tables::validate_content_header(&payload, &self.static_limits)
+                    .map_err(|e| ProtocolError::frame_error(e.message()).with_fatal())?;
                 let (_, header) = parse_content_header(&payload[..]).map_err(|e| {
                     ProtocolError::frame_error(format!("invalid content header: {e}")).with_fatal()
                 })?;

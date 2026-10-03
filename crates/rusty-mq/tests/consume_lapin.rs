@@ -435,3 +435,63 @@ async fn unacked_redelivers_to_new_consumer_after_connection_loss() {
     let _ = survivor.close(200, "bye".into()).await;
     let _ = publisher.close(200, "bye".into()).await;
 }
+
+/// FR-Q06 completion: delete with `if_unused` refuses while a consumer is
+/// attached (406 PRECONDITION_FAILED, queue survives) and succeeds on a
+/// fresh channel once the consumer died with its channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_if_unused_respects_live_consumers() {
+    let conn = connect(start_broker().await).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare("iu.q".into(), durable_queue(), FieldTable::default())
+        .await
+        .unwrap();
+    let _consumer = ch
+        .basic_consume(
+            "iu.q".into(),
+            "iu.tag".into(),
+            BasicConsumeOptions {
+                no_ack: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+
+    // The channel is closed by the 406; a fresh channel on the same
+    // connection proves the queue survived.
+    let err = ch
+        .queue_delete(
+            "iu.q".into(),
+            lapin::options::QueueDeleteOptions {
+                if_unused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("delete(if_unused) with a live consumer must fail");
+    assert!(
+        err.to_string().to_lowercase().contains("precondition"),
+        "expected PRECONDITION_FAILED, got: {err}"
+    );
+    let ch2 = conn.create_channel().await.unwrap();
+    ch2.queue_declare("iu.q".into(), durable_queue(), FieldTable::default())
+        .await
+        .expect("queue survives the refused delete");
+
+    // The consumer died with channel 1's 406 close (consumers are
+    // channel-scoped), so the queue is unused now and the delete must go
+    // through. Cancelling "iu.tag" on ch2 would itself 404 — the tag
+    // lived on the closed channel.
+    ch2.queue_delete(
+        "iu.q".into(),
+        lapin::options::QueueDeleteOptions {
+            if_unused: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("delete(if_unused) succeeds once unused");
+    let _ = conn.close(200, "bye".into()).await;
+}

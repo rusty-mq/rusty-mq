@@ -6,36 +6,41 @@
 features:
   # --- protocol core ---
   amqp_091_wire:
-    status: in_progress
+    status: supported
     target_release: "1.0"
     requirement: FR-P01
-    tests: ["framing unit tests", "T01 (lapin) partial"]
+    tests: ["framing unit tests", "tables::tests (budgets)", "T26 fuzz_frames", "five_client_interop_matrix (all five clients)"]
   publisher_confirms:
-    status: in_progress
+    status: supported
     target_release: "1.0"
     requirement: FR-PUB05
-    tests: ["confirms_lapin.rs (select, ordering, return-before-confirm, nack-on-reject)"]
-    notes: "positive confirms emitted after admission; durable boundary wired via the M4 journal; failpoint matrix (T13) pending
+    tests: ["confirms_lapin.rs (select, ordering, return-before-confirm, nack-on-reject)", "durability_lapin (T13 injected fsync failure)", "failure_safety_lapin (T14 kill/restart)"]
+    notes: "positive confirms emitted after admission; durable boundary via the journal; failpoint matrix covered"
   basic_nack:
-    status: planned
+    status: supported
     target_release: "1.0"
     requirement: FR-C05
-    tests: []
+    tests: ["settlement_lapin.rs (nack single/multiple, requeue and drop paths)"]
   consumer_cancel_notify:
-    status: planned
+    status: supported
     target_release: "1.0"
     requirement: FR-Q09
-    tests: []
+    tests: ["consume_lapin.rs queue_delete_cancels_consumers"]
   connection_blocked:
-    status: planned
+    status: supported
     target_release: "1.0"
     requirement: FR-R07
-    tests: []
+    tests: ["alarms_lapin.rs blocked_notification_reaches_capable_client, memory_alarm_stops_admissions_and_notifies_blocked"]
   basic_recover_requeue_true:
-    status: planned
+    status: supported
     target_release: "1.0"
     requirement: FR-C08
-    tests: []
+    tests: ["settlement_lapin.rs (recover requeues unacked deliveries)"]
+  channel_flow_noop:
+    status: unsupported
+    target_release: none
+    rejection: "flow-ok(active=true) always; active=false does not pause deliveries (deprecated in practice; see docs/protocol-profile.md)"
+    notes: "documented no-op, matches RabbitMQ behavior for years"
 
   # --- rejections (deferred features; behavior = reject before state change) ---
   queue_ttl:
