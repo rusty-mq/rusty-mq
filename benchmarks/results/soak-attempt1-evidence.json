@@ -1,0 +1,30 @@
+{
+ "log": "benchmarks/results/soak-24h-attempt1-FAILED.log",
+ "checkpoints": [
+  {
+   "cycles": 500,
+   "elapsed_seconds": 838.299185542,
+   "journal_bytes": 4542435
+  },
+  {
+   "cycles": 1000,
+   "elapsed_seconds": 1683.825392625,
+   "journal_bytes": 9086935
+  },
+  {
+   "cycles": 1500,
+   "elapsed_seconds": 2536.689789375,
+   "journal_bytes": 13641935
+  },
+  {
+   "cycles": 2000,
+   "elapsed_seconds": 3372.655500584,
+   "journal_bytes": 18196935
+  }
+ ],
+ "cycles": 2000,
+ "floor_seconds": null,
+ "max_journal_bytes_at_checkpoints": 18196935,
+ "test_result": "FAILED",
+ "in_progress": false
+}
