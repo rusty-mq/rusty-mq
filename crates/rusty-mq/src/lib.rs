@@ -4,6 +4,7 @@
 pub mod admin_client;
 pub mod alarms;
 pub mod broker;
+pub mod config;
 pub mod connection;
 pub mod consumers;
 pub mod definitions;

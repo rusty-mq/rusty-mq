@@ -1,0 +1,25 @@
+# systemd unit (PRD §13.3). Install to /etc/systemd/system/.
+[Unit]
+Description=rusty-mq AMQP 0-9-1 message broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rusty-mq
+Group=rusty-mq
+StateDirectory=rusty-mq
+Environment=RUSTY_MQ__LOGGING__LEVEL=info
+ExecStart=/usr/local/bin/rusty-mq serve --config /etc/rusty-mq/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/rusty-mq
+
+[Install]
+WantedBy=multi-user.target

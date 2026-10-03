@@ -21,6 +21,15 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// Validate a configuration file without starting the broker.
+    Validate {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Run the broker.
     Serve {
@@ -47,6 +56,11 @@ enum Command {
         /// Development password (M1 test auth only; never logged).
         #[arg(long, default_value = "guest")]
         password: String,
+    },
+    /// Validate a configuration file without starting the broker.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Offline RabbitMQ definitions preflight (§19.1, T29).
     MigrationInspect {
@@ -245,6 +259,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Config {
+            action: ConfigAction::Validate { config },
+        } => match rusty_mq::config::load_file(&config) {
+            Ok(_) => println!("{}: valid", config.display()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
         Command::MigrationInspect {
             definitions,
             output,

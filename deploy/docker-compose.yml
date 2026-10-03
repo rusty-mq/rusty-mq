@@ -1,0 +1,22 @@
+# Example deployment (PRD §13.3): one process, persistent volume,
+# loopback management by default.
+services:
+  rusty-mq:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: rusty-mq:dev
+    volumes:
+      - rmq-data:/data
+      - ./config.example.toml:/etc/rusty-mq/config.toml:ro
+    ports:
+      - "5672:5672"   # AMQP (TLS recommended for non-local access)
+      # Management/metrics stay internal by default; expose deliberately:
+      # - "127.0.0.1:15672:15672"
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  rmq-data:

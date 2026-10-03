@@ -1,0 +1,57 @@
+# rusty-mq example configuration (PRD §13.2, verbatim schema).
+# Relative paths resolve against this file's directory. No passwords here.
+
+[server]
+data_dir = "./data"
+shutdown_grace_seconds = 30
+
+[amqp]
+listen = "127.0.0.1:5672"
+allow_insecure_remote = false
+frame_max_bytes = 131072
+channel_max = 256
+heartbeat_seconds = 60
+handshake_timeout_seconds = 10
+assembly_timeout_seconds = 30
+max_message_bytes = 16777216
+max_header_bytes = 65536
+
+[tls]
+enabled = false
+listen = "127.0.0.1:5671"
+cert_file = "./certs/server.pem"
+key_file = "./certs/server-key.pem"
+
+[storage]
+segment_bytes = 268435456
+commit_batch_delay_ms = 2
+commit_batch_bytes = 1048576
+disk_free_min_bytes = 1073741824
+disk_free_min_ratio = 0.10
+index_cache_bytes = 67108864
+
+[limits]
+max_connections = 1024
+max_queues_per_vhost = 10000
+max_bindings_per_vhost = 100000
+max_destinations_per_publish = 1024
+max_pending_confirms_per_channel = 10000
+managed_buffer_bytes = 268435456
+memory_alarm_bytes = 536870912
+
+[compatibility]
+allow_transient_nonexclusive_queues = false
+reject_unknown_arguments = true
+
+[management]
+listen = "127.0.0.1:15672"
+remote_requires_tls = true
+max_request_bytes = 1048576
+
+[metrics]
+listen = "127.0.0.1:15692"
+queue_labels_enabled = false
+
+[logging]
+format = "json"
+level = "info"

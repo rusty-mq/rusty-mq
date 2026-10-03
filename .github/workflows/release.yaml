@@ -1,0 +1,68 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          dir="rusty-mq-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}"
+          mkdir -p "dist/$dir"
+          cp "target/${{ matrix.target }}/release/rusty-mq" "dist/$dir/"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "dist/$dir/" 2>/dev/null || true
+          cp deploy/config.example.toml "dist/$dir/"
+          ./deploy/gen-sbom.sh > "dist/$dir/SBOM.csv"
+          (cd dist && tar czf "../$dir.tar.gz" "$dir")
+          rm -rf "dist/$dir"
+      - name: Checksums
+        run: |
+          cd dist
+          shasum -a 256 *.tar.gz > checksums-sha256.txt 2>/dev/null || sha256sum *.tar.gz > checksums-sha256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+
+  attach:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+      - name: Summary
+        run: |
+          cat dist/checksums-*.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Storage compatibility notes: format major \`$(grep -m1 FORMAT_MAJOR crates/rusty-mq-storage/src/lib.rs)'" >> "$GITHUB_STEP_SUMMARY" || true
