@@ -165,6 +165,30 @@ fn snapshot_records(
 /// Aggregate in-memory message budget for the development broker
 /// (bounded by construction, INV-09; configurable in M7's config surface).
 const MESSAGE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
+/// §10 admission caps (ADR-0004): count budgets enforced at the
+/// mutation boundary — exhaustion is a channel-scoped 506, never silent
+/// acceptance.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionCaps {
+    pub max_connections: u32,
+    pub max_queues_per_vhost: u32,
+    pub max_bindings_per_vhost: u32,
+    pub max_destinations_per_publish: u32,
+    pub max_pending_confirms_per_channel: u32,
+}
+
+impl Default for AdmissionCaps {
+    fn default() -> Self {
+        Self {
+            max_connections: 1024,
+            max_queues_per_vhost: 10_000,
+            max_bindings_per_vhost: 100_000,
+            max_destinations_per_publish: 1024,
+            max_pending_confirms_per_channel: 10_000,
+        }
+    }
+}
 /// Auto-compaction ceiling: when journal bytes exceed this, snapshot +
 /// manifest + reclaim run inline after a commit (§9.9: V1 must reclaim
 /// during ordinary operation).
@@ -191,6 +215,8 @@ pub struct Broker {
     pub memory_alarm_bytes: u64,
     /// Message-store byte budget (limits.managed_buffer_bytes).
     pub message_budget: usize,
+    /// §10 count budgets (limits.*).
+    pub admission: AdmissionCaps,
     pub topology: Mutex<Topology>,
     /// In-memory message store (M2); the durable journal augments this in M4.
     pub store: Mutex<MessageStore>,
@@ -245,6 +271,7 @@ impl Broker {
             protocol_limits: rusty_mq_protocol::ProtocolLimits::default(),
             memory_alarm_bytes: MESSAGE_BYTE_BUDGET as u64,
             message_budget: MESSAGE_BYTE_BUDGET,
+            admission: AdmissionCaps::default(),
             topology: Mutex::new(Topology::new(CompatibilitySwitches::default())),
             store: Mutex::new(MessageStore::new(MESSAGE_BYTE_BUDGET)),
             journal: Mutex::new(None),
@@ -403,6 +430,13 @@ impl Broker {
         self.protocol_limits = cfg.protocol_limits();
         self.message_budget = cfg.limits.managed_buffer_bytes as usize;
         self.memory_alarm_bytes = cfg.limits.memory_alarm_bytes;
+        self.admission = AdmissionCaps {
+            max_connections: cfg.limits.max_connections,
+            max_queues_per_vhost: cfg.limits.max_queues_per_vhost,
+            max_bindings_per_vhost: cfg.limits.max_bindings_per_vhost,
+            max_destinations_per_publish: cfg.limits.max_destinations_per_publish,
+            max_pending_confirms_per_channel: cfg.limits.max_pending_confirms_per_channel,
+        };
         *self.topology.lock().unwrap() = Topology::new(cfg.compatibility());
         let (min_bytes, ratio) = cfg.alarm_settings();
         let mut alarms = self.alarms.lock().unwrap();
@@ -485,6 +519,7 @@ impl Broker {
             protocol_limits: rusty_mq_protocol::ProtocolLimits::default(),
             memory_alarm_bytes: MESSAGE_BYTE_BUDGET as u64,
             message_budget: MESSAGE_BYTE_BUDGET,
+            admission: AdmissionCaps::default(),
             auth: Mutex::new(auth),
             topology: Mutex::new(topology),
             store: Mutex::new(store),
@@ -660,14 +695,16 @@ impl Broker {
         self.journal.lock().unwrap().is_some()
     }
 
-    /// Register a live connection (alarm fan-out). Bounded: connections
-    /// beyond a sanity cap are accepted but not registered for broadcast.
-    pub fn register_connection(&self, conn: LiveConnection) {
-        const MAX_REGISTERED: usize = 4096;
+    /// Register a live connection. Returns false when the §10
+    /// max_connections budget is exhausted — the caller must refuse the
+    /// connection (never silent acceptance).
+    pub fn register_connection(&self, conn: LiveConnection) -> bool {
         let mut live = self.live_connections.lock().unwrap();
-        if live.len() < MAX_REGISTERED {
-            live.push(conn);
+        if live.len() >= self.admission.max_connections as usize {
+            return false;
         }
+        live.push(conn);
+        true
     }
 
     pub fn unregister_connection(&self, id: ConnectionId) {

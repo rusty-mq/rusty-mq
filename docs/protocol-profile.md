@@ -110,6 +110,7 @@ consuming rather than pause the channel.
 | Exclusive resource owned elsewhere | 405 RESOURCE_LOCKED | channel |
 | Conflicting redeclare / invalid delivery tag | 406 PRECONDITION_FAILED | channel |
 | Deferred feature requested (TTL, DLX, quorum, tx, immediate, ...) | 540 NOT_IMPLEMENTED | channel |
+| §10 count budget exhausted (queues/bindings per vhost, connections) | 506 RESOURCE_ERROR (queues/bindings: channel at the mutation boundary; connections: connection at accept) — equivalent redeclares and duplicate binds never grow budgets | channel (connections: connection) |
 | Oversized message | 311 CONTENT_TOO_LARGE | channel |
 | `mandatory=true`, zero destinations | basic.return 312 NO_ROUTE | (plus content) |
 | Unknown/unsupported frame type, bad frame-end | 501 FRAME_ERROR | connection |

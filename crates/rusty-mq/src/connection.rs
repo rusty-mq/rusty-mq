@@ -176,11 +176,43 @@ impl Connection {
             return;
         }
         Metrics::inc(&broker.metrics.connections_opened);
-        broker.register_connection(crate::broker::LiveConnection {
+        if !broker.register_connection(crate::broker::LiveConnection {
             id: conn_id,
             username: String::new(), // enriched post-auth with the registry pass
             control: control_tx,
-        });
+        }) {
+            // §10 max_connections exhausted: refuse (never silent
+            // acceptance) with a connection-scoped 506.
+            tracing::warn!(peer = %peer, "connection refused: max_connections reached");
+            let mut conn = Self {
+                broker,
+                conn_id,
+                vhost: None,
+                awaiting_close_ok: HashMap::new(),
+                mailbox_tx,
+                client_cancel_notify: false,
+                client_blocking: false,
+                username: String::new(),
+                peer: peer.clone(),
+                limits: rusty_mq_protocol::ProtocolLimits::default(),
+                negotiated: None,
+                phase: Phase::Running,
+                channels: HashMap::new(),
+                outbound: outbound_tx,
+            };
+            let _ = conn
+                .send(AMQPFrame::Method(
+                    0,
+                    AMQPClass::Connection(connection::AMQPMethod::Close(connection::Close {
+                        reply_code: rusty_mq_protocol::error::reply_code::RESOURCE_ERROR,
+                        reply_text: "RESOURCE_ERROR - max_connections reached".into(),
+                        class_id: 10,
+                        method_id: 10,
+                    })),
+                ))
+                .await;
+            return;
+        }
         let limits = broker.protocol_limits.clone();
         let mut conn = Self {
             broker,
@@ -1307,6 +1339,33 @@ impl Connection {
             None
         };
 
+        if !d.passive {
+            // §10 admission budget (ADR-0004): new queues only — an
+            // equivalent redeclare never grows the budget.
+            let already_present = {
+                let topo = self.broker.topology.lock().unwrap();
+                topo.find_queue(vhost, d.queue.as_str()).is_some()
+            };
+            if !already_present {
+                let count = {
+                    let topo = self.broker.topology.lock().unwrap();
+                    topo.queue_count(vhost)
+                };
+                if count >= self.broker.admission.max_queues_per_vhost as usize {
+                    let e = ProtocolError::channel(
+                        reply_code::RESOURCE_ERROR,
+                        format!(
+                            "RESOURCE_ERROR - queues per vhost limit {} reached",
+                            self.broker.admission.max_queues_per_vhost
+                        ),
+                        CLASS,
+                        method,
+                    );
+                    return self.protocol_error(channel_id, &e).await;
+                }
+            }
+        }
+
         if d.passive {
             // Passive: existence + exclusivity check; 404/405 otherwise.
             // Ok(None) = missing; Err = locked.
@@ -1592,6 +1651,31 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
+        // §10 admission budget (ADR-0004): duplicate binds are idempotent
+        // and never grow the budget.
+        let over_binding_cap = {
+            let topo = self.broker.topology.lock().unwrap();
+            let dup = topo
+                .find_queue(vhost, queue_name.as_str())
+                .zip(topo.find_exchange(vhost, d.exchange.as_str()))
+                .is_some_and(|(qid, eid)| {
+                    topo.binding_exists(vhost, eid, qid, d.routing_key.as_str())
+                });
+            !dup && topo.bindings_total(vhost)
+                >= self.broker.admission.max_bindings_per_vhost as usize
+        };
+        if over_binding_cap {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                format!(
+                    "RESOURCE_ERROR - bindings per vhost limit {} reached",
+                    self.broker.admission.max_bindings_per_vhost
+                ),
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
         // §11.2: bind/unbind = write on the destination queue + read on the
         // source exchange (names resolved in a guard-free prelude).
         {
@@ -1705,6 +1789,31 @@ impl Connection {
             return self.protocol_error(channel_id, &e).await;
         };
         let vhost = self.vhost();
+        // §10 admission budget (ADR-0004): duplicate binds are idempotent
+        // and never grow the budget.
+        let over_binding_cap = {
+            let topo = self.broker.topology.lock().unwrap();
+            let dup = topo
+                .find_queue(vhost, queue_name.as_str())
+                .zip(topo.find_exchange(vhost, d.exchange.as_str()))
+                .is_some_and(|(qid, eid)| {
+                    topo.binding_exists(vhost, eid, qid, d.routing_key.as_str())
+                });
+            !dup && topo.bindings_total(vhost)
+                >= self.broker.admission.max_bindings_per_vhost as usize
+        };
+        if over_binding_cap {
+            let e = ProtocolError::channel(
+                reply_code::RESOURCE_ERROR,
+                format!(
+                    "RESOURCE_ERROR - bindings per vhost limit {} reached",
+                    self.broker.admission.max_bindings_per_vhost
+                ),
+                CLASS,
+                method,
+            );
+            return self.protocol_error(channel_id, &e).await;
+        }
         // §11.2: bind/unbind = write on the destination queue + read on the
         // source exchange (names resolved in a guard-free prelude).
         {

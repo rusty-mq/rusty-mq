@@ -517,6 +517,34 @@ impl Topology {
 
     /// Number of bindings attached to an exchange (for `exchange.delete
     /// if_unused`).
+    /// Total queues in a vhost (§10 admission budget check).
+    pub fn queue_count(&self, vhost: VhostId) -> usize {
+        self.queues.values().filter(|q| q.vhost == vhost).count()
+    }
+
+    /// Whether an exact (exchange, queue, routing-key) binding exists —
+    /// duplicate binds are idempotent and never grow admission budgets.
+    pub fn binding_exists(
+        &self,
+        vhost: VhostId,
+        exchange: ExchangeId,
+        queue: QueueId,
+        key: &str,
+    ) -> bool {
+        self.bindings
+            .get(&vhost)
+            .and_then(|m| m.get(&exchange))
+            .is_some_and(|v| v.iter().any(|b| b.queue == queue && b.key == key))
+    }
+
+    /// Total bindings in a vhost across exchanges (§10 admission budget).
+    pub fn bindings_total(&self, vhost: VhostId) -> usize {
+        self.bindings
+            .get(&vhost)
+            .map(|m| m.values().map(|v| v.len()).sum())
+            .unwrap_or(0)
+    }
+
     pub fn binding_count(&self, vhost: VhostId, exchange: ExchangeId) -> usize {
         self.bindings_of(vhost, exchange).len()
     }
