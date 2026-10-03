@@ -24,3 +24,6 @@ libc = "0.2"
 # workspace forbids unsafe everywhere else.
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
