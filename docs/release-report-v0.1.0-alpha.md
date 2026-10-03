@@ -16,7 +16,7 @@ clean at commit `58020a2`).
 | # | Gate (§17.4) | Status | Evidence / gaps |
 | --- | --- | --- | --- |
 | 1 | Every P0 requirement has executable passing evidence; no hidden TODO/skips | **partial** | Ledger maps FR rows to tests; env-gated bench/soak and interop skips are explicit, never counted as passes. Remaining local gap: channel-flow beyond the documented no-op. Closed this cycle: doctor (M9-5), auth throttling (M9-6), definitions users/permissions export+import (M9-6) |
-| 2 | All invariants covered + five-client matrix | **partial** | INV-01..INV-05 have kill/restart, failpoint, and property evidence; INV-06..INV-12 covered by the recovery/compaction suites. Client matrix: **lapin, pika 1.4.4, amqplib pass** (roundtrip, confirms, typed properties, prefetch bursts, T25 RPC); Java + Go fixtures are CI jobs — matrix not yet five-five |
+| 2 | All invariants covered + five-client matrix | **pass (tested scope)** | INV-01..INV-05 have kill/restart, failpoint, and property evidence; INV-06..INV-12 covered by the recovery/compaction suites. Client matrix is five-five: **lapin, pika 1.4.4, amqplib, Java amqp-client 5.21.0, Go amqp091-go v1.10.0** all pass against the live broker (interop_matrix.rs; roundtrip, confirms, typed properties, T25 RPC). Local evidence on this dev machine (staged JDK 21 + Go 1.23.4); the interop CI job (fails on any skip) has not run yet — first run awaits push access |
 | 3 | Fault tests: no confirmed-message loss in the single-node model | **pass (tested scope)** | T13 injected-fsync, T14 kill/restart suites, §9.6 delivery-safety boundaries; kill -9 model, power loss explicitly out of scope |
 | 4 | Compaction and offline restore proven | **pass (tested scope)** | segment reclamation, manifest publication order, crash-at-boundary via torn-tail suite, backup verify/restore roundtrip with post-restore writes; crash-at-every-checkpoint-step matrix is nightly CI |
 | 5 | Security/isolation/malformed-input/resource-limit tests | **pass (tested scope)** | Argon2id + dummy-verify, §11.2 table, vhost isolation, revocation closes live connections, TLS verified-handshake + plaintext-refused, T26 adversarial suites, alarms quiesce admissions |
@@ -50,5 +50,6 @@ clean at commit `58020a2`).
 Treat v0.1.0-alpha as a **developer/evaluation prerelease**: memory-backed
 operation is fully usable; persistent operation is implemented and
 fault-tested but awaits the maintainer storage review (gate 9), the
-24-hour soak (gate 6), a clean tagged CI build (gate 7), and the Java/Go
-client fixtures (gate 2) before any production claim.
+24-hour soak (gate 6), and a clean tagged CI build (gate 7) before any
+production claim. The five-client interop matrix (gate 2) passes with
+local evidence; its CI job's first run rides along with gate 7.
