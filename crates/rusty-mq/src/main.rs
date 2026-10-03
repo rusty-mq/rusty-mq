@@ -199,13 +199,30 @@ enum PermissionsAction {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    // §13.2 logging: level precedence RUST_LOG > serve --config
+    // logging.level > info; format "json" switches the subscriber. Init
+    // after parsing so the file can contribute, before any real work.
+    let (file_level, file_format) = match &cli.command {
+        Command::Serve { config, .. } => config.as_ref().and_then(|p| {
+            rusty_mq::config::load_file(p)
+                .ok()
+                .map(|c| (c.logging.level, c.logging.format))
+        }),
+        _ => None,
+    }
+    .unwrap_or_else(|| ("info".into(), "text".into()));
+    let level = std::env::var("RUST_LOG").ok().unwrap_or(file_level);
+    let filter = tracing_subscriber::EnvFilter::try_new(&level)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if file_format == "json" {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
     match cli.command {
         Command::Serve {
             listen,

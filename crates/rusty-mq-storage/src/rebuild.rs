@@ -264,6 +264,31 @@ pub fn open_persistent_with_projection(
     Ok((topology, store, projection, writer, rebuilt.auth))
 }
 
+/// Cache-sized variant of [`open_persistent_with_projection`]
+/// (§13.2 storage.index_cache_bytes).
+pub fn open_persistent_with_projection_cached(
+    dir: &std::path::Path,
+    byte_budget: usize,
+    config: crate::journal::JournalConfig,
+    index_cache_bytes: Option<u64>,
+) -> Result<
+    (
+        Topology,
+        MessageStore,
+        crate::projection::Projection,
+        JournalWriter,
+        rusty_mq_core::auth::AuthState,
+    ),
+    crate::record::FormatError,
+> {
+    std::fs::create_dir_all(dir).map_err(|e| crate::record::FormatError::Io(e.to_string()))?;
+    let rebuilt = rebuild(dir, byte_budget)?;
+    let (topology, store, projection, _status) =
+        crate::projection::recover_with_projection_cached(dir, byte_budget, index_cache_bytes)?;
+    let writer = JournalWriter::open(dir, config)?;
+    Ok((topology, store, projection, writer, rebuilt.auth))
+}
+
 /// Open a persistent broker backend: recover first (rebuild live state),
 /// then open the writer for appends. The recovery root is authoritative.
 pub fn open_persistent(

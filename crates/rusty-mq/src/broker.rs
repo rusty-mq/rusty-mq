@@ -409,16 +409,26 @@ impl Broker {
         broker
     }
 
-    /// Persistent-mode broker honoring a §13.2 configuration (also sets
-    /// journal shape via the doc-hidden journal-config constructor).
+    /// Persistent-mode broker honoring a §13.2 configuration (journal
+    /// shape AND the redb page-cache budget via the cached recovery
+    /// path).
     pub fn open_persistent_from_config(
         user: String,
         password: String,
         data_dir: &std::path::Path,
         cfg: &crate::config::Config,
     ) -> Self {
-        let mut broker =
-            Self::open_persistent_with_journal(user, password, data_dir, cfg.journal_config());
+        let (topology, store, projection, writer, auth) =
+            rusty_mq_storage::rebuild::open_persistent_with_projection_cached(
+                data_dir,
+                MESSAGE_BYTE_BUDGET,
+                cfg.journal_config(),
+                Some(cfg.storage.index_cache_bytes),
+            )
+            .expect("recovery must succeed or startup must fail explicitly");
+        let mut broker = Self::from_recovered(
+            user, password, data_dir, topology, store, projection, writer, auth,
+        );
         broker.apply_config(cfg);
         broker
     }
@@ -461,6 +471,25 @@ impl Broker {
                 journal,
             )
             .expect("recovery must succeed or startup must fail explicitly");
+        Self::from_recovered(
+            user, password, data_dir, topology, store, projection, writer, auth,
+        )
+    }
+
+    /// Assemble a persistent broker from an already-recovered state
+    /// tuple (shared by the plain and cache-sized recovery paths;
+    /// includes first-run admin bootstrap).
+    #[allow(clippy::too_many_arguments)] // one-shot assembly tuple
+    fn from_recovered(
+        user: String,
+        password: String,
+        data_dir: &std::path::Path,
+        topology: Topology,
+        store: MessageStore,
+        projection: rusty_mq_storage::projection::Projection,
+        writer: JournalWriter,
+        auth: rusty_mq_core::auth::AuthState,
+    ) -> Self {
         let mut auth = auth;
         let writer = writer;
         if auth.principal(&user).is_none() && auth.principal("admin").is_none() {

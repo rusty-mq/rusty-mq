@@ -60,9 +60,23 @@ impl Projection {
     /// Open (creating if absent) the projection at `dir/index/state.redb`.
     /// All tables are created eagerly so reads never hit "does not exist".
     pub fn open(dir: &Path) -> Result<Self, crate::record::FormatError> {
+        Self::open_with_cache(dir, None)
+    }
+
+    /// `cache_bytes` sets the redb page-cache budget (§13.2
+    /// storage.index_cache_bytes); None keeps the library default.
+    pub fn open_with_cache(
+        dir: &Path,
+        cache_bytes: Option<u64>,
+    ) -> Result<Self, crate::record::FormatError> {
         let index_dir = dir.join("index");
         std::fs::create_dir_all(&index_dir).map_err(io_err)?;
-        let db = Database::create(index_dir.join("state.redb"))
+        let mut builder = redb::Builder::new();
+        if let Some(bytes) = cache_bytes {
+            builder.set_cache_size(bytes as usize);
+        }
+        let db = builder
+            .create(index_dir.join("state.redb"))
             .map_err(|e| crate::record::FormatError::Corruption(format!("index open: {e}")))?;
         let projection = Self { db };
         // Schema init runs only when the META table itself is missing.
@@ -350,11 +364,21 @@ pub fn recover_with_projection(
     dir: &Path,
     byte_budget: usize,
 ) -> Result<(Topology, MessageStore, Projection, ProjectionStatus), crate::record::FormatError> {
+    recover_with_projection_cached(dir, byte_budget, None)
+}
+
+/// `index_cache_bytes` (§13.2 storage.index_cache_bytes) sizes the redb
+/// page cache; None keeps the library default.
+pub fn recover_with_projection_cached(
+    dir: &Path,
+    byte_budget: usize,
+    index_cache_bytes: Option<u64>,
+) -> Result<(Topology, MessageStore, Projection, ProjectionStatus), crate::record::FormatError> {
     // Authoritative replay (manifest-aware) computes the journal truth.
     let journal_rebuilt = crate::rebuild::rebuild(dir, byte_budget)?;
     let last_lsn = crate::journal::last_committed_lsn(dir)?;
 
-    let try_projection = Projection::open(dir).and_then(|p| {
+    let try_projection = Projection::open_with_cache(dir, index_cache_bytes).and_then(|p| {
         let applied = p.applied_lsn()?;
         Ok((p, applied))
     });
@@ -406,12 +430,12 @@ pub fn recover_with_projection(
                         },
                     ))
                 }
-                _ => rebuild_projection(dir, byte_budget, journal_rebuilt),
+                _ => rebuild_projection(dir, byte_budget, journal_rebuilt, index_cache_bytes),
             }
         }
         // Empty, corrupt, schema-mismatched, or ahead of the journal
         // (INV-12: never trust a projection leading the authority).
-        _ => rebuild_projection(dir, byte_budget, journal_rebuilt),
+        _ => rebuild_projection(dir, byte_budget, journal_rebuilt, index_cache_bytes),
     }
 }
 
@@ -419,9 +443,10 @@ fn rebuild_projection(
     dir: &Path,
     _byte_budget: usize,
     journal_rebuilt: crate::rebuild::Rebuilt,
+    index_cache_bytes: Option<u64>,
 ) -> Result<(Topology, MessageStore, Projection, ProjectionStatus), crate::record::FormatError> {
     Projection::discard(dir);
-    let projection = Projection::open(dir)?;
+    let projection = Projection::open_with_cache(dir, index_cache_bytes)?;
     // Rebuild from the authoritative fold's records: replay ALL journal
     // records through the projection (snapshot state is implied by the
     // authoritative rebuild result; the journal remains the chain of
