@@ -142,10 +142,15 @@ stale lock (dead pid) is tolerated. PID reuse is a known limitation.
 
 `backup create` copies the recovery chain (segments, `snapshots/`,
 `MANIFEST`; `LOCK`/`MANIFEST.tmp` excluded) into a fresh output directory
-and refuses while a live writer holds the source. `backup verify` replays
-the copy through the real recovery fold — a backup that cannot be
-recovered is not valid. `backup restore` verifies first and refuses a
-nonempty target; it never merges or overwrites.
+and refuses while a live writer holds the source. Every backup carries a
+`CHECKSUMS` sidecar: one `<sha256-hex>␠␠<relative/path>` line per copied
+file, sorted by path (UTF-8, `\n`-terminated). `backup verify` first
+checks every digest and that the file set matches exactly (added or
+removed files fail), then replays the copy through the real recovery
+fold — a backup that cannot be recovered is not valid. A backup without
+`CHECKSUMS` is refused. `backup restore` verifies first, refuses a
+nonempty target, and never merges or overwrites; `CHECKSUMS` itself is
+backup metadata and never lands in a data directory.
 
 ## Implementation status
 

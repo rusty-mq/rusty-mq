@@ -2,17 +2,25 @@
 //!
 //! A backup is a complete copy of the recovery chain — MANIFEST (if
 //! published), `snapshots/`, and `journal/` — taken while no writer holds
-//! the data directory (enforced via the LOCK liveness probe). Restore
+//! the data directory (enforced via the LOCK liveness probe). Every
+//! backup carries a `CHECKSUMS` sidecar (SHA-256 per file) so transport
+//! corruption is caught byte-level before the semantic check. Restore
 //! targets must be empty; a nonempty target is refused rather than merged
 //! or overwritten (INV: never silently initialize over existing state).
 //!
-//! Verification replays the backup through the real recovery fold: a
-//! backup that cannot be recovered is not a valid backup.
+//! Verification checks the sidecar, then replays the backup through the
+//! real recovery fold: a backup that cannot be recovered is not a valid
+//! backup.
 
 use std::fs;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use crate::record::FormatError;
+
+/// Name of the integrity sidecar written into every backup.
+pub const CHECKSUMS_FILE: &str = "CHECKSUMS";
 
 fn io_err(e: std::io::Error) -> FormatError {
     FormatError::Io(e.to_string())
@@ -37,6 +45,38 @@ fn copy_dir_excluding_lock(from: &Path, to: &Path) -> Result<(), FormatError> {
     Ok(())
 }
 
+/// Deterministic (sorted) relative paths of every file under `root`,
+/// skipping `skip` names wherever they appear.
+fn inventory(root: &Path, skip: &[&str]) -> Result<Vec<std::path::PathBuf>, FormatError> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        skip: &[&str],
+        out: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), FormatError> {
+        for entry in fs::read_dir(dir).map_err(io_err)? {
+            let entry = entry.map_err(io_err)?;
+            if skip.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().map_err(io_err)?.is_dir() {
+                walk(root, &path, skip, out)?;
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|_| FormatError::Io("inventory escape: path outside root".into()))?;
+                out.push(rel.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, skip, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
 /// Create a backup of `data_dir` under `output` (created fresh; must not
 /// exist or be empty). Refuses while a live writer holds the directory.
 pub fn create(data_dir: &Path, output: &Path) -> Result<(), FormatError> {
@@ -58,13 +98,69 @@ pub fn create(data_dir: &Path, output: &Path) -> Result<(), FormatError> {
             output.display()
         )));
     }
-    copy_dir_excluding_lock(data_dir, output)
+    copy_dir_excluding_lock(data_dir, output)?;
+    write_checksums(output)
 }
 
-/// Verify a backup: it must be a complete, consistent recovery root that
-/// the real recovery fold can rebuild from. Returns the rebuilt summary on
-/// success (records replayed + queue count as a sanity signal).
+fn file_sha256(path: &Path) -> Result<String, FormatError> {
+    let bytes = fs::read(path).map_err(io_err)?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// Write the CHECKSUMS sidecar: one `<hex>  <relative/path>` line per
+/// copied file, sorted, covering everything in the backup.
+fn write_checksums(backup: &Path) -> Result<(), FormatError> {
+    let files = inventory(backup, &[CHECKSUMS_FILE])?;
+    let mut body = String::new();
+    for rel in files {
+        let hex = file_sha256(&backup.join(&rel))?;
+        body.push_str(&format!("{hex}  {}\n", rel.to_string_lossy()));
+    }
+    fs::write(backup.join(CHECKSUMS_FILE), body).map_err(io_err)
+}
+
+/// Byte-level integrity against the CHECKSUMS sidecar: every listed file
+/// must hash to its recorded digest, and the file set must match exactly
+/// (files added or removed after creation fail). This catches transport
+/// corruption before the (slower) semantic replay below.
+fn verify_checksums(backup: &Path) -> Result<(), FormatError> {
+    let body = fs::read_to_string(backup.join(CHECKSUMS_FILE)).map_err(|_| {
+        FormatError::Io(format!(
+            "backup is missing {CHECKSUMS_FILE}; refusing to verify (recreate the backup)"
+        ))
+    })?;
+    let mut listed: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let (hex, rel) = line
+            .split_once("  ")
+            .ok_or_else(|| FormatError::Io(format!("malformed {CHECKSUMS_FILE} line: {line:?}")))?;
+        let actual = file_sha256(&backup.join(rel))
+            .map_err(|_| FormatError::Io(format!("{CHECKSUMS_FILE} lists missing file {rel}")))?;
+        if actual != hex {
+            return Err(FormatError::Io(format!(
+                "checksum mismatch for {rel}: recorded {hex}, found {actual}"
+            )));
+        }
+        listed.push(rel.to_string());
+    }
+    let present: Vec<String> = inventory(backup, &[CHECKSUMS_FILE])?
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if listed != present {
+        return Err(FormatError::Io(format!(
+            "backup file set does not match {CHECKSUMS_FILE}: listed {listed:?}, present {present:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify a backup: byte-level integrity against the CHECKSUMS sidecar,
+/// then a full semantic replay through the real recovery fold. Returns
+/// the rebuilt summary on success (records replayed + queue count as a
+/// sanity signal).
 pub fn verify(backup: &Path) -> Result<VerifySummary, FormatError> {
+    verify_checksums(backup)?;
     // The data-directory layout is flat: numbered `*.log` segments at the
     // root, `snapshots/`, `MANIFEST`. A backup must be that recovery root.
     let has_segments = fs::read_dir(backup)
@@ -113,7 +209,12 @@ pub fn restore(backup: &Path, target: &Path) -> Result<(), FormatError> {
             "restore target is held by a live writer".into(),
         ));
     }
-    copy_dir_excluding_lock(backup, target)
+    // CHECKSUMS is backup metadata, never part of a data directory.
+    copy_dir_excluding_lock(backup, target)?;
+    if target.join(CHECKSUMS_FILE).exists() {
+        fs::remove_file(target.join(CHECKSUMS_FILE)).map_err(io_err)?;
+    }
+    Ok(())
 }
 
 /// Result of a successful verification.
@@ -232,6 +333,95 @@ mod tests {
         assert!(err.to_string().contains("not empty"));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&backup);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn checksums_sidecar_written_and_listed() {
+        let dir = tmp("cs-src");
+        seed(&dir);
+        let backup = tmp("cs-backup");
+        create(&dir, &backup).unwrap();
+        let body = fs::read_to_string(backup.join(CHECKSUMS_FILE)).unwrap();
+        assert!(
+            body.lines()
+                .any(|l| l.ends_with("00000000000000000001.log")),
+            "segment must be listed: {body}"
+        );
+        // Each line is 64 hex chars + two spaces + a relative path.
+        for line in body.lines() {
+            let (hex, rel) = line.split_once("  ").unwrap();
+            assert_eq!(hex.len(), 64, "sha256 hex for {rel}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&backup);
+    }
+
+    #[test]
+    fn byte_flip_caught_by_checksums() {
+        let dir = tmp("cs-src2");
+        seed(&dir);
+        let backup = tmp("cs-backup2");
+        create(&dir, &backup).unwrap();
+        // Corrupt a byte in a segment header (before any record payload so
+        // the journal CRC may or may not fire first — the sidecar must).
+        let seg = backup.join("00000000000000000001.log");
+        let mut data = fs::read(&seg).unwrap();
+        data[0] ^= 0x01;
+        fs::write(&seg, data).unwrap();
+        let err = verify(&backup).unwrap_err().to_string();
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&backup);
+    }
+
+    #[test]
+    fn file_set_changes_fail_verification() {
+        let dir = tmp("cs-src3");
+        seed(&dir);
+        let backup = tmp("cs-backup3");
+        create(&dir, &backup).unwrap();
+
+        // File removed after creation.
+        let seg = backup.join("00000000000000000001.log");
+        fs::remove_file(&seg).unwrap();
+        let err = verify(&backup).unwrap_err().to_string();
+        assert!(err.contains("missing file"), "got: {err}");
+
+        // File added after creation (recreate a fresh backup for it).
+        let _ = fs::remove_dir_all(&backup);
+        let backup = tmp("cs-backup3b");
+        create(&dir, &backup).unwrap();
+        fs::write(backup.join("sneaky.log"), b"x").unwrap();
+        let err = verify(&backup).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&backup);
+    }
+
+    #[test]
+    fn missing_sidecar_refuses_and_restore_excludes_it() {
+        let dir = tmp("cs-src4");
+        seed(&dir);
+        let backup = tmp("cs-backup4");
+        create(&dir, &backup).unwrap();
+        fs::remove_file(backup.join(CHECKSUMS_FILE)).unwrap();
+        let err = verify(&backup).unwrap_err().to_string();
+        assert!(err.contains("missing CHECKSUMS"), "got: {err}");
+
+        // A valid backup restores cleanly and CHECKSUMS never lands in the
+        // data directory.
+        let backup2 = tmp("cs-backup4b");
+        create(&dir, &backup2).unwrap();
+        let target = tmp("cs-target4");
+        restore(&backup2, &target).unwrap();
+        assert!(
+            !target.join(CHECKSUMS_FILE).exists(),
+            "CHECKSUMS must not enter a data directory"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&backup);
+        let _ = fs::remove_dir_all(&backup2);
         let _ = fs::remove_dir_all(&target);
     }
 

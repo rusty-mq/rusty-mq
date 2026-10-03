@@ -271,12 +271,19 @@ async fn run_publishers(
 
 /// T28 soak slice: churn with compaction — journal bytes must stay bounded
 /// (no unbounded growth through declare/publish/consume/delete cycles).
+///
+/// Long runs: `RMQ_SOAK_MIN_SECS` keeps cycling until the wall-clock floor
+/// is met (the cycle cap still applies), progress prints every 500 cycles,
+/// and the journal bound is re-checked every 2,000 cycles so unbounded
+/// growth fails fast instead of after a day of churning.
 #[tokio::test(flavor = "multi_thread")]
 async fn churn_soak_journal_bounded() {
-    let Some(cycles) = env_num("RMQ_SOAK_CYCLES") else {
+    let Some(cycles_cap) = env_num("RMQ_SOAK_CYCLES") else {
         eprintln!("SKIP soak (set RMQ_SOAK_CYCLES=<n> to run)");
         return;
     };
+    let min_secs = env_num("RMQ_SOAK_MIN_SECS");
+    let started = std::time::Instant::now();
     let dir = bench_dir("soak");
     let (addr, broker) = spawn_persistent(dir.clone()).await;
     // Tiny compaction threshold: compaction runs constantly.
@@ -292,7 +299,12 @@ async fn churn_soak_journal_bounded() {
         .unwrap();
     let payload = vec![1u8; 256];
 
-    for cycle in 0..cycles {
+    let mut cycle: u64 = 0;
+    while cycle < cycles_cap {
+        // Wall-clock floor: keep churning until it is met (cycle cap first).
+        if min_secs.is_some_and(|m| started.elapsed().as_secs() >= m) && cycle > 0 {
+            break;
+        }
         let qname = format!("soak.{cycle}");
         ch.queue_declare(
             qname.clone().into(),
@@ -341,6 +353,31 @@ async fn churn_soak_journal_bounded() {
         )
         .await
         .unwrap();
+        cycle += 1;
+
+        if cycle % 500 == 0 {
+            let bytes = rusty_mq_storage::snapshot::journal_bytes(&dir);
+            eprintln!(
+                "SOAK progress: {cycle} cycles, {:?} elapsed, journal {bytes} bytes",
+                started.elapsed()
+            );
+        }
+        if cycle % 2_000 == 0 {
+            // Fail fast: reclaim now and check the bound mid-run, so a
+            // compaction leak surfaces in minutes, not at the 24h finish.
+            broker.compact().unwrap();
+            let bytes = rusty_mq_storage::snapshot::journal_bytes(&dir);
+            assert!(
+                bytes < 1024 * 1024,
+                "journal grew to {bytes} bytes at cycle {cycle} — compaction not reclaiming"
+            );
+        }
+    }
+    if min_secs.is_some() {
+        eprintln!(
+            "SOAK finished {cycle} cycles in {:?} (floor was {min_secs:?}s)",
+            started.elapsed()
+        );
     }
 
     // Boundedness: after full churn with settles+deletes+compaction, the
