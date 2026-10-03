@@ -92,15 +92,30 @@ async fn five_client_interop_matrix() {
     let url = format!("amqp://guest:guest@{addr}/%2F");
     let root = repo_root();
 
-    // --- pika (Python) ---
-    let pika = run_fixture(
-        {
-            let mut c = Command::new("python3");
-            c.arg(root.join("tests/interop/python/pika_roundtrip.py"));
-            c
-        },
-        &url,
-    );
+    // --- pika (Python) --- module resolution probed BEFORE running the
+    // fixture: a runtime (python3) without the module must SKIP, not run
+    // and fail (CI runners ship python3 but not pika; found by ci#2-#4).
+    let pika_available = Command::new("python3")
+        .arg("-c")
+        .arg("import pika")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !pika_available {
+        eprintln!("SKIP pika (module not resolvable; pip install pika)");
+    }
+    let pika = if pika_available {
+        run_fixture(
+            {
+                let mut c = Command::new("python3");
+                c.arg(root.join("tests/interop/python/pika_roundtrip.py"));
+                c
+            },
+            &url,
+        )
+    } else {
+        FixtureOutcome::Skipped("pika module unavailable".into())
+    };
     match pika {
         FixtureOutcome::Passed(passes) => {
             assert!(passes.len() >= 8, "pika fixture PASS lines: {passes:?}");
@@ -150,14 +165,18 @@ async fn five_client_interop_matrix() {
     }
 
     // --- T25: request/reply fixtures (exclusive reply queues) ---
-    let pika_rpc = run_fixture(
-        {
-            let mut c = Command::new("python3");
-            c.arg(root.join("tests/interop/python/pika_request_reply.py"));
-            c
-        },
-        &url,
-    );
+    let pika_rpc = if pika_available {
+        run_fixture(
+            {
+                let mut c = Command::new("python3");
+                c.arg(root.join("tests/interop/python/pika_request_reply.py"));
+                c
+            },
+            &url,
+        )
+    } else {
+        FixtureOutcome::Skipped("pika module unavailable".into())
+    };
     match pika_rpc {
         FixtureOutcome::Passed(passes) => {
             assert!(passes.len() >= 3, "pika rpc PASS lines: {passes:?}");
