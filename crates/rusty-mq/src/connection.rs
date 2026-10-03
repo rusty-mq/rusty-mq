@@ -46,10 +46,6 @@ const CLOSE_LINGER: Duration = Duration::from_secs(5);
 /// Bounded consumer-delivery mailbox per connection (ADR-0004; a full
 /// mailbox requeues entries and stops scheduling to that consumer).
 const CONSUMER_MAILBOX_CAP: usize = 256;
-/// Outstanding unconfirmed publishes per channel (FR-PUB07 protective
-/// ceiling; exceeding it closes the channel with 506 rather than letting a
-/// publisher monopolize server bookkeeping).
-
 /// Handshake phase of the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
