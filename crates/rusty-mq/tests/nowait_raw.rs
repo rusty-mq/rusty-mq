@@ -363,3 +363,171 @@ async fn nowait_suppresses_replies_except_generated_names() {
         other => panic!("generated-name nowait declare must still reply: {other:?}"),
     }
 }
+
+/// T03: multiple interleaved channels on ONE connection — concurrent
+/// confirms, deliveries, and nowait operations must never cross channels
+/// (no orphan reply, no per-channel content interleaving). Frame-level:
+/// every received frame is checked against the channel it arrived on.
+#[tokio::test(flavor = "multi_thread")]
+async fn interleaved_channels_keep_content_isolated() {
+    let addr = start_broker().await;
+    let mut s = handshake(addr).await;
+
+    let open =
+        |id: u16| AMQPFrame::Method(id, AMQPClass::Channel(ch7::AMQPMethod::Open(ch7::Open {})));
+
+    // Channels 2 and 3 open on the same connection as the confirming
+    // publisher on channel 1.
+    for id in [2u16, 3] {
+        s.send(&open(id)).await;
+        match s.next_method().await {
+            AMQPFrame::Method(ch, AMQPClass::Channel(ch7::AMQPMethod::OpenOk(_))) => {
+                assert_eq!(ch, id, "open-ok must arrive on the opening channel");
+            }
+            other => panic!("unexpected while opening channel {id}: {other:?}"),
+        }
+    }
+
+    // Declare iso.a on channel 1 (exclusive: the frozen profile rejects
+    // shared transient queues).
+    s.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Queue(q7::AMQPMethod::Declare(q7::Declare {
+            queue: "iso.a".into(),
+            passive: false,
+            durable: false,
+            exclusive: true,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        })),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Queue(q7::AMQPMethod::DeclareOk(ok))) => {
+            assert_eq!(ok.queue.as_str(), "iso.a");
+        }
+        other => panic!("unexpected instead of declare-ok: {other:?}"),
+    }
+
+    // NOWAIT declare on channel 3: no reply may ever arrive for it. It is
+    // proven below — the only frames that may follow are the ones channel
+    // 1 and 2 are owed, and any channel-3 frame fails the match arms.
+    s.send(&AMQPFrame::Method(
+        3,
+        AMQPClass::Queue(q7::AMQPMethod::Declare(q7::Declare {
+            queue: "iso.b".into(),
+            passive: false,
+            durable: false,
+            exclusive: true,
+            auto_delete: false,
+            nowait: true,
+            arguments: Default::default(),
+        })),
+    ))
+    .await;
+
+    // Confirm-select on channel 1 only.
+    s.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Confirm(amq_protocol::protocol::confirm::AMQPMethod::Select(
+            amq_protocol::protocol::confirm::Select { nowait: false },
+        )),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(
+            1,
+            AMQPClass::Confirm(amq_protocol::protocol::confirm::AMQPMethod::SelectOk(_)),
+        ) => {}
+        other => panic!("unexpected instead of select-ok: {other:?}"),
+    }
+
+    // Consume iso.a on channel 2 (no-ack push consumer).
+    s.send(&AMQPFrame::Method(
+        2,
+        AMQPClass::Basic(basic7::AMQPMethod::Consume(basic7::Consume {
+            queue: "iso.a".into(),
+            consumer_tag: "iso.tag".into(),
+            no_local: false,
+            no_ack: true,
+            exclusive: false,
+            nowait: false,
+            arguments: Default::default(),
+        })),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(2, AMQPClass::Basic(basic7::AMQPMethod::ConsumeOk(ok))) => {
+            assert_eq!(ok.consumer_tag.as_str(), "iso.tag");
+        }
+        other => panic!("unexpected instead of consume-ok: {other:?}"),
+    }
+
+    // The interleave under test: a confirmed publish on channel 1 races
+    // the delivery on channel 2. Whichever order they arrive in, the
+    // confirm is on channel 1 and the delivery (with its content) is on
+    // channel 2 — never swapped, never duplicated, never on channel 3.
+    s.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Basic(basic7::AMQPMethod::Publish(basic7::Publish {
+            exchange: "".into(),
+            routing_key: "iso.a".into(),
+            mandatory: false,
+            immediate: false,
+        })),
+    ))
+    .await;
+    s.send(&AMQPFrame::Header(
+        1,
+        60,
+        Box::new(AMQPContentHeader {
+            class_id: 60,
+            body_size: 4,
+            properties: Default::default(),
+        }),
+    ))
+    .await;
+    s.send(&AMQPFrame::Body(1, b"iso0".to_vec())).await;
+
+    let mut got_deliver = false;
+    let mut got_confirm = false;
+    for _ in 0..2 {
+        match s.next_method().await {
+            AMQPFrame::Method(2, AMQPClass::Basic(basic7::AMQPMethod::Deliver(d))) => {
+                assert!(!got_deliver, "duplicate delivery");
+                assert_eq!(d.consumer_tag.as_str(), "iso.tag");
+                assert_eq!(d.routing_key.as_str(), "iso.a");
+                let body = s.drain_content(4).await;
+                assert_eq!(body, b"iso0");
+                got_deliver = true;
+            }
+            AMQPFrame::Method(1, AMQPClass::Basic(basic7::AMQPMethod::Ack(a))) => {
+                assert!(!got_confirm, "duplicate confirm");
+                assert!(a.delivery_tag >= 1, "confirm sequence starts at 1");
+                assert!(a.multiple || a.delivery_tag == 1);
+                got_confirm = true;
+            }
+            AMQPFrame::Method(3, _) => panic!("nowait declare on channel 3 leaked a reply"),
+            other => panic!("frame crossed channels or unexpected: {other:?}"),
+        }
+    }
+    assert!(got_deliver, "delivery must arrive on channel 2");
+    assert!(got_confirm, "confirm must arrive on channel 1");
+    let _ = conn_close(&mut s).await;
+}
+
+async fn conn_close(s: &mut RawSession) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    s.sock
+        .write_all(&encode_frame(&AMQPFrame::Method(
+            0,
+            AMQPClass::Connection(conn7::AMQPMethod::Close(conn7::Close {
+                reply_code: 200,
+                reply_text: "bye".into(),
+                class_id: 0,
+                method_id: 0,
+            })),
+        )))
+        .await
+}

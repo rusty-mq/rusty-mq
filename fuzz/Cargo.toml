@@ -1,0 +1,39 @@
+[package]
+name = "rusty-mq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The fuzz crate is OUTSIDE the workspace's member list; reference the
+# internal crates by path so targets stay in lockstep with the tree.
+rusty-mq-protocol = { path = "../crates/rusty-mq-protocol" }
+rusty-mq-storage = { path = "../crates/rusty-mq-storage" }
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_decode"
+path = "fuzz_targets/record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table_walker"
+path = "fuzz_targets/table_walker.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

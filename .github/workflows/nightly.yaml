@@ -45,6 +45,22 @@ jobs:
         env:
           PROPTEST_CASES: "2048"
 
+  # Coverage-guided fuzz (T26): the same entry points the proptest
+  # corpora exercise, now under libFuzzer with sanitizer coverage.
+  fuzz:
+    name: coverage-guided fuzz (5 min per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: frame_reader
+        run: cargo +nightly fuzz run frame_reader -- -max_total_time=300
+      - name: record_decode
+        run: cargo +nightly fuzz run record_decode -- -max_total_time=300
+      - name: table_walker
+        run: cargo +nightly fuzz run table_walker -- -max_total_time=300
+
   # The 24-hour soak (§14.1) is a manually dispatched long-run job; the
   # recipe: RMQ_BENCH_SECS=86400 with a dedicated self-hosted runner and
   # RSS/FD/disk sampling — gate is "no unbounded growth".
