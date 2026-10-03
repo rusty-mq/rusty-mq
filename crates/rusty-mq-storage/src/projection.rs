@@ -369,11 +369,17 @@ pub fn recover_with_projection(
                 Ok((topology, store, loaded_lsn)) if loaded_lsn == applied => {
                     // Suffix: journal records after the projection point
                     // (up to last committed) applied idempotently.
-                    let suffix: Vec<Record> = crate::journal::recover(dir)?
-                        .into_iter()
-                        .filter(|r| r.lsn > applied)
-                        .map(|r| r.record)
-                        .collect();
+                    // Orphan-first mirrors the authoritative recovery: a
+                    // manifest-published reclamation may have removed the
+                    // chain head (the projection must tolerate every
+                    // journal shape rebuild() tolerates).
+                    let orphan_first = crate::snapshot::read_manifest(dir)?.is_some();
+                    let suffix: Vec<Record> =
+                        crate::journal::recover_with_options(dir, orphan_first)?
+                            .into_iter()
+                            .filter(|r| r.lsn > applied)
+                            .map(|r| r.record)
+                            .collect();
                     let mut topology = topology;
                     let mut store = store;
                     let mut max_id = 0u64;
@@ -419,8 +425,10 @@ fn rebuild_projection(
     // Rebuild from the authoritative fold's records: replay ALL journal
     // records through the projection (snapshot state is implied by the
     // authoritative rebuild result; the journal remains the chain of
-    // record events the projection indexes).
-    let records: Vec<Record> = crate::journal::recover(dir)?
+    // record events the projection indexes). Orphan-first mirrors the
+    // authoritative recovery (reclaimed chain head under a manifest).
+    let orphan_first = crate::snapshot::read_manifest(dir)?.is_some();
+    let records: Vec<Record> = crate::journal::recover_with_options(dir, orphan_first)?
         .into_iter()
         .map(|r| r.record)
         .collect();

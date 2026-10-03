@@ -131,6 +131,22 @@ bytes exceed a ceiling; the capture uses try_lock, so a contended round
 defers to the next commit instead of deadlocking against callers that hold
 state locks across `journal_commit` (the persistent publish path).
 
+### Segment sealing (T28 finding)
+
+Reclamation can only drop segments that precede the writer's active one.
+If `segment_bytes` is never reached, one segment grows without bound and
+compaction snapshots without reclaiming anything. Compaction therefore
+SEALS the active segment when a published snapshot fully covers it
+(every record in the segment is durable at or before the manifest's
+`covered_lsn` and nothing is pending): the writer rolls to a fresh
+segment under the state lock, making the sealed segment reclaimable.
+An in-flight flusher batch lands in the fresh segment; replay of
+records at or below `covered_lsn` is idempotent (INV-11), so the swap
+never loses or duplicates durable state. Recovery tolerates the
+resulting severed head link only under a manifest (orphan-first walk);
+the redb projection and `last_committed_lsn` apply the same rule — a
+manifest-less journal with a missing chain head is still `ChainBreak`.
+
 ## Offline backup and the LOCK (§9.10, M6)
 
 `LOCK` holds the writer's pid (session state; never part of backups).

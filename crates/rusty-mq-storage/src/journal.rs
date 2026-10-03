@@ -154,6 +154,9 @@ pub struct JournalWriter {
     /// Shared failpoint cell visible to commit() and the flusher thread
     /// (runtime injection must reach the fsync site — T13/T14).
     failpoint: std::sync::Arc<Mutex<Option<std::sync::Arc<Failpoint>>>>,
+    /// Shared handle to the active segment file (the flusher holds a
+    /// clone); seal_if_covered swaps it under the state lock.
+    file: std::sync::Arc<Mutex<File>>,
     flusher: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -325,6 +328,7 @@ impl JournalWriter {
             committed,
             work,
             failpoint,
+            file,
             flusher: Some(flusher),
         })
     }
@@ -537,6 +541,31 @@ impl JournalWriter {
     /// Current segment id (reclaim keeps this one).
     pub fn current_segment_id(&self) -> u64 {
         self.state.lock().unwrap().segment_id
+    }
+
+    /// Seal the ACTIVE segment when every record in it is durable at or
+    /// before `covered_lsn` (the caller has just published a snapshot
+    /// covering it) and roll the writer to a fresh segment, so reclamation
+    /// may drop the sealed one (§9.9). Without this, a writer that never
+    /// hits `segment_bytes` rotation keeps one growing segment forever —
+    /// compaction snapshots but reclaims nothing (found by the T28 soak).
+    ///
+    /// Safety of the swap against an in-flight flusher batch: pending is
+    /// empty under the state lock, so any batch already taken out lands in
+    /// the NEW segment; replay of records at or below the snapshot's
+    /// covered LSN is idempotent (INV-11), and nothing durable is ever
+    /// dropped — the sealed segment only contains records the snapshot
+    /// already covers.
+    pub fn seal_if_covered(&self, covered_lsn: u64) -> Result<bool, FormatError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.pending.is_empty()
+            || st.durable_lsn > covered_lsn
+            || st.segment_len <= SEGMENT_HEADER_LEN
+        {
+            return Ok(false); // busy or not fully covered: keep as-is
+        }
+        roll_segment(&self.dir, &mut st, &self.file)?;
+        Ok(true)
     }
 
     /// Replace the failpoint hook (test-only; T13/T14 evidence). The
@@ -789,9 +818,12 @@ pub fn segment_inventory(dir: &Path) -> Option<Vec<u64>> {
 }
 
 /// The highest committed (fenced) LSN in the journal, 0 when empty.
+/// Tolerates a reclaimed chain head when a manifest covers it (same
+/// orphan-first rule as the authoritative recovery).
 pub fn last_committed_lsn(dir: &Path) -> Result<u64, FormatError> {
+    let orphan_first = crate::snapshot::read_manifest(dir)?.is_some();
     let mut max = 0u64;
-    for item in recover(dir)? {
+    for item in recover_with_options(dir, orphan_first)? {
         max = max.max(item.fence_lsn);
     }
     Ok(max)

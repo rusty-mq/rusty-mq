@@ -362,11 +362,24 @@ impl Broker {
     /// into live state first (the journal is the only source of truth,
     /// ADR-0002), then open the writer for appends.
     pub fn open_persistent(user: String, password: String, data_dir: &std::path::Path) -> Self {
+        Self::open_persistent_with_journal(user, password, data_dir, JournalConfig::default())
+    }
+
+    /// Test/ops variant of [`Broker::open_persistent`] with an explicit
+    /// journal configuration (e.g. no-rotation segments to exercise the
+    /// seal-on-compact path; T28 regression).
+    #[doc(hidden)]
+    pub fn open_persistent_with_journal(
+        user: String,
+        password: String,
+        data_dir: &std::path::Path,
+        journal: JournalConfig,
+    ) -> Self {
         let (topology, store, projection, writer, auth) =
             rusty_mq_storage::rebuild::open_persistent_with_projection(
                 data_dir,
                 MESSAGE_BYTE_BUDGET,
-                JournalConfig::default(),
+                journal,
             )
             .expect("recovery must succeed or startup must fail explicitly");
         let mut auth = auth;
@@ -541,7 +554,24 @@ impl Broker {
             },
         )
         .map_err(|e| e.to_string())?;
-        // 3. Only now may covered segments and superseded snapshots go
+        // 3. Seal the ACTIVE segment when the snapshot fully covers it so
+        //    reclamation may drop it too (T28 soak finding: without the
+        //    seal, a writer that never reaches segment rotation keeps one
+        //    growing segment and compaction reclaims nothing). Busy journal
+        //    falls back to the pre-seal keep_segment — conservative, the
+        //    next compaction seals.
+        let keep_segment = match self.journal.try_lock() {
+            Ok(journal) => {
+                let w = journal.as_ref().expect("compact requires the journal");
+                if w.seal_if_covered(covered_lsn).map_err(|e| e.to_string())? {
+                    w.current_segment_id() // post-seal fresh segment
+                } else {
+                    keep_segment
+                }
+            }
+            Err(_) => keep_segment, // busy: conservative, seal next round
+        };
+        // 4. Only now may covered segments and superseded snapshots go
         //    (§9.9 step 5).
         rusty_mq_storage::snapshot::reclaim(&dir, covered_lsn, keep_segment, generation)
             .map_err(|e| e.to_string())?;
