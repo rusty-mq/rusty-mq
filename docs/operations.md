@@ -22,8 +22,12 @@ rusty-mq serve --config /etc/rusty-mq/config.toml
 - First run with a data directory bootstraps the flagged credentials
   (`--user`/`--password` or their defaults) as the durable admin — logged
   as a warning; rotate immediately via `admin users` + `credentials`.
-- Optional listeners: `--management-listen` (HTTP API), `--tls-listen`
-  with `--tls-cert/--tls-key`.
+- Optional listeners: `--management-listen` (HTTP API; add
+  `--management-tls-cert/--management-tls-key` to serve it over TLS),
+  `--tls-listen` with `--tls-cert/--tls-key` (AMQP TLS).
+- Remote management REQUIRES TLS: `management.remote_requires_tls`
+  (default true) refuses startup when `management.listen` binds
+  non-loopback without `management.tls_cert/tls_key` (§13).
 
 ### Stopping
 

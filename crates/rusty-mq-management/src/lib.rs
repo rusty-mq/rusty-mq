@@ -591,3 +591,50 @@ fn map_topology_error(e: TopologyError) -> Response {
 fn regex_lite_valid(pattern: &str) -> Option<()> {
     regex::Regex::new(pattern).ok().map(|_| ()).or(None)
 }
+
+/// A TCP listener whose accepted streams complete a TLS handshake
+/// before being handed to axum (PRD §13: management exposed remotely
+/// requires authenticated TLS).
+struct TlsListener {
+    tcp: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.tcp.accept().await {
+                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
+                    Ok(tls) => return (tls, addr),
+                    Err(e) => {
+                        tracing::warn!(peer = %addr, error = %e, "management TLS handshake failed")
+                    }
+                },
+                Err(e) => tracing::warn!(error = %e, "management TCP accept failed"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
+
+/// Serve the management router over TLS.
+pub async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> std::io::Result<()> {
+    axum::serve(
+        TlsListener {
+            tcp: listener,
+            acceptor,
+        },
+        app,
+    )
+    .await
+}

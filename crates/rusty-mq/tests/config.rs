@@ -94,3 +94,54 @@ fn validation_rejects_impossible_combinations() {
     let err = rusty_mq::config::load_file(&mk("max_header_bytes = 999999\n")).unwrap_err();
     assert!(err.contains("max_header_bytes"), "got: {err}");
 }
+
+#[test]
+fn management_remote_requires_tls_material() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("rmq-cfg-{}-mtls", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Dummy PEM files: validation only checks presence on disk.
+    let cert = dir.join("c.pem");
+    let key = dir.join("k.pem");
+    std::fs::write(&cert, "x").unwrap();
+    std::fs::write(&key, "x").unwrap();
+    let write = |body: String| {
+        let path = dir.join("m.toml");
+        std::fs::write(&path, body).unwrap();
+        rusty_mq::config::load_file(&path)
+    };
+
+    // Remote management WITHOUT TLS material: refused (§13).
+    let err = write("[management]\nlisten = \"0.0.0.0:15672\"\n".into()).unwrap_err();
+    assert!(err.contains("remote_requires_tls"), "got: {err}");
+
+    // Remote WITH material: valid.
+    write(format!(
+        "[management]\nlisten = \"0.0.0.0:15672\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+        cert.display(),
+        key.display()
+    ))
+    .expect("remote management with TLS validates");
+
+    // Cert without key: refused.
+    let err = write(format!(
+        "[management]\nlisten = \"0.0.0.0:15672\"\ntls_cert = \"{}\"\n",
+        cert.display()
+    ))
+    .unwrap_err();
+    assert!(err.contains("together"), "got: {err}");
+
+    // Missing file: refused.
+    let err = write(
+        "[management]\nlisten = \"0.0.0.0:15672\"\ntls_cert = \"/nope/c.pem\"\ntls_key = \"/nope/k.pem\"\n".into(),
+    )
+    .unwrap_err();
+    assert!(err.contains("not found"), "got: {err}");
+
+    // Loopback without TLS: still fine (default posture).
+    write("[management]\nlisten = \"127.0.0.1:15672\"\n".into())
+        .expect("loopback plaintext management validates");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

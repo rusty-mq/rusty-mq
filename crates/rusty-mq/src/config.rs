@@ -248,6 +248,12 @@ pub struct Management {
     pub remote_requires_tls: bool,
     #[serde(default = "default_max_request")]
     pub max_request_bytes: u32,
+    /// TLS material for the management plane (§13: remote exposure
+    /// requires authenticated TLS). Both or neither.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 impl Default for Management {
@@ -338,6 +344,8 @@ fn apply_env_overrides(cfg: &mut Config) -> Result<(), String> {
             ["TLS", "CERT_FILE"] => cfg.tls.cert_file = PathBuf::from(&value),
             ["TLS", "KEY_FILE"] => cfg.tls.key_file = PathBuf::from(&value),
             ["MANAGEMENT", "LISTEN"] => cfg.management.listen = value,
+            ["MANAGEMENT", "TLS_CERT"] => cfg.management.tls_cert = Some(value),
+            ["MANAGEMENT", "TLS_KEY"] => cfg.management.tls_key = Some(value),
             ["METRICS", "LISTEN"] => cfg.metrics.listen = value,
             ["LOGGING", "LEVEL"] => cfg.logging.level = value,
             _ => {
@@ -409,6 +417,30 @@ pub fn validate(cfg: &Config, origin: Option<&Path>) -> Result<(), String> {
         }
     }
 
+    // Management exposed remotely requires TLS (§13; PRD line: remote
+    // management must be authenticated TLS). Loopback stays plaintext.
+    match (&cfg.management.tls_cert, &cfg.management.tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("management.tls_cert and management.tls_key must be set together".into());
+        }
+        (Some(cert), Some(key)) => {
+            if !std::path::Path::new(cert).is_file() {
+                return Err(format!("management.tls_cert file not found: {cert}"));
+            }
+            if !std::path::Path::new(key).is_file() {
+                return Err(format!("management.tls_key file not found: {key}"));
+            }
+        }
+        (None, None) => {
+            if cfg.management.remote_requires_tls && !is_loopback(&cfg.management.listen) {
+                return Err(
+                    "management.listen is not loopback and remote_requires_tls is true; \
+                     configure management.tls_cert + management.tls_key"
+                        .into(),
+                );
+            }
+        }
+    }
     // Non-loopback plaintext AMQP requires the explicit insecure opt-in.
     if !cfg.amqp.allow_insecure_remote && !is_loopback(&cfg.amqp.listen) {
         return Err(ctx(

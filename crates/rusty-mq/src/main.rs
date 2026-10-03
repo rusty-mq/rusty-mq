@@ -43,6 +43,12 @@ enum Command {
         /// Native HTTP management listener (§12.1; None disables).
         #[arg(long)]
         management_listen: Option<std::net::SocketAddr>,
+        /// TLS material for the management listener (§13: required when
+        /// exposed non-loopback).
+        #[arg(long, requires = "management_listen")]
+        management_tls_cert: Option<std::path::PathBuf>,
+        #[arg(long, requires = "management_listen")]
+        management_tls_key: Option<std::path::PathBuf>,
         /// TLS AMQP listener (FR-S02). Requires --tls-cert/--tls-key.
         #[arg(long, requires_all = ["tls_cert", "tls_key"])]
         tls_listen: Option<std::net::SocketAddr>,
@@ -197,6 +203,8 @@ fn main() {
             listen,
             data_dir,
             management_listen,
+            management_tls_cert,
+            management_tls_key,
             tls_listen,
             tls_cert,
             tls_key,
@@ -219,6 +227,11 @@ fn main() {
                 .expect("tokio runtime");
             if let Some(addr) = management_listen {
                 let broker = broker.clone();
+                // Either both TLS paths or neither (validated above).
+                let mgmt_tls = match (&management_tls_cert, &management_tls_key) {
+                    (Some(cert), Some(key)) => Some(rusty_mq::tls::load(cert, key)),
+                    _ => None,
+                };
                 runtime.spawn(async move {
                     let app = rusty_mq_management::router(broker);
                     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -228,9 +241,25 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    tracing::info!(%addr, "management API listening");
-                    if let Err(e) = axum::serve(listener, app).await {
-                        tracing::error!("management server failed: {e}");
+                    match mgmt_tls {
+                        Some(Ok(setup)) => {
+                            tracing::info!(%addr, "management API listening (TLS)");
+                            if let Err(e) =
+                                rusty_mq_management::serve_tls(listener, app, setup.acceptor).await
+                            {
+                                tracing::error!("management TLS server failed: {e}");
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("management TLS material: {e}");
+                            std::process::exit(1);
+                        }
+                        None => {
+                            tracing::info!(%addr, "management API listening");
+                            if let Err(e) = axum::serve(listener, app).await {
+                                tracing::error!("management server failed: {e}");
+                            }
+                        }
                     }
                 });
             }
