@@ -48,7 +48,8 @@ assertions) runs in nightly CI; see `.github/workflows/nightly.yaml`.
 
 | Run | Machine | Throughput | p99 confirm | Note |
 | --- | --- | --- | --- | --- |
-| reference (5 s smoke) | dev macOS/APFS, temp-dir journal | 39 confirmed/s | 77 s | fsync-per-commit dominates on APFS; dev-shape evidence only, not a target comparison |
+| reference (5 s smoke, pre-group-commit) | dev macOS/APFS, temp-dir journal | 39 confirmed/s | 77 s | fsync-per-commit dominates on APFS; dev-shape evidence only, not a target comparison |
+| reference (8 s smoke, group commit + lock-free publish path) | dev macOS/APFS, temp-dir journal | 59 confirmed/s | 52 s | +63% throughput, -39% p99 with §9.5 batching engaged; still dev-shape evidence, not a target comparison |
 
 Raw results land in `results/` — publish them unmodified; §14 forbids
 presenting adjusted numbers as measurements.

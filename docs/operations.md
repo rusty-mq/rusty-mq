@@ -111,6 +111,7 @@ rusty-mq backup-restore --input /mnt/backup/rmq-2026-10-03 --data-dir /var/lib/r
 - No live config reload (restart applies changes).
 - Connection-close endpoint exists; connection *listing* shows id+user
   only (no per-connection channel detail).
-- Group-commit batching (§9.5 triggers) is not yet behind the commit path
-  — each durable transaction fsyncs individually; expect low
-  persistent-throughput on fsync-slow filesystems (see benchmarks/README).
+- Group commit (§9.5) batches concurrent durable commits (2 ms / 1 MiB
+  triggers, fsync-inclusive boundary); single-publisher latency is still
+  one fsync per transaction, so fsync-slow filesystems remain the
+  persistent-throughput limiter (see benchmarks/README).
