@@ -1,0 +1,89 @@
+{
+ "url_sanitized": "127.0.0.1:55672/%2F",
+ "cases": [
+  {
+   "case": "queue_plain_durable_ok",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": null
+  },
+  {
+   "case": "queue_x_message_ttl",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_x_queue_type_quorum",
+   "outcome": "channel_error",
+   "reply_code": 406,
+   "reply_text": "PRECONDITION_FAILED - invalid property 'non-durable' for queue 'diff.quorum' in vhost '/'",
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_x_max_priority",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "queue_durable_exclusive",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:406"
+  },
+  {
+   "case": "queue_durable_auto_delete",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:406"
+  },
+  {
+   "case": "exchange_type_headers",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "publish_expiration_property",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "tx_select",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "basic_qos_prefetch_size",
+   "outcome": "connection_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - prefetch_size!=0 (10)",
+   "frozen_expect": "channel_error:pending-540"
+  },
+  {
+   "case": "consume_x_single_active_consumer",
+   "outcome": "ok",
+   "reply_code": null,
+   "reply_text": null,
+   "frozen_expect": "channel_error:540"
+  },
+  {
+   "case": "basic_recover_requeue_false",
+   "outcome": "connection_error",
+   "reply_code": 540,
+   "reply_text": "NOT_IMPLEMENTED - requeue=false",
+   "frozen_expect": "channel_error:540"
+  }
+ ]
+}

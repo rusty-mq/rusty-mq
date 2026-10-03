@@ -17,9 +17,14 @@ use rusty_mq_protocol::{encode_frame, FrameReader, ProtocolLimits, PROTOCOL_HEAD
 use tokio::io::AsyncReadExt;
 
 async fn start_broker() -> std::net::SocketAddr {
+    // Unique per call: an atomic counter — two tests starting in the same
+    // millisecond would otherwise share a data dir and collide on the
+    // projection lock (found by the differential-matrix run).
+    static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "rmq-nowait-{}-{}",
+        "rmq-nowait-{}-{}-{}",
         std::process::id(),
+        DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -530,4 +535,91 @@ async fn conn_close(s: &mut RawSession) -> std::io::Result<()> {
             })),
         )))
         .await
+}
+
+/// Differential-matrix finding: connection.close after an async
+/// publish-time channel error (expiration → 540) must still complete.
+/// Frame-level: close-ok for the channel, then connection close-ok.
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_close_completes_after_async_channel_error() {
+    let addr = start_broker().await;
+    let mut s = handshake(addr).await;
+
+    // Declare a queue, then publish with the expiration property set.
+    s.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Queue(q7::AMQPMethod::Declare(q7::Declare {
+            queue: "exp.q".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        })),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Queue(q7::AMQPMethod::DeclareOk(_))) => {}
+        other => panic!("unexpected instead of declare-ok: {other:?}"),
+    }
+
+    s.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Basic(basic7::AMQPMethod::Publish(basic7::Publish {
+            exchange: "".into(),
+            routing_key: "exp.q".into(),
+            mandatory: false,
+            immediate: false,
+        })),
+    ))
+    .await;
+    // Header WITH the expiration property: the frozen profile rejects
+    // this at publish time with an async channel error.
+    let props = basic7::AMQPProperties::default()
+        .with_expiration(amq_protocol::types::ShortString::from("1000"));
+    s.send(&AMQPFrame::Header(
+        1,
+        60,
+        Box::new(AMQPContentHeader {
+            class_id: 60,
+            body_size: 1,
+            properties: props,
+        }),
+    ))
+    .await;
+    s.send(&AMQPFrame::Body(1, b"x".to_vec())).await;
+
+    // Expect channel.close(540). Do NOT answer close-ok first: some
+    // clients (pika's conn.close path) send connection.close while the
+    // channel close handshake is still open — the connection close must
+    // still be answered.
+    match s.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Channel(ch7::AMQPMethod::Close(c))) => {
+            assert_eq!(c.reply_code, 540, "expiration must be NOT_IMPLEMENTED");
+        }
+        other => panic!("expected channel.close 540, got {other:?}"),
+    }
+
+    // The handshake under test: connection.close must still be answered
+    // even though this connection just went through an async channel
+    // error (found by the differential matrix against pika: conn.close()
+    // hung forever after the expiration 540).
+    s.send(&AMQPFrame::Method(
+        0,
+        AMQPClass::Connection(conn7::AMQPMethod::Close(conn7::Close {
+            reply_code: 200,
+            reply_text: "bye".into(),
+            class_id: 0,
+            method_id: 0,
+        })),
+    ))
+    .await;
+    match tokio::time::timeout(Duration::from_secs(5), s.next_method()).await {
+        Ok(AMQPFrame::Method(0, AMQPClass::Connection(conn7::AMQPMethod::CloseOk(_)))) => {
+            // Server may also initiate nothing here; success is close-ok.
+        }
+        Ok(other) => panic!("expected connection.close-ok, got {other:?}"),
+        Err(_) => panic!("connection close handshake hung after async channel error"),
+    }
 }
