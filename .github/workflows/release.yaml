@@ -9,6 +9,7 @@ permissions:
   contents: write
 
 env:
+  CARGO_PROFILE_DEV_DEBUG: "0" # bounded link memory (see ci.yaml)
   CARGO_TERM_COLOR: always
 
 jobs:
