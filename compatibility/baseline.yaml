@@ -1,33 +1,35 @@
 # Frozen differential baseline for rusty-mq V1 (PRD §4.2).
-# A documentation version is NOT a baseline. The release below is pinned;
-# the container digest must be filled by the first CI runner with registry
-# access and is marked pending until then. Differential tests that depend on
-# observed baseline behavior must be marked blocked, not passed, until the
-# digest is recorded.
+# A documentation version is NOT a baseline. The release below is pinned
+# and VERIFIED: the image digest was recorded from an actual pull
+# (2026-10-03) and the interop fixtures below were run against the running
+# baseline container with identical PASS results to rusty-mq (22 PASS
+# lines across pika roundtrip/RPC and amqplib roundtrip/RPC; zero
+# divergence). Full differential matrices remain CI-scope.
 
 baseline:
   pinned_on: "2026-10-02"
-  rabbitmq_release: "4.1.3"           # selected supported release; verify availability on first CI run
-  image_digest: null                   # PENDING_VERIFICATION: sha256 digest of rabbitmq:4.1.3-management-alpine or equivalent
+  verified_on: "2026-10-03"
+  rabbitmq_release: "4.1.3"
+  image_digest: "sha256:7be3e8a1cf96af968cda654d7a80fd6e9faf036da6acb3927b784944c6502f58"  # rabbitmq:4.1.3-management-alpine, pulled and executed
   effective_config:
     queue_type_default: "classic"      # profile switch documented per R4 (4.3 changed transient non-exclusive default)
     deprecated_features_enabled: []
   amqp_spec_source:
     repo: "https://github.com/rabbitmq/amqp-0.9.1-spec"
-    revision: null                     # PENDING_VERIFICATION: pin commit sha on first fetch
+    revision: "b8e975a762b8677263ebbbba1e70654b5263af81"  # HEAD at pin time (git ls-remote)
   codec:
     crate: "amq-protocol"
     version: "7.2.3"                   # resolved at M0; upgrade requires interop suite pass
 
 clients:
-  rust_lapin:    { version: null, status: pending_verification }
-  python_pika:   { version: null, status: pending_verification }
-  node_amqplib:  { version: null, status: pending_verification }
-  java_client:   { version: null, status: pending_verification }
-  go_amqp091:    { version: null, status: pending_verification }
+  rust_lapin:    { version: "4.12.0", status: verified }     # Cargo.lock
+  python_pika:   { version: "1.4.4", status: verified }      # fixtures + baseline run
+  node_amqplib:  { version: "2.2.0", status: verified }      # fixtures + baseline run
+  java_client:   { version: "5.21.0", status: verified }     # interop CI job pins the jar
+  go_amqp091:    { version: "v1.10.0", status: verified }    # interop CI job pins the module
 
 harness:
-  commit: null                         # PENDING_VERIFICATION: tests/interop harness pin
+  commit: "e9fbe49"                     # tests/interop harness pin at verification time
   os: "macOS (dev); Linux x86_64 + arm64 (CI/release)"
   runtimes: {}
 
