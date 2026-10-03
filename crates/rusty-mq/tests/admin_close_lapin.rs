@@ -37,7 +37,42 @@ async fn spawn() -> (
     (addr, broker, task)
 }
 
+/// Channel creation on a connection the server is closing asynchronously:
+/// poll to a deadline instead of assuming the close has already landed
+/// (loaded CI runners exposed the race — ci#11+).
+async fn channel_eventually_rejected(conn: &LapinConnection) {
+    let deadline = tokio::time::Instant::now() + timeout_secs();
+    loop {
+        if conn.create_channel().await.is_err() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "channel still accepted after the close deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Registry usernames are enriched post-auth; poll until both are present.
+async fn registry_shows(broker: &Arc<rusty_mq::Broker>, want: &[&str]) {
+    let deadline = tokio::time::Instant::now() + timeout_secs();
+    loop {
+        let conns = rusty_mq::Broker::list_connections(broker);
+        let users: Vec<String> = conns.iter().map(|(_, u)| u.clone()).collect();
+        if want.iter().all(|w| users.iter().any(|u| u == w)) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "registry never showed {want:?} (last: {users:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
+
 async fn connections_list_operator_close_and_revocation_close() {
     let (addr, broker, _server) = spawn().await;
 
@@ -66,33 +101,26 @@ async fn connections_list_operator_close_and_revocation_close() {
         .await
         .unwrap();
 
-    // Registry carries real usernames post-auth.
-    let conns = rusty_mq::Broker::list_connections(&broker);
-    assert_eq!(conns.len(), 2, "both live connections registered");
-    let users: Vec<_> = conns.iter().map(|(_, u)| u.as_str()).collect();
-    assert!(users.contains(&"alice") && users.contains(&"admin"));
+    // Registry carries real usernames post-auth (enrichment races the
+    // open-ok the client saw — poll).
+    registry_shows(&broker, &["alice", "admin"]).await;
 
     // Operator close of alice's connection: her channel future fails.
-    let alice_id = conns
-        .iter()
+    let alice_id = rusty_mq::Broker::list_connections(&broker)
+        .into_iter()
         .find(|(_, u)| u == "alice")
-        .map(|(id, _)| *id)
+        .map(|(id, _)| id)
         .unwrap();
     assert!(rusty_mq::Broker::close_connection(
         &broker,
         alice_id,
         "operator test",
     ));
-    let ch = alice.create_channel().await;
-    assert!(ch.is_err(), "closed connection rejects new channels");
+    channel_eventually_rejected(&alice).await;
 
     // Revocation closes admin's remaining connection (FR-S08).
     broker.delete_user("admin").unwrap();
-    let ch = admin.create_channel().await;
-    assert!(
-        ch.is_err(),
-        "principal deletion closes that user's live connections"
-    );
+    channel_eventually_rejected(&admin).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -147,8 +175,7 @@ async fn http_close_endpoint_and_permissions_listing() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    let ch = conn.create_channel().await;
-    assert!(ch.is_err(), "HTTP-closed connection is really closed");
+    channel_eventually_rejected(&conn).await;
 
     // Unknown id -> 404.
     let resp = make_app()
