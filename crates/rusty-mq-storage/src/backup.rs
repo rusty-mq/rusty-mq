@@ -136,7 +136,7 @@ mod tests {
     }
 
     fn seed(dir: &Path) {
-        let mut w = JournalWriter::open(dir, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(dir, JournalConfig::default()).unwrap();
         w.commit(&[Record::QueueDeclare(QueueRecord {
             name: "jobs".into(),
             id: 5,
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(entry.body, b"payload-one".to_vec());
 
         // The restored directory is immediately usable by a writer.
-        let mut w = JournalWriter::open(&restored, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(&restored, JournalConfig::default()).unwrap();
         w.commit(&[Record::QueueDelete { id: 5 }]).unwrap();
         drop(w);
         let _ = fs::remove_dir_all(&dir);

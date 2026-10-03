@@ -485,7 +485,7 @@ mod tests {
     fn fresh_startup_builds_projection_from_journal() {
         let dir = tmp("fresh");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[q(7, "jobs")]).unwrap();
             w.commit(&[msg(1, 0)]).unwrap();
         }
@@ -501,7 +501,7 @@ mod tests {
     fn second_startup_loads_from_projection() {
         let dir = tmp("load");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[q(7, "jobs")]).unwrap();
             w.commit(&[msg(1, 0), msg(2, 1)]).unwrap();
         }
@@ -523,14 +523,14 @@ mod tests {
     fn trailing_journal_replays_over_loaded_projection() {
         let dir = tmp("suffix");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[q(7, "jobs")]).unwrap();
         }
         let (_, _, proj, _) = recover_with_projection(&dir, 1 << 20).unwrap();
         drop(proj);
         // Journal gains a suffix the projection has not seen.
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[msg(9, 0)]).unwrap();
         }
         let (topology, store, _, status) = recover_with_projection(&dir, 1 << 20).unwrap();
@@ -545,7 +545,7 @@ mod tests {
     fn corrupt_index_is_rebuilt_not_trusted() {
         let dir = tmp("corrupt");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[q(7, "jobs")]).unwrap();
             w.commit(&[msg(1, 0)]).unwrap();
         }
@@ -570,7 +570,7 @@ mod tests {
     fn settlement_reflected_in_projection_state() {
         let dir = tmp("settle");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[q(7, "jobs")]).unwrap();
             w.commit(&[msg(1, 0), msg(2, 1)]).unwrap();
             w.commit(&[Record::SettleAck { queue: 7, seq: 0 }]).unwrap();

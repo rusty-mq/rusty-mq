@@ -370,7 +370,7 @@ impl Broker {
             )
             .expect("recovery must succeed or startup must fail explicitly");
         let mut auth = auth;
-        let mut writer = writer;
+        let writer = writer;
         if auth.principal(&user).is_none() && auth.principal("admin").is_none() {
             // First run bootstrap: the flagged credentials become the
             // durable admin (clearly logged; rotatable via the CLI).

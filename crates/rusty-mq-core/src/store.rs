@@ -120,12 +120,38 @@ impl MessageStore {
             .unwrap_or_default()
     }
 
-    /// The sequence the next enqueue on this queue will receive (pure
-    /// peek: does NOT consume; the caller holds the store lock across the
-    /// journal commit and the following enqueue, so the value cannot
-    /// change in between).
-    pub fn next_seq_of(&self, queue: QueueId) -> u64 {
-        self.queues.get(&queue).map_or(0, |q| q.next_seq)
+    /// Reserve the sequence for the next enqueue on this queue (CONSUMES:
+    /// the caller must either insert at the reserved seq or burn it —
+    /// gaps are legal, recovery never assumes contiguity). The caller
+    /// drops the store lock between reservation and insertion, so
+    /// concurrent publishers' journal commits batch in the flusher while
+    /// sequence assignment stays unique.
+    pub fn next_seq_of(&mut self, queue: QueueId) -> u64 {
+        let q = self.queues.entry(queue).or_default();
+        let seq = q.next_seq;
+        q.next_seq += 1;
+        seq
+    }
+
+    /// Insert an entry at an explicit reserved sequence (the durable
+    /// publish path: the journal record already names this seq). Sets the
+    /// mint past it; idempotent per seq. Insertion is in seq order —
+    /// commit completion order across concurrent publishers must not
+    /// reorder the ready queue (§7.3 publication order per channel).
+    pub fn insert_at(&mut self, queue: QueueId, seq: u64, message: StoredMessage) {
+        let size = message.size_bytes();
+        let q = self.queues.entry(queue).or_default();
+        q.next_seq = q.next_seq.max(seq + 1);
+        if q.entries.iter().any(|e| e.seq == seq) {
+            return; // idempotent
+        }
+        let pos = q
+            .entries
+            .iter()
+            .position(|e| e.seq > seq)
+            .unwrap_or(q.entries.len());
+        q.entries.insert(pos, QueueEntry { seq, message });
+        self.total_bytes += size;
     }
 
     /// Replay-only: restore an entry with its journaled identity (queue id

@@ -20,7 +20,7 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 }
 
 fn seed(dir: &std::path::Path) {
-    let mut w = JournalWriter::open(dir, JournalConfig::default()).unwrap();
+    let w = JournalWriter::open(dir, JournalConfig::default()).unwrap();
     w.commit(&[Record::QueueDeclare(QueueRecord {
         name: "q".into(),
         id: 1,

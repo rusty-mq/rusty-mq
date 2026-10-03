@@ -2225,12 +2225,21 @@ impl Connection {
         };
         // The commit happens inside a scoped block so the store guard ends
         // before any await on this path.
-        let commit_failed = if !durable_destinations.is_empty() {
-            let store = self.broker.store.lock().unwrap();
-            let assigned: Vec<(u64, u64)> = durable_destinations
-                .iter()
-                .map(|q| (q.to_raw(), store.next_seq_of(*q)))
-                .collect();
+        // Durable publish path, lock-free across the fsync so concurrent
+        // publishers batch in the group-commit flusher: (1) reserve
+        // sequences under the store lock; (2) drop the lock; (3) journal
+        // commit (the blocking durable boundary); (4) insert at the
+        // reserved sequences. A failed commit burns the reservations —
+        // sequence gaps are legal and invisible to recovery.
+        let mut durable_assignment: Option<(Vec<(QueueId, u64)>, bool)> = None;
+        if !durable_destinations.is_empty() {
+            let assigned: Vec<(QueueId, u64)> = {
+                let mut store = self.broker.store.lock().unwrap();
+                durable_destinations
+                    .iter()
+                    .map(|q| (*q, store.next_seq_of(*q)))
+                    .collect()
+            };
             let record = rusty_mq_storage::Record::Enqueue(rusty_mq_storage::Enqueue {
                 // Message identity is the (queue, seq) pair in V1; the
                 // broker-wide id arrives with the redb projection (M5).
@@ -2240,14 +2249,20 @@ impl Connection {
                 exchange: message.exchange.clone(),
                 routing_key: message.routing_key.clone(),
                 persistent: true,
-                destinations: assigned,
+                destinations: assigned.iter().map(|(q, s)| (q.to_raw(), *s)).collect(),
             });
             let failed = self.broker.journal_commit(&[record]).is_err();
-            drop(store); // unconditional within this block
-            failed
-        } else {
-            false
-        };
+            durable_assignment = Some((assigned, failed));
+        }
+        let commit_failed = matches!(&durable_assignment, Some((_, true)));
+        if let Some((ref assigned, failed)) = durable_assignment {
+            if !failed {
+                let mut store = self.broker.store.lock().unwrap();
+                for (queue, seq) in assigned {
+                    store.insert_at(*queue, *seq, message.clone());
+                }
+            }
+        }
         if commit_failed {
             let e = ProtocolError::channel(
                 reply_code::RESOURCE_ERROR,
@@ -2259,11 +2274,23 @@ impl Connection {
         }
 
         Metrics::inc(&self.broker.metrics.messages_published);
+        // Destinations already inserted by the durable path (assigned seqs)
+        // are complete: no second enqueue. Only transient destinations —
+        // or the fallback when the durable commit failed — take the
+        // generic admission path below.
+        let inserted: Vec<QueueId> = match &durable_assignment {
+            Some((assigned, false)) => assigned.iter().map(|(q, _)| *q).collect(),
+            _ => Vec::new(),
+        };
         // Admit to every destination under the store budget, then dispatch
         // to waiting consumers. Admission crossing the budget raises the
         // memory alarm (evaluate + notify below).
         let mut admission_failure: Option<AdmitError> = None;
         for queue in &destinations {
+            if inserted.contains(queue) {
+                self.broker.dispatch_queue(*queue);
+                continue;
+            }
             let admitted = self
                 .broker
                 .store

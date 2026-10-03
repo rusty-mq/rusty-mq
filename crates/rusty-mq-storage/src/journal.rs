@@ -6,6 +6,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::record::{FormatError, Record};
 
@@ -95,7 +96,15 @@ pub type Failpoint = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 pub struct JournalConfig {
     /// Roll to a new segment after this many bytes.
     pub segment_bytes: usize,
-    /// Optional failpoint hook (test-only).
+    /// Group-commit window: the flusher waits up to this long for more
+    /// records before fsyncing (§9.5 trigger; 0 = fsync on first batch).
+    pub commit_batch_delay_ms: u32,
+    /// Group-commit byte trigger: pending bytes at or above this flush
+    /// immediately without waiting out the window (§9.5).
+    pub commit_batch_bytes: usize,
+    /// Optional failpoint hook (test-only); the RUNNING writer copies it
+    /// into a shared cell at open so later `set_failpoint` changes reach
+    /// the flusher thread.
     pub failpoint: Option<std::sync::Arc<Failpoint>>,
 }
 
@@ -103,21 +112,49 @@ impl Default for JournalConfig {
     fn default() -> Self {
         Self {
             segment_bytes: 256 * 1024 * 1024,
+            commit_batch_delay_ms: 2,
+            commit_batch_bytes: 1_048_576,
             failpoint: None,
         }
     }
 }
 
-/// The single serialized journal writer (ADR-0002).
+/// State shared between committers and the flusher thread.
+struct GroupState {
+    /// Encoded frames waiting to be written (drained by the flusher).
+    pending: Vec<u8>,
+    /// Fence LSN of the last frame currently in `pending`.
+    pending_fence: u64,
+    /// Highest fence known fsynced (ADR-0001 watermark).
+    durable_lsn: u64,
+    /// First error seen by the flusher since it was observed (cleared
+    /// once reported to all waiters whose fence it covers).
+    flush_error: Option<String>,
+    /// Writer bookkeeping moved under the lock.
+    next_lsn: u64,
+    segment_id: u64,
+    segment_len: usize,
+    /// Flusher shutdown flag.
+    stopping: bool,
+}
+
+/// The single serialized journal writer (ADR-0002) with group commit
+/// (§9.5): committers append under the state lock, hand the batch to the
+/// flusher thread, and block on the condvar until their fence is covered
+/// by an actual fsync — concurrency batches naturally, and a timer firing
+/// is never treated as proof of durability (ADR-0001).
 pub struct JournalWriter {
     dir: PathBuf,
     config: JournalConfig,
-    file: File,
-    segment_id: u64,
-    segment_len: usize,
-    next_lsn: u64,
-    /// Highest fence known fsynced (ADR-0001 watermark).
-    durable_lsn: u64,
+    state: std::sync::Arc<Mutex<GroupState>>,
+    /// Notified when durable_lsn advances or an error is recorded.
+    committed: std::sync::Arc<std::sync::Condvar>,
+    /// Notified when new work arrives for the flusher.
+    work: std::sync::Arc<std::sync::Condvar>,
+    /// Shared failpoint cell visible to commit() and the flusher thread
+    /// (runtime injection must reach the fsync site — T13/T14).
+    failpoint: std::sync::Arc<Mutex<Option<std::sync::Arc<Failpoint>>>>,
+    flusher: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Data-directory lock: the writer records its pid in `LOCK`; a live pid
@@ -210,177 +247,366 @@ impl JournalWriter {
         // The writer continues the existing tail segment (not a new one) so
         // LSNs stay contiguous within it.
         let path = dir.join(segment_file_name(segment_id));
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&path)
             .map_err(io_err)?;
-        let mut w = Self {
+        let segment_len = if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+            file.write_all(&segment_header_bytes(segment_id, previous))
+                .map_err(io_err)?;
+            file.sync_all().map_err(io_err)?;
+            sync_dir(dir)?;
+            SEGMENT_HEADER_LEN
+        } else {
+            if let Some((seg, prefix)) = tail_to_truncate {
+                let current_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as usize;
+                if prefix < current_len {
+                    let tail_path = dir.join(segment_file_name(seg));
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&tail_path)
+                        .and_then(|f| f.set_len(prefix as u64))
+                        .map_err(io_err)?;
+                    sync_dir(dir)?;
+                    tracing::debug!(
+                        segment = seg,
+                        from = current_len,
+                        to = prefix,
+                        "truncated torn tail"
+                    );
+                }
+                // Recompute segment length from the truncated file.
+            }
+            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as usize;
+            file.seek(SeekFrom::End(0)).map_err(io_err)?;
+            len
+        };
+        let state = GroupState {
+            pending: Vec::new(),
+            pending_fence: 0,
+            durable_lsn: 0,
+            flush_error: None,
+            next_lsn,
+            segment_id,
+            segment_len,
+            stopping: false,
+        };
+        let file = std::sync::Arc::new(Mutex::new(file));
+        let state = std::sync::Arc::new(Mutex::new(state));
+        let committed = std::sync::Arc::new(std::sync::Condvar::new());
+        let work = std::sync::Arc::new(std::sync::Condvar::new());
+        let failpoint = std::sync::Arc::new(Mutex::new(config.failpoint.clone()));
+        let flusher = {
+            let dir = dir.to_path_buf();
+            let flusher_config = config.clone();
+            let file = file.clone();
+            let state = state.clone();
+            let committed = committed.clone();
+            let work = work.clone();
+            let failpoint = failpoint.clone();
+            std::thread::spawn(move || {
+                Self::flusher_loop(
+                    &dir,
+                    &flusher_config,
+                    file,
+                    state,
+                    committed,
+                    work,
+                    failpoint,
+                )
+            })
+        };
+        Ok(Self {
             dir: dir.to_path_buf(),
             config,
-            file,
-            segment_id,
-            segment_len: SEGMENT_HEADER_LEN,
-            next_lsn,
-            durable_lsn: 0,
-        };
-        if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
-            w.file
-                .write_all(&segment_header_bytes(segment_id, previous))
-                .map_err(io_err)?;
-            w.file.sync_all().map_err(io_err)?;
-            sync_dir(dir)?;
-        } else if let Some((seg, prefix)) = tail_to_truncate {
-            let current_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as usize;
-            if prefix < current_len {
-                let tail_path = dir.join(segment_file_name(seg));
-                OpenOptions::new()
-                    .write(true)
-                    .open(&tail_path)
-                    .and_then(|f| f.set_len(prefix as u64))
-                    .map_err(io_err)?;
-                sync_dir(dir)?;
-                tracing::debug!(
-                    segment = seg,
-                    from = current_len,
-                    to = prefix,
-                    "truncated torn tail"
-                );
-            }
-            w.file.seek(SeekFrom::End(0)).map_err(io_err)?;
-        } else {
-            w.file.seek(SeekFrom::End(0)).map_err(io_err)?;
-        }
-        Ok(w)
-    }
-
-    fn failpoint(&self, name: &str) -> Result<(), FormatError> {
-        if let Some(fp) = &self.config.failpoint {
-            fp(name).map_err(FormatError::Io)?;
-        }
-        Ok(())
+            state,
+            committed,
+            work,
+            failpoint,
+            flusher: Some(flusher),
+        })
     }
 
     /// Append one logical transaction (its records + an explicit commit
-    /// fence), assign LSNs, and fsync. Returns the fence LSN (the commit
-    /// identity callers can wait on). This is the durable boundary.
-    pub fn commit(&mut self, records: &[Record]) -> Result<u64, FormatError> {
-        self.failpoint("before-append")?;
-        let mut buf: Vec<u8> = Vec::new();
-        // TxBegin for multi-record transactions; single-record transactions
-        // proceed without it (spec: the explicit fence commits).
-        if records.len() > 1 {
-            let lsn = self.next_lsn;
-            self.next_lsn += 1;
-            buf.extend_from_slice(&frame_control(0x01, lsn));
+    /// fence), assign LSNs, and block until an actual fsync covers the
+    /// fence. Returns the fence LSN (the commit identity callers wait on).
+    ///
+    /// Group commit (§9.5): the encoded frames join the shared pending
+    /// batch under the state lock; the flusher thread writes+fsyncs the
+    /// batch (batching concurrent committers); this caller waits on the
+    /// condvar until `durable_lsn >= fence` or the flusher reports an
+    /// error covering it. The batch window (delay/bytes triggers) never
+    /// lets a caller return before its fsync (ADR-0001).
+    pub fn commit(&self, records: &[Record]) -> Result<u64, FormatError> {
+        if let Some(fp) = self.failpoint.lock().unwrap().as_ref() {
+            fp("before-append").map_err(FormatError::Io)?;
         }
-        for rec in records {
-            let lsn = self.next_lsn;
-            self.next_lsn += 1;
-            let payload = rec.encode();
-            let mut crc_input = Vec::with_capacity(payload.len() + 5);
-            crc_input.push(rec.kind());
-            crc_input.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            crc_input.extend_from_slice(&payload);
-            let crc = crc32(&crc_input);
-            buf.extend_from_slice(&record_header_bytes(
-                lsn,
-                rec.kind(),
-                payload.len() as u32,
-                crc,
-            ));
-            buf.extend_from_slice(&payload);
+        let fence = {
+            let mut st = self.state.lock().unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            // TxBegin for multi-record transactions; single-record
+            // transactions proceed without it (spec: the fence commits).
+            if records.len() > 1 {
+                let lsn = st.next_lsn;
+                st.next_lsn += 1;
+                buf.extend_from_slice(&frame_control(0x01, lsn));
+            }
+            for rec in records {
+                let lsn = st.next_lsn;
+                st.next_lsn += 1;
+                let payload = rec.encode();
+                let mut crc_input = Vec::with_capacity(payload.len() + 5);
+                crc_input.push(rec.kind());
+                crc_input.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                crc_input.extend_from_slice(&payload);
+                let crc = crc32(&crc_input);
+                buf.extend_from_slice(&record_header_bytes(
+                    lsn,
+                    rec.kind(),
+                    payload.len() as u32,
+                    crc,
+                ));
+                buf.extend_from_slice(&payload);
+            }
+            let fence = st.next_lsn;
+            st.next_lsn += 1;
+            buf.extend_from_slice(&frame_control(0x02, fence));
+            st.pending.extend_from_slice(&buf);
+            st.pending_fence = fence;
+            self.work.notify_one();
+            fence
+        };
+        // Wait for durability covering OUR fence (ADR-0001: the window
+        // timing out is never proof; only the flusher's fsync result is).
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if st.durable_lsn >= fence {
+                return Ok(fence);
+            }
+            if let Some(err) = st.flush_error.take() {
+                // An error only fails callers whose fence it could cover;
+                // later callers keep waiting for a successful flush.
+                return Err(FormatError::Io(err));
+            }
+            if st.stopping {
+                return Err(FormatError::Io("flusher stopped".into()));
+            }
+            st = self.committed.wait(st).unwrap();
         }
-        let fence = self.next_lsn;
-        self.next_lsn += 1;
-        buf.extend_from_slice(&frame_control(0x02, fence));
-
-        // Segment roll (header included in accounting).
-        if self.segment_len + buf.len() > self.config.segment_bytes
-            && self.segment_len > SEGMENT_HEADER_LEN
-        {
-            self.roll()?;
-        }
-        self.file.write_all(&buf).map_err(io_err)?;
-        self.failpoint("before-sync")?;
-        self.file.sync_all().map_err(io_err)?;
-        self.failpoint("after-sync")?;
-        self.segment_len += buf.len();
-        // Watermark advances only after the successful sync (ADR-0001).
-        self.durable_lsn = self.durable_lsn.max(fence);
-        Ok(fence)
     }
 
-    fn roll(&mut self) -> Result<(), FormatError> {
-        let next = self.segment_id + 1;
-        let previous = self.segment_id;
-        let path = self.dir.join(segment_file_name(next));
-        let mut file = File::create(&path).map_err(io_err)?;
-        file.write_all(&segment_header_bytes(next, previous))
-            .map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
-        // Durably link the new segment into the directory before switching.
-        sync_dir(&self.dir)?;
-        self.file = OpenOptions::new()
-            .append(true)
-            .read(true)
-            .open(&path)
-            .map_err(io_err)?;
-        self.segment_id = next;
-        self.segment_len = SEGMENT_HEADER_LEN;
-        Ok(())
+    /// The flusher thread body. Loop: wait for work (with the batch
+    /// window timeout), take the pending batch, write, fsync, advance the
+    /// watermark, wake waiters. Segment rolling happens on the taken
+    /// batch's size accounting.
+    fn flusher_loop(
+        dir: &Path,
+        config: &JournalConfig,
+        file: std::sync::Arc<Mutex<File>>,
+        state: std::sync::Arc<Mutex<GroupState>>,
+        committed: std::sync::Arc<std::sync::Condvar>,
+        work: std::sync::Arc<std::sync::Condvar>,
+        failpoint: std::sync::Arc<Mutex<Option<std::sync::Arc<Failpoint>>>>,
+    ) {
+        let window = std::time::Duration::from_millis(config.commit_batch_delay_ms as u64);
+        loop {
+            let (batch, batch_fence) = {
+                let mut st = state.lock().unwrap();
+                loop {
+                    if st.stopping {
+                        if st.pending.is_empty() {
+                            return;
+                        }
+                        break; // final drain
+                    }
+                    if !st.pending.is_empty() {
+                        // Byte trigger flushes immediately; otherwise wait
+                        // out the window for more committers to join.
+                        if st.pending.len() >= config.commit_batch_bytes || window.is_zero() {
+                            break;
+                        }
+                        let (guard, _timed_out) = work.wait_timeout(st, window).unwrap();
+                        st = guard;
+                        break;
+                    }
+                    st = work.wait(st).unwrap();
+                }
+                (std::mem::take(&mut st.pending), st.pending_fence)
+            };
+            if batch.is_empty() {
+                continue;
+            }
+            // Segment roll decision on the accumulated length.
+            {
+                let mut st = state.lock().unwrap();
+                if st.segment_len + batch.len() > config.segment_bytes
+                    && st.segment_len > SEGMENT_HEADER_LEN
+                {
+                    if let Err(e) = roll_segment(dir, &mut st, &file) {
+                        record_flush_error(&state, &committed, e.to_string());
+                        return;
+                    }
+                }
+            }
+            let mut f = file.lock().unwrap();
+            if let Err(e) = f.write_all(&batch) {
+                drop(f);
+                record_flush_error(&state, &committed, e.to_string());
+                return;
+            }
+            if let Some(fp) = failpoint.lock().unwrap().as_ref() {
+                if fp("before-sync").is_err() {
+                    drop(f);
+                    record_flush_error(&state, &committed, "injected fsync failure".into());
+                    return;
+                }
+            }
+            if let Err(e) = f.sync_all() {
+                drop(f);
+                record_flush_error(&state, &committed, e.to_string());
+                return;
+            }
+            if let Some(fp) = failpoint.lock().unwrap().as_ref() {
+                if fp("after-sync").is_err() {
+                    drop(f);
+                    record_flush_error(&state, &committed, "after-sync failpoint".into());
+                    return;
+                }
+            }
+            drop(f);
+            {
+                let mut st = state.lock().unwrap();
+                st.segment_len += batch.len();
+                // Watermark advances only after the successful sync.
+                st.durable_lsn = st.durable_lsn.max(batch_fence);
+                st.flush_error = None;
+                committed.notify_all();
+            }
+        }
     }
 
     /// Clean-shutdown end marker (optimization only).
-    pub fn write_end_marker(&mut self) -> Result<(), FormatError> {
-        let lsn = self.next_lsn;
-        self.next_lsn += 1;
-        let payload = [0x00u8];
-        let crc = crc32(&payload);
-        let bytes = record_header_bytes(lsn, 0xF1, payload.len() as u32, crc);
-        let mut buf = bytes.to_vec();
-        buf.extend_from_slice(&payload);
-        self.file.write_all(&buf).map_err(io_err)?;
-        self.file.sync_all().map_err(io_err)?;
-        self.segment_len += buf.len();
+    pub fn write_end_marker(&self) -> Result<(), FormatError> {
+        let buf = {
+            let mut st = self.state.lock().unwrap();
+            let lsn = st.next_lsn;
+            st.next_lsn += 1;
+            let payload = [0x00u8];
+            let crc = crc32(&payload);
+            let mut buf = record_header_bytes(lsn, 0xF1, payload.len() as u32, crc).to_vec();
+            buf.extend_from_slice(&payload);
+            st.pending.extend_from_slice(&buf);
+            st.pending_fence = st.pending_fence.max(lsn);
+            self.work.notify_one();
+            buf
+        };
+        let _ = buf;
+        // The marker is an optimization: wait briefly for it to flush so a
+        // clean shutdown actually persists it, but do not fail shutdown
+        // if the window expires (absence is not an error — §9.8).
+        let mut st = self.state.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while st.durable_lsn < st.pending_fence {
+            let (guard, _t) = self
+                .committed
+                .wait_timeout(
+                    st,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .unwrap();
+            st = guard;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
         Ok(())
     }
 
-    /// Replace the failpoint hook (test-only; T13/T14 evidence).
+    /// Highest fence known fsynced.
+    pub fn durable_lsn(&self) -> u64 {
+        self.state.lock().unwrap().durable_lsn
+    }
+
+    /// Next LSN to be assigned.
+    pub fn next_lsn(&self) -> u64 {
+        self.state.lock().unwrap().next_lsn
+    }
+
+    /// Current segment id (reclaim keeps this one).
+    pub fn current_segment_id(&self) -> u64 {
+        self.state.lock().unwrap().segment_id
+    }
+
+    /// Replace the failpoint hook (test-only; T13/T14 evidence). The
+    /// change propagates to the running flusher via the shared cell.
     pub fn set_failpoint(&mut self, fp: Option<std::sync::Arc<Failpoint>>) {
         self.config.failpoint = fp;
+        *self.failpoint.lock().unwrap() = self.config.failpoint.clone();
     }
 
     /// Release the data-directory lock (idempotent; also runs on Drop).
     pub fn release_lock(&self) {
         release_writer_lock(&self.dir);
     }
-
-    pub fn durable_lsn(&self) -> u64 {
-        self.durable_lsn
-    }
-
-    pub fn next_lsn(&self) -> u64 {
-        self.next_lsn
-    }
-
-    /// Current segment id (reclaim keeps this one).
-    pub fn current_segment_id(&self) -> u64 {
-        self.segment_id
-    }
-}
-
-impl Drop for JournalWriter {
-    fn drop(&mut self) {
-        // Best effort: a crashed writer leaves a stale LOCK, tolerated by
-        // the next open (pid no longer alive).
-        release_writer_lock(&self.dir);
-    }
 }
 
 fn io_err(e: io::Error) -> FormatError {
     FormatError::Io(e.to_string())
+}
+
+/// Roll to the next segment under the state lock (flusher path). The new
+/// segment header + directory are fsynced BEFORE the switch.
+fn roll_segment(dir: &Path, st: &mut GroupState, file: &Mutex<File>) -> Result<(), FormatError> {
+    let next = st.segment_id + 1;
+    let previous = st.segment_id;
+    let path = dir.join(segment_file_name(next));
+    let mut new_file = File::create(&path).map_err(io_err)?;
+    new_file
+        .write_all(&segment_header_bytes(next, previous))
+        .map_err(io_err)?;
+    new_file.sync_all().map_err(io_err)?;
+    sync_dir(dir)?;
+    let appended = OpenOptions::new()
+        .append(true)
+        .read(true)
+        .open(&path)
+        .map_err(io_err)?;
+    *file.lock().unwrap() = appended;
+    st.segment_id = next;
+    st.segment_len = SEGMENT_HEADER_LEN;
+    Ok(())
+}
+
+/// Record a flush failure and wake every waiter: committers whose fence
+/// was in (or behind) the failed batch get Err; the flusher stops (the
+/// broker's §6.4 posture — do not continue after uncertain persistence).
+fn record_flush_error(
+    state: &std::sync::Arc<Mutex<GroupState>>,
+    committed: &std::sync::Arc<std::sync::Condvar>,
+    detail: String,
+) {
+    let mut st = state.lock().unwrap();
+    st.flush_error = Some(detail);
+    st.stopping = true;
+    committed.notify_all();
+}
+
+impl Drop for JournalWriter {
+    fn drop(&mut self) {
+        // Stop the flusher after a final drain; never wait on it while
+        // holding the state lock (deadlock).
+        {
+            let mut st = self.state.lock().unwrap();
+            st.stopping = true;
+            self.work.notify_all();
+        }
+        if let Some(t) = self.flusher.take() {
+            let _ = t.join();
+        }
+        release_writer_lock(&self.dir);
+    }
 }
 
 fn sync_dir(dir: &Path) -> Result<(), FormatError> {
@@ -675,6 +901,107 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_committers_group_commit() {
+        let dir = tmpdir("group");
+        let w = std::sync::Arc::new(JournalWriter::open(&dir, JournalConfig::default()).unwrap());
+        let threads: usize = 8;
+        let per: usize = 25;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let w = w.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut fences = Vec::new();
+                for i in 0..per {
+                    let f = w
+                        .commit(&[queue_declare((t * per + i) as u64, &format!("g{t}-{i}"))])
+                        .unwrap();
+                    fences.push(f);
+                }
+                fences
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        // Every fence distinct, watermark covers the max, monotonic by
+        // construction of next_lsn under the lock.
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), threads * per, "fences unique");
+        assert_eq!(w.durable_lsn(), *all.last().unwrap());
+        // All records recoverable after drop.
+        drop(w);
+        let recovered = recover(&dir).unwrap();
+        assert_eq!(recovered.len(), threads * per);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_window_still_correct() {
+        // delay=0 must behave exactly like per-commit sync (no lost waits).
+        let dir = tmpdir("zero");
+        let w = JournalWriter::open(
+            &dir,
+            JournalConfig {
+                commit_batch_delay_ms: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..10u64 {
+            w.commit(&[queue_declare(i, "z")]).unwrap();
+            assert!(w.durable_lsn() > i);
+        }
+        drop(w);
+        assert_eq!(recover(&dir).unwrap().len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failpoint_injection_reaches_running_flusher() {
+        let dir = tmpdir("fp-live");
+        let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        // Healthy commit first (T13's setup declare).
+        w.commit(&[queue_declare(1, "ok")]).unwrap();
+        // Inject on the RUNNING writer.
+        let tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t2 = tripped.clone();
+        let fp: Failpoint = Box::new(move |name| {
+            if name == "before-sync" {
+                t2.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("injected fsync failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        w.set_failpoint(Some(std::sync::Arc::new(fp)));
+        let result = w.commit(&[queue_declare(2, "must-fail")]);
+        assert!(
+            result.is_err(),
+            "running-writer injection must fail the commit"
+        );
+        assert!(tripped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(w);
+        let recovered = recover(&dir).unwrap();
+        // §7.4/§9.5: a complete transaction MAY survive without its
+        // producer seeing a confirm — recovery retaining record 2 is legal.
+        // The invariant (INV-01) is about confirms, which the Err above
+        // preserves. Assert the healthy commit survived and nothing alien
+        // appeared.
+        let ids: Vec<u64> = recovered
+            .iter()
+            .filter_map(|r| match &r.record {
+                Record::QueueDeclare(q) => Some(q.id),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.iter().all(|id| *id == 1 || *id == 2));
+        assert!(ids.contains(&1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn crc32_known_vectors() {
         assert_eq!(crc32(b""), 0x0000_0000);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
@@ -687,7 +1014,7 @@ mod tests {
     #[test]
     fn commit_and_recover_roundtrip() {
         let dir = tmpdir("roundtrip");
-        let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         let f1 = w.commit(&[queue_declare(1, "jobs")]).unwrap();
         let f2 = w
             .commit(&[
@@ -714,7 +1041,7 @@ mod tests {
     #[test]
     fn torn_tail_discards_unfenced_transaction() {
         let dir = tmpdir("torn");
-        let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         w.commit(&[queue_declare(1, "jobs")]).unwrap();
         // Simulate a crash mid-transaction: write bytes for an unfenced
         // transaction and drop the writer without sync/fence.
@@ -756,7 +1083,7 @@ mod tests {
     #[test]
     fn checksum_failure_is_explicit() {
         let dir = tmpdir("crc");
-        let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         w.commit(&[queue_declare(1, "jobs")]).unwrap();
         drop(w);
         // Flip a payload byte of the committed record.
@@ -772,18 +1099,18 @@ mod tests {
     #[test]
     fn segment_rolling_and_chain_recovery() {
         let dir = tmpdir("roll");
-        let mut w = JournalWriter::open(
+        let w = JournalWriter::open(
             &dir,
             JournalConfig {
                 segment_bytes: 200, // force rolls
-                failpoint: None,
+                ..Default::default()
             },
         )
         .unwrap();
         for i in 0..20u64 {
             w.commit(&[queue_declare(i, &format!("q{i}"))]).unwrap();
         }
-        assert!(w.segment_id > 1, "segments were rolled");
+        assert!(w.current_segment_id() > 1, "segments were rolled");
         drop(w);
 
         let ids = scan_segments(&dir).unwrap();
@@ -791,7 +1118,7 @@ mod tests {
         let recovered = recover(&dir).unwrap();
         assert_eq!(recovered.len(), 20, "all committed records across segments");
         // Reopen appends after the last intact LSN.
-        let mut w2 = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w2 = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         w2.commit(&[queue_declare(100, "after-restart")]).unwrap();
         drop(w2);
         let recovered = recover(&dir).unwrap();
@@ -814,11 +1141,12 @@ mod tests {
                 Ok(())
             }
         });
-        let mut w = JournalWriter::open(
+        let w = JournalWriter::open(
             &dir,
             JournalConfig {
                 segment_bytes: usize::MAX,
                 failpoint: Some(std::sync::Arc::new(fp)),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -838,11 +1166,11 @@ mod tests {
     fn chain_break_detected() {
         let dir = tmpdir("chain");
         {
-            let mut w = JournalWriter::open(
+            let w = JournalWriter::open(
                 &dir,
                 JournalConfig {
                     segment_bytes: 200,
-                    failpoint: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -863,7 +1191,7 @@ mod tests {
     fn reopen_after_torn_tail_truncates_and_future_commits_recover() {
         let dir = tmpdir("truncate");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[queue_declare(1, "keep")]).unwrap();
         }
         // Crash mid-record: append half a record header (torn).
@@ -876,7 +1204,7 @@ mod tests {
             f.write_all(&[0x07, 0x00, 0x00]).unwrap();
         }
         // Reopen: truncates the torn bytes, then commits new work.
-        let mut w2 = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w2 = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         w2.commit(&[queue_declare(2, "after-crash")]).unwrap();
         drop(w2);
 

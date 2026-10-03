@@ -43,7 +43,7 @@ proptest! {
         flip in 0usize..512,
     ) {
         let dir = tmp("bitflip");
-        let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         w.commit(&[Record::QueueDeclare(rusty_mq_storage::QueueRecord {
             name: "fuzz".into(),
             id: 1,
@@ -83,7 +83,7 @@ proptest! {
         cut in 0usize..512,
     ) {
         let dir = tmp("trunc");
-        let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+        let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
         w.commit(&[Record::QueueDeclare(rusty_mq_storage::QueueRecord {
             name: "fuzz".into(),
             id: 1,

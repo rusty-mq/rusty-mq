@@ -320,7 +320,7 @@ mod tests {
     fn rebuild_restores_topology_messages_and_settlements() {
         let dir = tmp("full");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[queue_declare(5, "jobs")]).unwrap();
             w.commit(&[enqueue(1, 0, b"one"), enqueue(2, 1, b"two")])
                 .unwrap();
@@ -351,7 +351,7 @@ mod tests {
     fn rebuild_after_delete_does_not_resurrect() {
         let dir = tmp("delete");
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[queue_declare(3, "temp")]).unwrap();
             w.commit(&[enqueue(1, 0, b"x")]).unwrap();
             w.commit(&[Record::QueueDelete { id: 3 }]).unwrap();
@@ -369,7 +369,7 @@ mod tests {
         let dir = tmp("snap-suffix");
         let covered_lsn;
         {
-            let mut w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
+            let w = JournalWriter::open(&dir, JournalConfig::default()).unwrap();
             w.commit(&[queue_declare(5, "jobs")]).unwrap();
             w.commit(&[enqueue(1, 0, b"one"), enqueue(2, 1, b"two")])
                 .unwrap();

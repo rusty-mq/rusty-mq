@@ -386,11 +386,11 @@ mod tests {
     #[test]
     fn reclaim_removes_only_covered_segments() {
         let dir = tmp("reclaim");
-        let mut w = JournalWriter::open(
+        let w = JournalWriter::open(
             &dir,
             JournalConfig {
                 segment_bytes: 200,
-                failpoint: None,
+                ..Default::default()
             },
         )
         .unwrap();
