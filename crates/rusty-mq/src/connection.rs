@@ -412,6 +412,12 @@ impl Connection {
     }
 
     async fn send_start(&mut self) -> Result<(), ()> {
+        // NO server protocol header: byte-probed RabbitMQ 4.1.3 (the
+        // pinned baseline) also replies to the client header with
+        // connection.start directly — no header echo — and lapin REJECTS
+        // a mid-handshake header (InvalidProtocolVersion). Baseline
+        // compatibility wins over the raw spec text (same precedent as
+        // the RabbitMQ field-table dialect). Evidence in the ledger.
         let mut props = FieldTable::default();
         props.insert(
             "product".into(),
