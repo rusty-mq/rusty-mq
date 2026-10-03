@@ -1,72 +1,125 @@
 name: ci
-
-on:
+true:
   push:
-    branches: [main]
-  pull_request:
-
+    branches:
+    - main
+  pull_request: null
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Debug-off test builds: the first CI run died linking ~30 debug test
-  # binaries in parallel (linker OOM-killed, exit 101). No debuginfo keeps
-  # link memory and time bounded; -j 2 on the test build caps peak.
-  CARGO_PROFILE_DEV_DEBUG: "0"
-
+  CARGO_PROFILE_DEV_DEBUG: '0'
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
-
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.95.0
+      with:
+        components: rustfmt
+    - run: cargo fmt --all --check
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.95.0
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo clippy --workspace --all-targets -- -D warnings
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
-      - name: Test (no-fail-fast; failures echoed into the public job summary)
-        run: |
-          set +e
-          cargo test --workspace -j 2 --no-fail-fast 2>&1 | tee /tmp/test.log
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo "## Test failures"
-              echo '```'
-              grep -B2 -A25 -E "FAILED|panicked at" /tmp/test.log | tail -300
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit "$rc"
-      - name: Check documentation builds
-        run: cargo doc --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
-
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.95.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Per-suite test (failing suite = failing JOB name, visible publicly)
+      run: cargo test -p ${{ matrix.pkg }} ${{ matrix.suite == '--lib' && '--lib' || format('--test {0}',
+        matrix.suite) }} -j 2 --no-fail-fast
+    - name: Check documentation builds
+      run: cargo doc --workspace --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
+    strategy:
+      matrix:
+        include:
+        - pkg: rusty-mq
+          suite: admin_close_lapin
+        - pkg: rusty-mq
+          suite: alarms_lapin
+        - pkg: rusty-mq
+          suite: auth_lapin
+        - pkg: rusty-mq
+          suite: auth_throttle_defs
+        - pkg: rusty-mq
+          suite: bench_reference
+        - pkg: rusty-mq
+          suite: compaction_lapin
+        - pkg: rusty-mq
+          suite: config
+        - pkg: rusty-mq
+          suite: confirms_lapin
+        - pkg: rusty-mq
+          suite: consume_lapin
+        - pkg: rusty-mq
+          suite: definitions_import
+        - pkg: rusty-mq
+          suite: durability_lapin
+        - pkg: rusty-mq
+          suite: failure_safety_lapin
+        - pkg: rusty-mq
+          suite: handshake_lapin
+        - pkg: rusty-mq
+          suite: interop_matrix
+        - pkg: rusty-mq
+          suite: management_http
+        - pkg: rusty-mq
+          suite: migration_inspect
+        - pkg: rusty-mq
+          suite: nowait_raw
+        - pkg: rusty-mq
+          suite: publish_lapin
+        - pkg: rusty-mq
+          suite: request_reply_lapin
+        - pkg: rusty-mq
+          suite: settlement_lapin
+        - pkg: rusty-mq
+          suite: slow_consumer_lapin
+        - pkg: rusty-mq
+          suite: stress_lapin
+        - pkg: rusty-mq
+          suite: tls_lapin
+        - pkg: rusty-mq
+          suite: topology_lapin
+        - pkg: rusty-mq-storage
+          suite: doctor
+        - pkg: rusty-mq-storage
+          suite: fuzz_storage
+        - pkg: rusty-mq-protocol
+          suite: fuzz_frames
+        - pkg: rusty-mq
+          suite: --lib
+        - pkg: rusty-mq-core
+          suite: --lib
+        - pkg: rusty-mq-storage
+          suite: --lib
+        - pkg: rusty-mq-protocol
+          suite: --lib
+        - pkg: rusty-mq-management
+          suite: --lib
+        - pkg: rusty-mq-testkit
+          suite: --lib
+    name: tests ${{ matrix.pkg }} ${{ matrix.suite }}
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      - name: License + advisory + source checks (gate 7)
-        run: |
-          cargo install cargo-deny --locked
-          cargo deny --version
-          cargo deny check licenses advisories bans sources
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.95.0
+    - uses: Swatinem/rust-cache@v2
+    - name: License + advisory + source checks (gate 7)
+      run: 'cargo install cargo-deny --locked
+
+        cargo deny --version
+
+        cargo deny check licenses advisories bans sources
+
+        '
