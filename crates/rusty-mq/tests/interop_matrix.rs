@@ -134,6 +134,46 @@ async fn five_client_matrix_pika_amqplib() {
         }
     }
 
+    // --- T25: request/reply fixtures (exclusive reply queues) ---
+    let pika_rpc = run_fixture(
+        {
+            let mut c = Command::new("python3");
+            c.arg(root.join("tests/interop/python/pika_request_reply.py"));
+            c
+        },
+        &url,
+    );
+    match pika_rpc {
+        FixtureOutcome::Passed(passes) => {
+            assert!(passes.len() >= 3, "pika rpc PASS lines: {passes:?}");
+            assert!(passes
+                .iter()
+                .any(|p| p.contains("correlated request/reply")));
+            assert!(passes.iter().any(|p| p.contains("reply queue lifecycle")));
+        }
+        FixtureOutcome::Skipped(why) => eprintln!("SKIP pika rpc: {why}"),
+        FixtureOutcome::Failed(detail) => panic!("pika rpc fixture failed:\n{detail}"),
+    }
+
+    if resolves {
+        let mut node_rpc = Command::new("node");
+        node_rpc
+            .env("NODE_PATH", &node_modules)
+            .arg(root.join("tests/interop/node/amqplib_request_reply.js"));
+        let amqplib_rpc = run_fixture(node_rpc, &url);
+        match amqplib_rpc {
+            FixtureOutcome::Passed(passes) => {
+                assert!(passes.len() >= 3, "amqplib rpc PASS lines: {passes:?}");
+                assert!(passes
+                    .iter()
+                    .any(|p| p.contains("correlated request/reply")));
+                assert!(passes.iter().any(|p| p.contains("reply queue lifecycle")));
+            }
+            FixtureOutcome::Skipped(why) => eprintln!("SKIP amqplib rpc: {why}"),
+            FixtureOutcome::Failed(detail) => panic!("amqplib rpc fixture failed:\n{detail}"),
+        }
+    }
+
     // The harness itself proves the broker stayed healthy across both
     // client families by opening a lapin connection afterwards.
     let uri = format!("amqp://guest:guest@{addr}/%2F");
