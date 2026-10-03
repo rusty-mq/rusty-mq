@@ -12,6 +12,7 @@ pub mod management_impl;
 pub mod metrics;
 pub mod migration;
 pub mod server;
+pub mod throttle;
 pub mod tls;
 
 pub use broker::Broker;

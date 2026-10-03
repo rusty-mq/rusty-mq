@@ -10,6 +10,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use rusty_mq_core::auth::Role;
 use rusty_mq_core::routing::ExchangeType;
 use rusty_mq_core::topology::{ExchangeRecord, QueueRecord, Topology};
 
@@ -57,12 +58,48 @@ pub fn export(broker: &Broker) -> Value {
             "routing_key": key,
         }));
     }
+    // Users and permission grants: usernames/roles only — credential
+    // material NEVER leaves the broker (§13.1).
+    let (users, permissions) = {
+        let auth = broker.auth.lock().unwrap();
+        let users: Vec<_> = auth
+            .principal_names()
+            .map(|name| {
+                let role = auth.principal(name).map(|p| p.role);
+                json!({
+                    "username": name,
+                    "role": match role {
+                        Some(Role::Ordinary) | None => "ordinary",
+                        Some(Role::Monitor) => "monitor",
+                        Some(Role::Operator) => "operator",
+                        Some(Role::Admin) => "admin",
+                    },
+                })
+            })
+            .collect();
+        let permissions: Vec<_> = auth
+            .all_permissions()
+            .into_iter()
+            .map(|(user, vhost, p)| {
+                json!({
+                    "username": user,
+                    "vhost": vhost,
+                    "configure": p.configure,
+                    "write": p.write,
+                    "read": p.read,
+                })
+            })
+            .collect();
+        (users, permissions)
+    };
     json!({
         "format": "rusty-mq-definitions",
         "version": 1,
         "queues": queues,
         "exchanges": exchanges,
         "bindings": bindings,
+        "users": users,
+        "permissions": permissions,
     })
 }
 
@@ -103,6 +140,31 @@ struct Definitions {
     exchanges: Vec<ExchangeDef>,
     #[serde(default)]
     bindings: Vec<BindingDef>,
+    /// Reference list from exports; roles are NOT applied on import
+    /// (credential creation is a separate admin action).
+    #[serde(default)]
+    users: Vec<UserDef>,
+    #[serde(default)]
+    permissions: Vec<PermissionDef>,
+}
+
+#[derive(Deserialize)]
+struct UserDef {
+    username: String,
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct PermissionDef {
+    username: String,
+    vhost: String,
+    #[serde(default)]
+    configure: String,
+    #[serde(default)]
+    write: String,
+    #[serde(default)]
+    read: String,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +298,13 @@ fn classify_only(broker: &Broker, defs: &Definitions, results: &mut Vec<Resource
     for b in &defs.bindings {
         results.push(ResourceResult {
             resource: format!("binding:{}->{}@{}", b.source, b.destination, b.vhost),
+            outcome: Outcome::Created,
+            detail: "dry run".into(),
+        });
+    }
+    for p in &defs.permissions {
+        results.push(ResourceResult {
+            resource: format!("permission:{}@{}", p.username, p.vhost),
             outcome: Outcome::Created,
             detail: "dry run".into(),
         });
@@ -375,6 +444,23 @@ fn apply(broker: &Broker, defs: &Definitions, results: &mut Vec<ResourceResult>)
         });
     }
 
+    apply_permissions(broker, defs, results);
+
+    // Exported user entries are reference-only (credentials never ride in
+    // definitions); malformed roles are surfaced rather than ignored.
+    for u in &defs.users {
+        if !matches!(
+            u.role.as_str(),
+            "ordinary" | "monitor" | "operator" | "admin" | ""
+        ) {
+            results.push(ResourceResult {
+                resource: format!("user:{}", u.username),
+                outcome: Outcome::Invalid,
+                detail: format!("unknown role '{}'", u.role),
+            });
+        }
+    }
+
     // Bindings (source exchange + destination queue must now exist).
     for b in &defs.bindings {
         let resource = format!("binding:{}->{}@{}", b.source, b.destination, b.vhost);
@@ -412,6 +498,55 @@ fn apply(broker: &Broker, defs: &Definitions, results: &mut Vec<ResourceResult>)
             outcome: outcome.clone(),
             detail: outcome_detail(&outcome),
         });
+    }
+}
+
+fn apply_permissions(broker: &Broker, defs: &Definitions, results: &mut Vec<ResourceResult>) {
+    for p in &defs.permissions {
+        let resource = format!("permission:{}@{}", p.username, p.vhost);
+        // Grants only apply to EXISTING principals: credentials are never
+        // part of definitions (§13.1), so creating the user first is the
+        // operator's explicit step (matches docs/migration.md).
+        let exists = broker.auth.lock().unwrap().principal(&p.username).is_some();
+        if !exists {
+            results.push(ResourceResult {
+                resource,
+                outcome: Outcome::Invalid,
+                detail: "user does not exist; create credentials first (never in definitions)"
+                    .into(),
+            });
+            continue;
+        }
+        for (label, pattern) in [
+            ("configure", &p.configure),
+            ("write", &p.write),
+            ("read", &p.read),
+        ] {
+            if regex::Regex::new(pattern).is_err() {
+                results.push(ResourceResult {
+                    resource: resource.clone(),
+                    outcome: Outcome::Invalid,
+                    detail: format!("invalid {label} regex"),
+                });
+            }
+        }
+        let perms = rusty_mq_core::auth::Permissions {
+            configure: p.configure.clone(),
+            write: p.write.clone(),
+            read: p.read.clone(),
+        };
+        match Broker::set_permissions(broker, &p.username, &p.vhost, perms) {
+            Ok(()) => results.push(ResourceResult {
+                resource,
+                outcome: Outcome::Created,
+                detail: "grants applied".into(),
+            }),
+            Err(e) => results.push(ResourceResult {
+                resource,
+                outcome: Outcome::Invalid,
+                detail: e,
+            }),
+        }
     }
 }
 

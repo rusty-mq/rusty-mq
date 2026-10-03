@@ -141,6 +141,8 @@ pub struct Connection {
     /// Authenticated principal (set at start-ok; empty never — auth is
     /// required before tune).
     username: String,
+    /// Peer address (throttling + logging).
+    peer: String,
     limits: ProtocolLimits,
     negotiated: Option<NegotiatedLimits>,
     phase: Phase,
@@ -164,6 +166,15 @@ impl Connection {
 
         let writer = tokio::spawn(writer_task(write_half, outbound_rx));
 
+        // FR-S05: throttled peers are refused before the handshake burns
+        // Argon2 time. Key on the HOST part — source ports differ per
+        // connection, so the full peer string would never trip the
+        // per-peer window for a reconnecting attacker.
+        let peer_host = peer_host_of(&peer);
+        if broker.auth_throttle.check(&peer_host) == crate::throttle::Decision::Throttled {
+            tracing::warn!(peer = %peer, "connection refused: auth throttle");
+            return;
+        }
         Metrics::inc(&broker.metrics.connections_opened);
         broker.register_connection(crate::broker::LiveConnection {
             id: conn_id,
@@ -179,6 +190,7 @@ impl Connection {
             client_cancel_notify: false,
             client_blocking: false,
             username: String::new(),
+            peer: peer.clone(),
             limits: ProtocolLimits::default(),
             negotiated: None,
             phase: Phase::AwaitStartOk,
@@ -485,6 +497,9 @@ impl Connection {
         let pass = String::from_utf8_lossy(parts[2]).to_string();
         if !self.broker.authenticate(&user, &pass) {
             tracing::warn!(user = %user, "authentication refused");
+            self.broker
+                .auth_throttle
+                .record_failure(&peer_host_of(&self.peer));
             return self
                 .protocol_error(
                     0,
@@ -3316,6 +3331,20 @@ fn channel_id_of(m: &channel::AMQPMethod) -> u16 {
         M::FlowOk(x) => x.get_amqp_method_id(),
         M::Close(x) => x.get_amqp_method_id(),
         M::CloseOk(x) => x.get_amqp_method_id(),
+    }
+}
+
+/// Host portion of a peer address (strip the port; also handles IPv6
+/// "[::1]:p" forms).
+fn peer_host_of(peer: &str) -> String {
+    if let Some(rest) = peer.strip_prefix('[') {
+        // IPv6 literal: [host]:port
+        rest.split(']').next().unwrap_or(rest).to_string()
+    } else {
+        match peer.rsplit_once(':') {
+            Some((host, _)) => host.to_string(),
+            None => peer.to_string(),
+        }
     }
 }
 

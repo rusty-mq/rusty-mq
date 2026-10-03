@@ -202,6 +202,8 @@ pub struct Broker {
     pub auth: Mutex<AuthState>,
     /// Process metrics (§12.2): bounded-cardinality counters.
     pub metrics: Metrics,
+    /// Auth-failure throttle (FR-S05).
+    pub auth_throttle: crate::throttle::AuthThrottle,
     /// Resource alarms (§10) + connection registry for notifications.
     pub alarms: Mutex<Alarms>,
     pub live_connections: Mutex<Vec<LiveConnection>>,
@@ -245,6 +247,11 @@ impl Broker {
                 password,
             },
             metrics: Metrics::default(),
+            auth_throttle: crate::throttle::AuthThrottle::new(
+                std::time::Duration::from_secs(10),
+                10,
+                100,
+            ),
             alarms: Mutex::new(Alarms::default()),
             live_connections: Mutex::new(Vec::new()),
             connection_seq: AtomicU64::new(1),
@@ -429,6 +436,11 @@ impl Broker {
                 password,
             },
             metrics: Metrics::default(),
+            auth_throttle: crate::throttle::AuthThrottle::new(
+                std::time::Duration::from_secs(10),
+                10,
+                100,
+            ),
             alarms: Mutex::new(Alarms::default()),
             live_connections: Mutex::new(Vec::new()),
             connection_seq: AtomicU64::new(1),
