@@ -184,7 +184,7 @@ impl Connection {
             // §10 max_connections exhausted: refuse (never silent
             // acceptance) with a connection-scoped 506.
             tracing::warn!(peer = %peer, "connection refused: max_connections reached");
-            let mut conn = Self {
+            let conn = Self {
                 broker,
                 conn_id,
                 vhost: None,
