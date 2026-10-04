@@ -79,10 +79,17 @@ pub fn write_snapshot(
         buf.extend_from_slice(&crc32(&crc_input).to_le_bytes());
         buf.extend_from_slice(&payload);
     }
-    let mut file = File::create(&path).map_err(io_err)?;
+    // Atomic publication (§9.9): write+fsync a temp file, then rename —
+    // a concurrent reader (or a crash mid-write) sees either the old
+    // complete snapshot or the new one, never a truncation. Found by a
+    // rare durability-test flake ("failed to fill whole buffer": a
+    // background compaction truncating state.bin while recovery read it).
+    let tmp = snap_dir.join("state.bin.tmp");
+    let mut file = File::create(&tmp).map_err(io_err)?;
     file.write_all(&buf).map_err(io_err)?;
     file.sync_all().map_err(io_err)?;
-    // Sync the snapshot directory so the file is durably linked.
+    fs::rename(&tmp, &path).map_err(io_err)?;
+    // Sync the snapshot directory so the rename is durably linked.
     File::open(&snap_dir)
         .and_then(|d| d.sync_all())
         .map_err(io_err)?;

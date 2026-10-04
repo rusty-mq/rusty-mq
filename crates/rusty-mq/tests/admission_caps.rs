@@ -13,13 +13,14 @@ use lapin::{
 
 async fn broker_with(limits: &str) -> (Arc<rusty_mq::Broker>, std::net::SocketAddr) {
     let cfg = rusty_mq::config::load_str(limits).expect("test config");
+    // Atomic counter: two tests starting in the same clock tick would
+    // otherwise share a data dir and collide on the redb lock (the
+    // third instance of the dir-collision class).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "rmq-caps-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let broker = Arc::new(rusty_mq::Broker::open_persistent_from_config(
         "guest".into(),

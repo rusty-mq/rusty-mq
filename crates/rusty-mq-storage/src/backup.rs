@@ -32,8 +32,11 @@ fn copy_dir_excluding_lock(from: &Path, to: &Path) -> Result<(), FormatError> {
     fs::create_dir_all(to).map_err(io_err)?;
     for entry in fs::read_dir(from).map_err(io_err)? {
         let entry = entry.map_err(io_err)?;
-        if entry.file_name() == "LOCK" || entry.file_name() == "MANIFEST.tmp" {
-            continue;
+        if entry.file_name() == "LOCK"
+            || entry.file_name() == "MANIFEST.tmp"
+            || entry.file_name() == "state.bin.tmp"
+        {
+            continue; // session/transient state, never part of the chain
         }
         let target = to.join(entry.file_name());
         if entry.file_type().map_err(io_err)?.is_dir() {

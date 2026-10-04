@@ -120,6 +120,12 @@ impl RawSession {
 }
 
 async fn handshake(addr: std::net::SocketAddr) -> RawSession {
+    handshake_with_heartbeat(addr, 0).await
+}
+
+/// Handshake negotiating `hb` as the client heartbeat (tune-ok value;
+/// the server applies min(client, server)).
+async fn handshake_with_heartbeat(addr: std::net::SocketAddr, hb: u16) -> RawSession {
     use tokio::io::AsyncWriteExt;
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     sock.write_all(&PROTOCOL_HEADER_0_9_1).await.unwrap();
@@ -160,7 +166,7 @@ async fn handshake(addr: std::net::SocketAddr) -> RawSession {
                         AMQPClass::Connection(conn7::AMQPMethod::TuneOk(conn7::TuneOk {
                             channel_max: t.channel_max,
                             frame_max: t.frame_max,
-                            heartbeat: t.heartbeat,
+                            heartbeat: hb,
                         })),
                     ))
                     .await;
@@ -185,6 +191,32 @@ async fn handshake(addr: std::net::SocketAddr) -> RawSession {
                 return session;
             }
             other => panic!("unexpected frame during handshake: {other:?}"),
+        }
+    }
+}
+
+/// T19 half-open peer: a client that negotiates heartbeats and then goes
+/// silent is detected and dropped within the idle window (2x heartbeat).
+#[tokio::test(flavor = "multi_thread")]
+async fn silent_peer_is_dropped_within_heartbeat_window() {
+    let addr = start_broker().await;
+    let mut s = handshake_with_heartbeat(addr, 2).await;
+
+    // Fully silent from here (no heartbeats, no methods). The server's
+    // idle window is 2 x 2s = 4s; assert the socket dies well inside 15s.
+    let mut sock = std::mem::replace(
+        &mut s.sock,
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut buf = [0u8; 64];
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "peer never dropped");
+        match tokio::time::timeout(Duration::from_secs(1), sock.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // EOF: server closed the connection
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
         }
     }
 }
