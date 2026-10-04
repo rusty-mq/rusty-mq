@@ -775,3 +775,42 @@ async fn negotiated_frame_max_is_enforced_inbound() {
         Err(_) => panic!("oversized frame silently accepted (no close)"),
     }
 }
+
+/// §4.2.7: the server beats PROACTIVELY during quiet periods — a peer
+/// with liveness detection must see type-8 frames at the negotiated
+/// interval without sending anything itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_beats_proactively_while_idle() {
+    let addr = start_broker().await;
+    let mut s = handshake_with_heartbeat(addr, 2).await;
+
+    // Read raw bytes: within ~4s the server must send a type-8 frame.
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(4), s.sock.read(&mut buf))
+        .await
+        .expect("beat within window")
+        .expect("socket");
+    assert!(n > 0, "EOF before a heartbeat arrived");
+    assert_eq!(
+        buf[0], 8,
+        "expected a type-8 heartbeat frame, got type {}",
+        buf[0]
+    );
+
+    // What happens next is contract, not race: the server keeps beating
+    // at the interval BUT ALSO drops a fully silent peer at 2x hb — the
+    // second beat (t=2hb) and the drop race. Accept either a second
+    // type-8 beat or the drop; both prove the liveness machinery runs.
+    let n = tokio::time::timeout(Duration::from_secs(6), s.sock.read(&mut buf))
+        .await
+        .expect("activity within window")
+        .unwrap_or(0); // EOF reads as Ok(0)
+    if n > 0 {
+        assert_eq!(
+            buf[0], 8,
+            "only beats or the drop may arrive, got type {}",
+            buf[0]
+        );
+    }
+}

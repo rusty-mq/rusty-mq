@@ -280,6 +280,11 @@ impl Connection {
         // FR-P04: once tune-ok lands, the reader adopts the NEGOTIATED
         // frame_max (the pre-handshake cap is the server default only).
         let mut negotiated_applied = false;
+        // Last outbound-beat (or traffic) instant; heartbeats fill gaps.
+        let mut last_beat = tokio::time::Instant::now();
+        // Last INBOUND bytes: the idle-drop anchor (not reset by beats
+        // or jobs — only real peer traffic resets it).
+        let mut last_inbound = tokio::time::Instant::now();
         let mut buf = vec![0u8; READ_CHUNK];
 
         // Protocol header: read until one complete frame header is buffered.
@@ -358,10 +363,24 @@ impl Connection {
                 }
             }
             // Socket reads and consumer jobs run concurrently; the idle
-            // deadline applies to the socket side (heartbeats).
+            // deadline applies to the socket side (heartbeats) and is
+            // ABSOLUTE (anchored to the last inbound bytes) — a fresh
+            // timeout per select iteration would let frequent outbound
+            // beats restart the inbound clock forever.
             let idle = self.idle_timeout(handshake_deadline);
+            let idle_at = last_inbound + idle;
+            // Proactive heartbeats (§4.2.7): while traffic is quiet, the
+            // server beats at the negotiated interval so peer liveness
+            // detectors never see a dead broker (any frame counts as a
+            // beat; these fill the gaps).
+            let hb_interval = self
+                .negotiated
+                .as_ref()
+                .map(|n| n.heartbeat_seconds)
+                .filter(|h| *h > 0 && self.phase == Phase::Running)
+                .map(|h| Duration::from_secs(h as u64));
             tokio::select! {
-                read = tokio::time::timeout(idle, read.read(&mut buf)) => {
+                read = tokio::time::timeout_at(idle_at, read.read(&mut buf)) => {
                     let n = match read {
                         Ok(Ok(n)) => n,
                         Ok(Err(_)) => break,
@@ -377,6 +396,21 @@ impl Connection {
                         tracing::warn!("reader budget exceeded");
                         break;
                     }
+                    last_beat = tokio::time::Instant::now();
+                    last_inbound = tokio::time::Instant::now();
+                }
+                _ = async {
+                    match hb_interval {
+                        Some(interval) => {
+                            tokio::time::sleep_until(last_beat + interval).await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if self.send(AMQPFrame::Heartbeat(0)).await.is_err() {
+                        break;
+                    }
+                    last_beat = tokio::time::Instant::now();
                 }
                 job = mailbox.recv() => {
                     if let Some(job) = job {
