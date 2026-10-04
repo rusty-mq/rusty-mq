@@ -35,6 +35,7 @@ fn copy_dir_excluding_lock(from: &Path, to: &Path) -> Result<(), FormatError> {
         if entry.file_name() == "LOCK"
             || entry.file_name() == "MANIFEST.tmp"
             || entry.file_name() == "state.bin.tmp"
+            || entry.file_name().to_string_lossy().ends_with(".log.tmp")
         {
             continue; // session/transient state, never part of the chain
         }

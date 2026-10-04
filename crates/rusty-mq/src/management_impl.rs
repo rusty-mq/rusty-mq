@@ -114,6 +114,15 @@ impl BrokerHandle for Broker {
             .collect()
     }
 
+    fn check_configure(&self, user: &str, vhost: &str, resource: &str) -> bool {
+        self.auth.lock().unwrap().check(
+            user,
+            vhost,
+            rusty_mq_core::auth::Access::Configure,
+            resource,
+        )
+    }
+
     fn delete_exchange(&self, vhost: &str, exchange: &str) -> Result<(), String> {
         Broker::mgmt_delete_exchange(self, vhost, exchange)
     }

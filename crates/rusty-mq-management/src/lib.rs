@@ -32,6 +32,7 @@ pub mod broker_facade;
 pub enum MinRole {
     None,
     Monitor,
+    Operator,
     Admin,
 }
 
@@ -224,19 +225,96 @@ fn require_role<B: crate::broker_facade::BrokerHandle>(
     headers: &HeaderMap,
     min: MinRole,
 ) -> Result<(), Response> {
+    require_role_user(broker, headers, min).map(|_| ())
+}
+
+/// Role check that also returns the authenticated username (for the
+/// §11.2 per-resource permission checks on mutations).
+#[allow(clippy::result_large_err)] // Response is the natural error unit
+fn require_role_user<B: crate::broker_facade::BrokerHandle>(
+    broker: &B,
+    headers: &HeaderMap,
+    min: MinRole,
+) -> Result<String, Response> {
     let role = authenticate(broker, headers)?;
+    let user = username_of(broker, headers)?;
     let ok = match min {
         MinRole::None => true,
         MinRole::Monitor => role >= Role::Monitor,
+        MinRole::Operator => role >= Role::Operator,
         MinRole::Admin => role >= Role::Admin,
     };
     if ok {
-        Ok(())
+        Ok(user)
     } else {
         Err(status(
             StatusCode::FORBIDDEN,
             "forbidden",
             "insufficient role for this operation",
+        ))
+    }
+}
+
+#[allow(clippy::result_large_err)] // Response is the natural error unit
+fn username_of<B: crate::broker_facade::BrokerHandle>(
+    broker: &B,
+    headers: &HeaderMap,
+) -> Result<String, Response> {
+    let _ = broker;
+    let raw = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .ok_or_else(|| {
+            status(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Basic authorization required",
+            )
+        })?;
+    let decoded = base64_decode(raw).ok_or_else(|| {
+        status(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "malformed Basic credentials",
+        )
+    })?;
+    let decoded = String::from_utf8(decoded).map_err(|_| {
+        status(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "credentials not UTF-8",
+        )
+    })?;
+    decoded
+        .split_once(':')
+        .map(|(u, _)| u.to_string())
+        .ok_or_else(|| {
+            status(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "malformed Basic credentials",
+            )
+        })
+}
+
+/// §11.2 on the management plane: the caller's CONFIGURE regex must
+/// match the resource name (PRD rows say "Operator + configure").
+#[allow(clippy::result_large_err)]
+fn require_configure<B: crate::broker_facade::BrokerHandle>(
+    broker: &B,
+    headers: &HeaderMap,
+    vhost: &str,
+    resource: &str,
+) -> Result<(), Response> {
+    let user = require_role_user(broker, headers, MinRole::Operator)?;
+    if broker.check_configure(&user, vhost, resource) {
+        Ok(())
+    } else {
+        Err(status(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            format!("configure permission denied for {resource:?} in {vhost:?}"),
         ))
     }
 }
@@ -408,7 +486,7 @@ async fn purge_queue<B: crate::broker_facade::BrokerHandle>(
     Path((vhost, queue)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+    if let Err(e) = require_configure(broker.as_ref(), &headers, &vhost, &queue) {
         return e;
     }
     match broker.purge_queue(&vhost, &queue) {
@@ -422,7 +500,7 @@ async fn delete_queue<B: crate::broker_facade::BrokerHandle>(
     Path((vhost, queue)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+    if let Err(e) = require_configure(broker.as_ref(), &headers, &vhost, &queue) {
         return e;
     }
     match broker.delete_queue(&vhost, &queue) {
@@ -846,7 +924,7 @@ async fn delete_exchange_ep<B: crate::broker_facade::BrokerHandle>(
     Path((vhost, exchange)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+    if let Err(e) = require_configure(broker.as_ref(), &headers, &vhost, &exchange) {
         return e;
     }
     match broker.delete_exchange(&vhost, &exchange) {
@@ -862,7 +940,10 @@ async fn delete_binding_ep<B: crate::broker_facade::BrokerHandle>(
     Path((vhost, binding)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+    // §11.2: the configure regex gates the exchange (the binding's
+    // owning resource).
+    let exchange = binding.split('|').next().unwrap_or("");
+    if let Err(e) = require_configure(broker.as_ref(), &headers, &vhost, exchange) {
         return e;
     }
     match broker.delete_binding(&vhost, &binding) {

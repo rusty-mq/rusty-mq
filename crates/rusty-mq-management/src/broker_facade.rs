@@ -22,6 +22,8 @@ pub trait BrokerHandle: Send + Sync + 'static {
     fn list_bindings(&self, vhost: &str) -> Vec<serde_json::Value>;
     fn list_exchanges(&self, vhost: &str) -> Vec<serde_json::Value>;
     fn delete_exchange(&self, vhost: &str, exchange: &str) -> Result<(), String>;
+    /// §11.2 on the management plane: the caller's configure regex.
+    fn check_configure(&self, user: &str, vhost: &str, resource: &str) -> bool;
     fn delete_binding(&self, vhost: &str, composite: &str) -> Result<(), String>;
     fn purge_queue(&self, vhost: &str, queue: &str) -> Result<u64, TopologyError>;
     fn delete_queue(&self, vhost: &str, queue: &str) -> Result<(), TopologyError>;
@@ -91,6 +93,9 @@ impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
     }
     fn delete_exchange(&self, vhost: &str, exchange: &str) -> Result<(), String> {
         (**self).delete_exchange(vhost, exchange)
+    }
+    fn check_configure(&self, user: &str, vhost: &str, resource: &str) -> bool {
+        (**self).check_configure(user, vhost, resource)
     }
     fn delete_binding(&self, vhost: &str, composite: &str) -> Result<(), String> {
         (**self).delete_binding(vhost, composite)

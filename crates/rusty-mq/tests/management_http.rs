@@ -1080,3 +1080,112 @@ async fn exchange_and_binding_deletes_enforce_checks_and_durable() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn management_mutations_enforce_configure_regex() {
+    // §11.2 on the management plane: a Monitor-role user whose configure
+    // regex does NOT match the resource is refused (403) even though
+    // role alone would pass the old Admin-only gate... and an Operator
+    // with a matching regex succeeds.
+    use rusty_mq::BrokerHandle as _;
+    use std::sync::Arc;
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &std::env::temp_dir().join(format!(
+            "rmq-cfgreg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+    ));
+    // app user: Operator role; configure regex matches only "allowed.*".
+    broker
+        .create_user("app", "app-pass", rusty_mq::Role::Operator)
+        .unwrap();
+    broker
+        .set_permissions(
+            "app",
+            "/",
+            rusty_mq_core::auth::Permissions {
+                configure: "^allowed\\..*".into(),
+                write: ".*".into(),
+                read: ".*".into(),
+            },
+        )
+        .unwrap();
+    // Two queues via AMQP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    for q in ["allowed.q", "denied.q"] {
+        ch.queue_declare(
+            q.into(),
+            lapin::options::QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let _ = conn.close(200, "bye".into()).await;
+
+    let app = rusty_mq_management::router(broker.clone());
+    // Operator + matching regex: allowed.q deletes.
+    let (s, _, b) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/queues/allowed.q",
+        Some(("app", "app-pass")),
+        None,
+    )
+    .await;
+    assert_eq!(s, 204, "matching regex: {s} {b}");
+    // Operator + NON-matching regex: denied.q refuses 403 naming configure.
+    let (s, _, b) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/queues/denied.q",
+        Some(("app", "app-pass")),
+        None,
+    )
+    .await;
+    assert_eq!(s, 403, "regex mismatch: {s} {b}");
+    assert!(b.to_string().contains("configure"), "reason: {b}");
+    // A role below Operator is refused regardless of regex (Monitor).
+    broker
+        .create_user("mon", "mon-pass", rusty_mq::Role::Monitor)
+        .unwrap();
+    broker
+        .set_permissions(
+            "mon",
+            "/",
+            rusty_mq_core::auth::Permissions {
+                configure: ".*".into(),
+                write: ".*".into(),
+                read: ".*".into(),
+            },
+        )
+        .unwrap();
+    let (s, _, b) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/queues/denied.q",
+        Some(("mon", "mon-pass")),
+        None,
+    )
+    .await;
+    assert_eq!(s, 403, "role floor: {s} {b}");
+}

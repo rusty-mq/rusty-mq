@@ -591,11 +591,18 @@ fn roll_segment(dir: &Path, st: &mut GroupState, file: &Mutex<File>) -> Result<(
     let next = st.segment_id + 1;
     let previous = st.segment_id;
     let path = dir.join(segment_file_name(next));
-    let mut new_file = File::create(&path).map_err(io_err)?;
+    // Atomic appearance: a concurrent compaction's reclaim scans the
+    // directory and reads segment headers; a File::create→write window
+    // exposes a 0-byte segment whose header read_exact fails ("failed to
+    // fill whole buffer" — found by the durability suite under load).
+    // Write+fsync under a temp name, then rename (atomic on POSIX).
+    let tmp = dir.join(format!("{next:020}.log.tmp"));
+    let mut new_file = File::create(&tmp).map_err(io_err)?;
     new_file
         .write_all(&segment_header_bytes(next, previous))
         .map_err(io_err)?;
     new_file.sync_all().map_err(io_err)?;
+    fs::rename(&tmp, &path).map_err(io_err)?;
     sync_dir(dir)?;
     let appended = OpenOptions::new()
         .append(true)
