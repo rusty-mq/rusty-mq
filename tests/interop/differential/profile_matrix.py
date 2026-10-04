@@ -179,6 +179,21 @@ def _noop(_ch):
 case("wrong_vhost", "connection_error", 403, _noop, url_vhost="/does-not-exist")
 
 
+def _reopen_channel(conn_holder):
+    # Re-open an already-open channel number: pika's BlockingChannel keeps
+    # its channel number; issuing channel.open raw on the same number is
+    # an unexpected frame sequence. pika cannot express it (its API never
+    # re-opens), so this case needs a raw AMQP peer — implemented in the
+    # Rust harness instead (reopening_an_open_channel_is_505). Recorded
+    # here as N/A: pika cannot send it.
+    raise NotImplementedError("raw-frame only")
+
+
+# Frozen profile: unexpected frame sequence -> 505 (connection scope);
+# pika cannot express the input — covered by the Rust frame-level test.
+case("channel_reopen", "na", None, _reopen_channel)
+
+
 def _safe_close(conn):
     try:
         conn.close()
@@ -189,6 +204,14 @@ def _safe_close(conn):
 def run_all(url):
     results = []
     for name, expect_kind, expect_code, fn, url_vhost in CASES:
+        if expect_kind == "na":
+            results.append({
+                "case": name, "outcome": "not_expressible",
+                "reply_code": None, "reply_text": "client API cannot send this input",
+                "frozen_expect": None, "url_vhost": None,
+            })
+            print(f"{name}: not expressible via this client")
+            continue
         case_url = url if url_vhost is None else url.rsplit("/", 1)[0] + url_vhost
         # Fresh connection per case: channel errors kill the channel and
         # some cases may close the connection (or refuse it at open).
@@ -275,7 +298,8 @@ def main():
     if expect:
         mismatches = [
             r for r in results
-            if (r["frozen_expect"] is None and r["outcome"] != "ok")
+            if r["outcome"] != "not_expressible"
+            and (r["frozen_expect"] is None and r["outcome"] != "ok")
             or (r["frozen_expect"] is not None and (
                 r["outcome"] != r["frozen_expect"].split(":")[0]
                 or (r["reply_code"] is not None

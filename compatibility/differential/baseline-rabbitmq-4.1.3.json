@@ -136,6 +136,14 @@
    "reply_text": "ConnectionClosedByBroker: (530) 'NOT_ALLOWED - vhost does-not-exist not found'",
    "frozen_expect": "connection_error:403",
    "url_vhost": "/does-not-exist"
+  },
+  {
+   "case": "channel_reopen",
+   "outcome": "not_expressible",
+   "reply_code": null,
+   "reply_text": "client API cannot send this input",
+   "frozen_expect": null,
+   "url_vhost": null
   }
  ]
 }
