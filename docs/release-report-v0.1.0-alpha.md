@@ -44,12 +44,26 @@ clean at commit `58020a2`).
 - V1 queue-profile restrictions; strict unknown-argument rejection;
   channel.flow as a documented no-op; shared transient queues off by
   default — all in compatibility/features.yaml with exact rejections.
+- Differential divergences from the pinned RabbitMQ 4.1.3 baseline,
+  byte-recorded in compatibility/differential/ (the matrix runs with
+  assertions in CI on every push):
+  - wrong-vhost close: we send 403 ACCESS_REFUSED, baseline 530
+    NOT_ALLOWED (same scope — connection; both fatal at open)
+  - queue.delete of a missing queue: we 404, baseline treats it as
+    idempotent success
+  - §10 count budgets and prefetch_size: channel-scoped 506/540 vs
+    the baseline's connection-fatal 540
+  - no server protocol-header echo: IDENTICAL to the baseline
+    (byte-probed; the raw spec text disagrees with the reference
+    implementation and we follow the implementation — as with the
+    field-table dialect)
 
 ## Recommendation
 
 Treat v0.1.0-alpha as a **developer/evaluation prerelease**: memory-backed
-operation is fully usable; persistent operation is implemented and
-fault-tested but awaits the maintainer storage review (gate 9), the
-24-hour soak (gate 6), and a clean tagged CI build (gate 7) before any
-production claim. The five-client interop matrix (gate 2) passes with
-local evidence; its CI job's first run rides along with gate 7.
+operation is fully usable; persistent operation is implemented,
+fault-tested, and 24-hour-soak-proven (gate 6 passed: 35,187 churn
+cycles, journal 32 bytes at all 70 checkpoints). Remaining before any
+production claim: the maintainer storage review (gate 9) and a clean
+tagged CI build (gate 7). The five-client interop matrix and frozen-
+profile conformance run in CI on every push.
