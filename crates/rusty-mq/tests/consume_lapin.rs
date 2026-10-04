@@ -626,3 +626,49 @@ async fn qos_changes_and_zero_apply_to_active_rules() {
 
     let _ = conn.close(200, "bye".into()).await;
 }
+
+/// FR-Q01's counters at the integration level: declare-ok carries REAL
+/// ready and consumer counts (not zeros) — publish then re-declare sees
+/// the ready count; a consumer then bumps consumer_count.
+#[tokio::test(flavor = "multi_thread")]
+async fn declare_ok_reports_real_message_and_consumer_counts() {
+    let addr = start_broker().await;
+    let conn = connect(addr).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare("counts.q".into(), durable_queue(), FieldTable::default())
+        .await
+        .unwrap();
+    for i in 0..3u8 {
+        publish(&ch, "counts.q", &[i]).await;
+    }
+
+    // Redeclare: message_count reflects the three ready entries.
+    let q = ch
+        .queue_declare("counts.q".into(), durable_queue(), FieldTable::default())
+        .await
+        .unwrap();
+    assert_eq!(q.message_count(), 3, "ready messages counted");
+
+    // A push consumer bumps consumer_count on the next redeclare.
+    let mut consumer = ch
+        .basic_consume(
+            "counts.q".into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    // Drain the three so the ready count clears.
+    for _ in 0..3 {
+        let d = next_delivery(&mut consumer).await;
+        d.acker.ack(BasicAckOptions::default()).await.unwrap();
+    }
+    let q2 = ch
+        .queue_declare("counts.q".into(), durable_queue(), FieldTable::default())
+        .await
+        .unwrap();
+    assert_eq!(q2.consumer_count(), 1, "live consumer counted");
+    assert_eq!(q2.message_count(), 0, "acked entries cleared the count");
+    let _ = conn.close(200, "bye".into()).await;
+}

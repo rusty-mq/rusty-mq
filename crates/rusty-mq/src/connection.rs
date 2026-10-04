@@ -1542,16 +1542,21 @@ impl Connection {
                     // otherwise (FR-P08, spec guidance).
                     return true;
                 }
-                let ready = {
+                let (ready, consumers) = {
                     let topo = self.broker.topology.lock().unwrap();
                     topo.find_queue(vhost, &name)
-                        .map(|id| self.broker.store.lock().unwrap().len(id))
-                        .unwrap_or(0)
+                        .map(|id| {
+                            (
+                                self.broker.store.lock().unwrap().len(id),
+                                self.broker.consumers.lock().unwrap().consumer_count(id),
+                            )
+                        })
+                        .unwrap_or((0, 0))
                 };
                 let ok = queue::AMQPMethod::DeclareOk(queue::DeclareOk {
                     queue: name.into(),
                     message_count: ready as u32,
-                    consumer_count: 0,
+                    consumer_count: consumers as u32,
                 });
                 self.send(AMQPFrame::Method(channel_id, AMQPClass::Queue(ok)))
                     .await

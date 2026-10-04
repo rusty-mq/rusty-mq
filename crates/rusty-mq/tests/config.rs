@@ -29,6 +29,10 @@ fn with_env(vars: &[(&str, &str)], f: impl FnOnce()) {
 
 #[test]
 fn prd_example_parses_verbatim() {
+    // load_file READS process-global env overrides; the env-mutating
+    // tests in this suite poison RUSTY_MQ__* concurrently — serialize
+    // (fifth instance of the shared-state race class).
+    let _guard = ENV_LOCK.lock().unwrap();
     let path = repo_root().join("deploy/config.example.toml");
     let cfg = rusty_mq::config::load_file(&path).expect("PRD §13.2 example must parse + validate");
     assert_eq!(cfg.amqp.frame_max_bytes, 131_072);

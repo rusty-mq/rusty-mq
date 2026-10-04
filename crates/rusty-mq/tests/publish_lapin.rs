@@ -613,3 +613,70 @@ async fn mandatory_return_frame_level() {
     assert!(channel_opened, "channel must open");
     assert!(got_return, "server must return the mandatory message");
 }
+
+/// FR-M04 at the integration level: a supplied user_id property must
+/// match the authenticated principal — mismatch closes the channel with
+/// 403 (frozen publish-gate table); a matching user_id flows normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn user_id_property_gates_on_principal() {
+    let addr = start_broker().await;
+    let conn = connect(addr).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare(
+        "uid.q".into(),
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+
+    // Matching principal: publishes and round-trips the property.
+    ch.basic_publish(
+        "".into(),
+        "uid.q".into(),
+        BasicPublishOptions::default(),
+        b"ok",
+        BasicProperties::default().with_user_id("guest".into()),
+    )
+    .await
+    .unwrap();
+    let got = ch
+        .basic_get(
+            "uid.q".into(),
+            lapin::options::BasicGetOptions { no_ack: true },
+        )
+        .await
+        .unwrap()
+        .expect("matching user_id publish routed");
+    let uid = got.properties.user_id().clone();
+    assert_eq!(uid, Some("guest".into()));
+
+    // Mismatched principal: the channel closes 403 (publish errors are
+    // async — probe with a follow-up op).
+    let _ = ch
+        .basic_publish(
+            "".into(),
+            "uid.q".into(),
+            BasicPublishOptions::default(),
+            b"bad",
+            BasicProperties::default().with_user_id("somebody-else".into()),
+        )
+        .await;
+    let err = ch
+        .queue_declare(
+            "uid.probe".into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect_err("user_id mismatch must close the channel");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("access") && msg.contains("refus"),
+        "expected ACCESS_REFUSED, got: {err}"
+    );
+    let _ = conn.close(200, "bye".into()).await;
+}
