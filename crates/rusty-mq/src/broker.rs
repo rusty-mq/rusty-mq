@@ -370,6 +370,84 @@ impl Broker {
         Ok(())
     }
 
+    /// Management-plane exchange delete (§12.1): journal + live removal,
+    /// refusing while bindings still reference the exchange (the topology
+    /// layer's in-use check surfaces as a 409).
+    pub fn mgmt_delete_exchange(&self, vhost: &str, exchange: &str) -> Result<(), String> {
+        let record = {
+            let topo = self.topology.lock().unwrap();
+            let Some(id) = topo.find_vhost(vhost) else {
+                return Err(format!("vhost {vhost:?} not found"));
+            };
+            let Some(ex_id) = topo.find_exchange(id, exchange) else {
+                return Err(format!("exchange {exchange:?} not found"));
+            };
+            if exchange.is_empty() {
+                return Err("the default exchange cannot be deleted".into());
+            }
+            if exchange.starts_with("amq.") {
+                return Err(format!("built-in exchange {exchange:?} cannot be deleted"));
+            }
+            if topo.binding_count(id, ex_id) > 0 {
+                return Err(format!(
+                    "exchange {exchange:?} still has bindings; remove them first"
+                ));
+            }
+            rusty_mq_storage::Record::ExchangeDelete { id: ex_id.to_raw() }
+        };
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        let topo = &mut self.topology.lock().unwrap();
+        let id = topo.find_vhost(vhost).expect("checked above");
+        topo.delete_exchange(id, exchange)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Management-plane binding delete (§12.1): the composite id from the
+    /// listing (source|destination|key). Journal + live removal.
+    pub fn mgmt_delete_binding(&self, vhost: &str, composite: &str) -> Result<(), String> {
+        let Some((exchange, queue, key)) = composite.split_once('|').and_then(|(ex, rest)| {
+            rest.rsplit_once('|')
+                .map(|(q, k)| (ex.to_string(), q.to_string(), k.to_string()))
+        }) else {
+            return Err("invalid binding id (expected source|destination|key)".into());
+        };
+        let record = {
+            let topo = self.topology.lock().unwrap();
+            let Some(id) = topo.find_vhost(vhost) else {
+                return Err(format!("vhost {vhost:?} not found"));
+            };
+            let Some(ex_id) = topo.find_exchange(id, &exchange) else {
+                return Err(format!("exchange {exchange:?} not found"));
+            };
+            let Some(q_id) = topo.find_queue(id, &queue) else {
+                return Err(format!("queue {queue:?} not found"));
+            };
+            if !topo.binding_exists(id, ex_id, q_id, &key) {
+                return Err(format!("binding {composite:?} not found"));
+            }
+            rusty_mq_storage::Record::Unbind(rusty_mq_storage::Binding {
+                exchange: ex_id.to_raw(),
+                queue: q_id.to_raw(),
+                routing_key: key,
+            })
+        };
+        let (ex_id, q_id, key) = match &record {
+            rusty_mq_storage::Record::Unbind(b) => (
+                rusty_mq_core::ExchangeId::from_raw(b.exchange),
+                rusty_mq_core::QueueId::from_raw(b.queue),
+                b.routing_key.clone(),
+            ),
+            _ => unreachable!("constructed as Unbind above"),
+        };
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        let topo = &mut self.topology.lock().unwrap();
+        let id = topo.find_vhost(vhost).expect("checked above");
+        topo.unbind(id, ex_id, q_id, &key)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// Journaled vhost deletion (§12.1 DELETE, explicit destructive
     /// checks): the default vhost "/" is never deletable; a vhost with
     /// any queue (beyond nothing) or non-builtin exchange refuses —

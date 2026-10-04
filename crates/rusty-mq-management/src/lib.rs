@@ -134,6 +134,14 @@ pub fn router_with_limit<B: crate::broker_facade::BrokerHandle>(
         .route("/v1/vhosts/{vhost}", delete(delete_vhost))
         .route("/v1/vhosts/{vhost}/queues", get(list_queues))
         .route("/v1/vhosts/{vhost}/bindings", get(list_bindings_ep))
+        .route(
+            "/v1/vhosts/{vhost}/bindings/{binding}",
+            delete(delete_binding_ep),
+        )
+        .route(
+            "/v1/vhosts/{vhost}/exchanges/{exchange}",
+            delete(delete_exchange_ep),
+        )
         .route("/v1/vhosts/{vhost}/exchanges", get(list_exchanges_ep))
         .route("/v1/vhosts/{vhost}/queues/{queue}/purge", post(purge_queue))
         .route("/v1/vhosts/{vhost}/queues/{queue}", delete(delete_queue))
@@ -829,4 +837,36 @@ async fn list_exchanges_ep<B: crate::broker_facade::BrokerHandle>(
         resp.headers_mut().insert(k, v.parse().unwrap());
     }
     resp
+}
+
+/// §12.1 DELETE /v1/vhosts/{v}/exchanges/{name}: Admin; destructive
+/// checks (default + amq.* refuse; bindings present refuses).
+async fn delete_exchange_ep<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    Path((vhost, exchange)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+        return e;
+    }
+    match broker.delete_exchange(&vhost, &exchange) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => status(StatusCode::CONFLICT, "conflict", e.as_str()),
+    }
+}
+
+/// §12.1 DELETE /v1/vhosts/{v}/bindings/{composite}: Admin; the id from
+/// the listing (source|destination|key).
+async fn delete_binding_ep<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    Path((vhost, binding)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
+        return e;
+    }
+    match broker.delete_binding(&vhost, &binding) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => status(StatusCode::CONFLICT, "conflict", e.as_str()),
+    }
 }

@@ -114,6 +114,14 @@ impl BrokerHandle for Broker {
             .collect()
     }
 
+    fn delete_exchange(&self, vhost: &str, exchange: &str) -> Result<(), String> {
+        Broker::mgmt_delete_exchange(self, vhost, exchange)
+    }
+
+    fn delete_binding(&self, vhost: &str, composite: &str) -> Result<(), String> {
+        Broker::mgmt_delete_binding(self, vhost, composite)
+    }
+
     fn list_bindings(&self, vhost: &str) -> Vec<serde_json::Value> {
         let topo = self.topology.lock().unwrap();
         let Some(id) = topo.find_vhost(vhost) else {

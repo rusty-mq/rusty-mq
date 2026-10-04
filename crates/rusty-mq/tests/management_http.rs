@@ -938,3 +938,145 @@ async fn call_raw(
         .await
         .unwrap()
 }
+
+#[tokio::test]
+async fn exchange_and_binding_deletes_enforce_checks_and_durable() {
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!(
+        "rmq-del-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    for q in ["del.q"] {
+        ch.queue_declare(
+            q.into(),
+            lapin::options::QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    }
+    ch.exchange_declare(
+        "del.ex".into(),
+        lapin::ExchangeKind::Topic,
+        lapin::options::ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    ch.queue_bind(
+        "del.q".into(),
+        "del.ex".into(),
+        "k1".into(),
+        lapin::options::QueueBindOptions::default(),
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    let _ = conn.close(200, "bye".into()).await;
+
+    let app = rusty_mq_management::router(broker.clone());
+    let auth = Some(("guest", "guest"));
+    // Built-ins and the default exchange refuse.
+    for name in ["%2F", "amq.direct"] {
+        let (s, _, b) = call(
+            &app,
+            "DELETE",
+            &format!("/v1/vhosts/%2F/exchanges/{name}"),
+            auth,
+            None,
+        )
+        .await;
+        assert_eq!(s, 409, "{name}: {s} {b}");
+    }
+    // An exchange WITH a binding refuses (named).
+    let (s, _, b) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/exchanges/del.ex",
+        auth,
+        None,
+    )
+    .await;
+    assert_eq!(s, 409, "in-use: {s} {b}");
+    assert!(b.to_string().contains("bindings"), "reason: {b}");
+    // Delete the binding by its composite id (URL-encoded |).
+    let (s, _, b) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/bindings/del.ex%7Cdel.q%7Ck1",
+        auth,
+        None,
+    )
+    .await;
+    assert_eq!(s, 204, "binding delete: {s} {b}");
+    // Gone from the listing.
+    let (_, _, body) = call(&app, "GET", "/v1/vhosts/%2F/bindings", auth, None).await;
+    assert!(!body.to_string().contains("del.ex"), "binding gone");
+    // Now the exchange deletes cleanly.
+    let (s, _, _) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/exchanges/del.ex",
+        auth,
+        None,
+    )
+    .await;
+    assert_eq!(s, 204);
+    // Unknown ids 409.
+    let (s, _, _) = call(
+        &app,
+        "DELETE",
+        "/v1/vhosts/%2F/exchanges/nope.ex",
+        auth,
+        None,
+    )
+    .await;
+    assert_eq!(s, 409);
+
+    // Durable: after reopen, both deletions hold.
+    drop(broker);
+    let reopened = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let names: Vec<String> = {
+        let topo = reopened.topology.lock().unwrap();
+        let id = topo.find_vhost("/").unwrap();
+        topo.exchanges_of_named(id)
+            .into_iter()
+            .map(|(n, ..)| n)
+            .collect()
+    };
+    assert!(
+        !names.contains(&"del.ex".to_string()),
+        "exchange deletion durable"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
