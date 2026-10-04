@@ -93,6 +93,7 @@ pub fn router_with_limit<B: crate::broker_facade::BrokerHandle>(
             get(get_definitions).post(post_definitions),
         )
         .route("/v1/connections", get(list_connections))
+        .route("/v1/channels", get(list_channels_ep))
         .route("/v1/connections/{id}/close", post(close_connection))
         .layer(axum::extract::DefaultBodyLimit::max(max_request_bytes))
         .with_state(std::sync::Arc::new(broker))
@@ -711,4 +712,15 @@ async fn list_bindings_ep<B: crate::broker_facade::BrokerHandle>(
         return e;
     }
     Json(json!({ "bindings": broker.list_bindings(&vhost) })).into_response()
+}
+
+/// §12.1 GET /v1/channels: Monitor; session inspection rows.
+async fn list_channels_ep<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
+        return e;
+    }
+    Json(json!({ "channels": broker.list_channels() })).into_response()
 }

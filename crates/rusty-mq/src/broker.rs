@@ -240,6 +240,8 @@ pub struct Broker {
     pub auth_throttle: crate::throttle::AuthThrottle,
     /// Resource alarms (§10) + connection registry for notifications.
     pub alarms: Mutex<Alarms>,
+    /// Open channels per connection (§12.1 session inspection).
+    open_channels: Mutex<std::collections::HashMap<ConnectionId, std::collections::BTreeSet<u16>>>,
     pub live_connections: Mutex<Vec<LiveConnection>>,
     /// M1: exactly one test user; M7 replaces this with durable principals.
     pub test_user: TestUser,
@@ -292,6 +294,7 @@ impl Broker {
                 100,
             ),
             alarms: Mutex::new(Alarms::default()),
+            open_channels: Mutex::new(std::collections::HashMap::new()),
             live_connections: Mutex::new(Vec::new()),
             connection_seq: AtomicU64::new(1),
             consumer_tag_seq: AtomicU64::new(1),
@@ -630,6 +633,7 @@ impl Broker {
                 100,
             ),
             alarms: Mutex::new(Alarms::default()),
+            open_channels: Mutex::new(std::collections::HashMap::new()),
             live_connections: Mutex::new(Vec::new()),
             connection_seq: AtomicU64::new(1),
             consumer_tag_seq: AtomicU64::new(1),
@@ -801,6 +805,38 @@ impl Broker {
 
     pub fn unregister_connection(&self, id: ConnectionId) {
         self.live_connections.lock().unwrap().retain(|c| c.id != id);
+        self.open_channels.lock().unwrap().remove(&id);
+    }
+
+    /// Track an open channel for §12.1 session inspection (bounded: the
+    /// channel count per connection is capped by channel_max).
+    pub fn register_channel(&self, conn: ConnectionId, channel: u16) {
+        self.open_channels
+            .lock()
+            .unwrap()
+            .entry(conn)
+            .or_default()
+            .insert(channel);
+    }
+
+    pub fn unregister_channel(&self, conn: ConnectionId, channel: u16) {
+        if let Some(set) = self.open_channels.lock().unwrap().get_mut(&conn) {
+            set.remove(&channel);
+        }
+    }
+
+    /// Open channels by connection (§12.1 GET /v1/channels).
+    pub fn channels_snapshot(&self) -> Vec<(ConnectionId, Vec<u16>)> {
+        self.open_channels
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(conn, set)| {
+                let mut chans: Vec<u16> = set.iter().copied().collect();
+                chans.sort_unstable();
+                (*conn, chans)
+            })
+            .collect()
     }
 
     /// Record the authenticated username once SASL PLAIN completes

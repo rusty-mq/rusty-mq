@@ -795,6 +795,7 @@ impl Connection {
                         )
                         .await;
                 }
+                self.broker.register_channel(self.conn_id, channel_id);
                 self.channels.insert(
                     channel_id,
                     ChannelState {
@@ -2059,6 +2060,7 @@ impl Connection {
     /// check follows), requeue unacked manual-ack deliveries (FR-C06), and
     /// drop any half-assembled publish.
     fn drop_channel_state(&mut self, channel_id: u16) {
+        self.broker.unregister_channel(self.conn_id, channel_id);
         if let Some(mut ch) = self.channels.remove(&channel_id) {
             ch.content = None;
             let affected = {

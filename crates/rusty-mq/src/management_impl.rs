@@ -268,6 +268,30 @@ impl BrokerHandle for Broker {
             .collect()
     }
 
+    fn list_channels(&self) -> Vec<serde_json::Value> {
+        // §12.1 GET /v1/channels: session inspection. Usernames come
+        // from the connection registry; channels with no live
+        // connection (teardown race) are skipped.
+        let users: std::collections::HashMap<_, _> = Broker::list_connections(self)
+            .into_iter()
+            .map(|(id, user)| (id.to_raw().to_string(), user))
+            .collect();
+        self.channels_snapshot()
+            .into_iter()
+            .flat_map(|(conn, chans)| {
+                let conn_id = conn.to_raw().to_string();
+                let user = users.get(&conn_id).cloned();
+                chans.into_iter().map(move |ch| {
+                    serde_json::json!({
+                        "connection": conn_id,
+                        "channel": ch,
+                        "user": user.clone(),
+                    })
+                })
+            })
+            .collect()
+    }
+
     fn close_connection(&self, id: &str, reason: &str) -> bool {
         let Ok(parsed) = id.parse::<u64>() else {
             return false;

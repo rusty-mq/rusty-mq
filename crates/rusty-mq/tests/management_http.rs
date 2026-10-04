@@ -707,3 +707,64 @@ async fn bindings_listing_shows_amqp_created_bindings() {
     assert_eq!(s, 401);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn channels_listing_tracks_lifecycle() {
+    use std::sync::Arc;
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &std::env::temp_dir().join(format!(
+            "rmq-channels-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch1 = conn.create_channel().await.unwrap();
+    let ch2 = conn.create_channel().await.unwrap();
+
+    let app = rusty_mq_management::router(broker.clone());
+    let (_, _, body) = call(&app, "GET", "/v1/channels", Some(("guest", "guest")), None).await;
+    let text = body.to_string();
+    assert!(text.contains("\"channel\":1"), "rows: {text}");
+    assert!(text.contains("\"channel\":2"), "rows: {text}");
+    assert!(text.contains("\"user\":\"guest\""), "rows: {text}");
+
+    // Closing one channel removes exactly its row.
+    let _ = ch1.close(200, "bye".into()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (_, _, body) = call(&app, "GET", "/v1/channels", Some(("guest", "guest")), None).await;
+    let text = body.to_string();
+    assert!(!text.contains("\"channel\":1"), "closed gone: {text}");
+    assert!(text.contains("\"channel\":2"), "open remains: {text}");
+
+    // Connection teardown clears the rest (the unregister hook).
+    let _ = conn.close(200, "bye".into()).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, _, body) = call(&app, "GET", "/v1/channels", Some(("guest", "guest")), None).await;
+        if !body.to_string().contains("\"channel\":2") || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (_, _, body) = call(&app, "GET", "/v1/channels", Some(("guest", "guest")), None).await;
+    assert!(
+        !body.to_string().contains("\"channel\":2"),
+        "teardown cleared: {body}"
+    );
+    let _ = ch2; // keep alive until here
+}
