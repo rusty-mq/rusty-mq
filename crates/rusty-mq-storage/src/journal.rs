@@ -668,13 +668,15 @@ pub struct RecoveredRecord {
 struct RawItem {
     lsn: u64,
     kind: u8,
-    #[allow(dead_code)]
     payload: Vec<u8>,
 }
 
 struct SegmentHeader {
     segment_id: u64,
     previous: u64,
+    // Parsed from every segment header; unread until a format migration
+    // exists (the version check today is major==FORMAT_MAJOR at the read
+    // site, which destructures only the fields it validates).
     #[allow(dead_code)]
     major: u32,
     #[allow(dead_code)]

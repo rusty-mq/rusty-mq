@@ -65,7 +65,12 @@ enum Phase {
 /// shorthand, in-flight publish content assembly, and outstanding
 /// manual-ack deliveries with channel-scoped tags (FR-C04).
 struct ChannelState {
-    #[allow(dead_code)] // consumed by delivery ownership from M3
+    // ADR-0003's stale-settlement guard is enforced by the close
+    // interlude (frames for a closed channel are dropped before any
+    // handler runs), so the generation token is not yet read. Kept for
+    // the ADR's model: when channels gain worker tasks, ownership
+    // moves to (channel id, generation) pairs.
+    #[allow(dead_code)]
     generation: ChannelGeneration,
     /// Most recently declared queue on this channel (empty-name shorthand).
     last_queue: Option<String>,
