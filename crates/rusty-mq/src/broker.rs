@@ -355,6 +355,18 @@ impl Broker {
         Ok(())
     }
 
+    /// Journaled vhost creation (§12.1 POST /v1/vhosts). Idempotent by
+    /// name (the topology dedups; a duplicate create is a no-op journal
+    /// entry + the existing id).
+    pub fn create_vhost(&self, name: &str) -> Result<(), String> {
+        let record = rusty_mq_storage::Record::VhostDeclare {
+            name: name.to_string(),
+        };
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        self.topology.lock().unwrap().add_vhost(name.to_string());
+        Ok(())
+    }
+
     /// Journaled permission set (also used at bootstrap).
     pub fn set_permissions(
         &self,

@@ -275,15 +275,37 @@ async fn create_vhost<B: crate::broker_facade::BrokerHandle>(
     if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Admin) {
         return e;
     }
-    // Destructive-operation posture: creating a vhost redefines the
-    // permission surface; V1 wires durable vhosts with the topology
-    // journal record — until the record kind exists, refuse honestly.
-    let _ = body;
-    status(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "durable vhost creation lands with the topology vhost record",
-    )
+    // §12.1: create the vhost durably (VhostDeclare journal record);
+    // idempotent by name. Body: {"name": "..."}.
+    let Some(Json(body)) = body else {
+        return status(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "body required: {\"name\": ...}",
+        );
+    };
+    let Some(name) = body.get("name").and_then(|v| v.as_str()) else {
+        return status(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "field 'name' (string) required",
+        );
+    };
+    if name.is_empty() || name.len() > 256 {
+        return status(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "name must be 1..=256 chars",
+        );
+    }
+    match broker.create_vhost(name) {
+        Ok(()) => status(
+            StatusCode::CREATED,
+            "created",
+            format!("vhost {name:?} created").as_str(),
+        ),
+        Err(e) => status(StatusCode::INTERNAL_SERVER_ERROR, "error", e.as_str()),
+    }
 }
 
 async fn list_queues<B: crate::broker_facade::BrokerHandle>(

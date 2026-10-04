@@ -75,9 +75,21 @@ impl BrokerHandle for Broker {
         })
     }
 
+    fn create_vhost(&self, name: &str) -> Result<(), String> {
+        Broker::create_vhost(self, name)
+    }
+
     fn list_vhosts(&self) -> Vec<serde_json::Value> {
-        // V1 serves the default vhost (durable vhost records pending).
-        vec![serde_json::json!({ "id": "/", "name": "/" })]
+        // All known vhosts: "/" plus any created via the management
+        // plane (durable VhostDeclare records).
+        let topo = self.topology.lock().unwrap();
+        let mut names: Vec<String> = topo.vhost_names().collect();
+        drop(topo);
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| serde_json::json!({ "id": name, "name": name }))
+            .collect()
     }
 
     fn list_queues(&self, vhost: &str) -> Vec<serde_json::Value> {

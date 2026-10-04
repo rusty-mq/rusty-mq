@@ -183,6 +183,11 @@ impl Topology {
     }
 
     /// Look up a vhost by name (exact match; "/" is the default vhost).
+    /// All vhost names (unordered).
+    pub fn vhost_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.vhosts.values().cloned()
+    }
+
     pub fn find_vhost(&self, name: &str) -> Option<VhostId> {
         self.vhosts
             .iter()

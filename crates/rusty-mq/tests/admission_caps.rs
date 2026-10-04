@@ -11,7 +11,13 @@ use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties,
 };
 
-async fn broker_with(limits: &str) -> (Arc<rusty_mq::Broker>, std::net::SocketAddr) {
+async fn broker_with(
+    limits: &str,
+) -> (
+    Arc<rusty_mq::Broker>,
+    std::net::SocketAddr,
+    std::path::PathBuf,
+) {
     let cfg = rusty_mq::config::load_str(limits).expect("test config");
     // Atomic counter: two tests starting in the same clock tick would
     // otherwise share a data dir and collide on the redb lock (the
@@ -34,7 +40,7 @@ async fn broker_with(limits: &str) -> (Arc<rusty_mq::Broker>, std::net::SocketAd
         listener,
         broker.clone(),
     ));
-    (broker, addr)
+    (broker, addr, dir)
 }
 
 async fn connect(addr: std::net::SocketAddr) -> Connection {
@@ -63,7 +69,7 @@ async fn declare(ch: &Channel, name: &str) -> Result<(), lapin::Error> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_cap_rejects_with_506_and_redeclare_stays_legal() {
-    let (_broker, addr) = broker_with("[limits]\nmax_queues_per_vhost = 2\n").await;
+    let (_broker, addr, _dir) = broker_with("[limits]\nmax_queues_per_vhost = 2\n").await;
     let conn = connect(addr).await;
     let ch = conn.create_channel().await.unwrap();
     declare(&ch, "cap.q1").await.expect("first queue ok");
@@ -86,7 +92,7 @@ async fn queue_cap_rejects_with_506_and_redeclare_stays_legal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn binding_cap_rejects_new_binds_but_duplicates_stay_legal() {
-    let (_broker, addr) = broker_with("[limits]\nmax_bindings_per_vhost = 2\n").await;
+    let (_broker, addr, _dir) = broker_with("[limits]\nmax_bindings_per_vhost = 2\n").await;
     let conn = connect(addr).await;
     let ch = conn.create_channel().await.unwrap();
     declare(&ch, "bcap.q").await.expect("queue");
@@ -128,7 +134,7 @@ async fn binding_cap_rejects_new_binds_but_duplicates_stay_legal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connection_cap_refuses_the_third_connection() {
-    let (_broker, addr) = broker_with("[limits]\nmax_connections = 2\n").await;
+    let (_broker, addr, _dir) = broker_with("[limits]\nmax_connections = 2\n").await;
     let c1 = connect(addr).await;
     let c2 = connect(addr).await;
 
@@ -152,7 +158,7 @@ async fn byte_budget_publish_guard_unaffected() {
     // Sanity: the pre-existing byte-budget 506 path still works beside
     // the new count caps (a publish through the default exchange to a
     // declared queue succeeds under default caps).
-    let (_broker, addr) = broker_with("[limits]\nmax_queues_per_vhost = 10000\n").await;
+    let (_broker, addr, _dir) = broker_with("[limits]\nmax_queues_per_vhost = 10000\n").await;
     let conn = connect(addr).await;
     let ch = conn.create_channel().await.unwrap();
     declare(&ch, "sane.q").await.unwrap();
@@ -173,7 +179,7 @@ async fn byte_budget_publish_guard_unaffected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn destination_cap_rejects_fanout_expansion() {
     // Three queues bound to one fanout exchange; cap at 2 destinations.
-    let (_broker, addr) = broker_with("[limits]\nmax_destinations_per_publish = 2\n").await;
+    let (_broker, addr, _dir) = broker_with("[limits]\nmax_destinations_per_publish = 2\n").await;
     let conn = connect(addr).await;
     let ch = conn.create_channel().await.unwrap();
     ch.exchange_declare(
@@ -249,7 +255,7 @@ async fn pending_confirms_cap_value_is_config_driven_and_structurally_bounded() 
 async fn begin_shutdown_closes_every_live_connection() {
     // §13 graceful shutdown: the broadcast delivers a 200 close to each
     // connection; the registry drains as they finish their handshakes.
-    let (broker, addr) = broker_with("[limits]\nmax_connections = 100\n").await;
+    let (broker, addr, _dir) = broker_with("[limits]\nmax_connections = 100\n").await;
     let c1 = connect(addr).await;
     let c2 = connect(addr).await;
     assert_eq!(broker.live_connection_count(), 2);
@@ -280,7 +286,7 @@ async fn graceful_shutdown_mid_burst_loses_no_confirmed_message() {
     // publishes in flight while begin_shutdown() runs; everything the
     // client SAW confirmed must survive the restart (the writer's Drop
     // joins the flusher before exit).
-    let (broker, addr) = broker_with("[limits]\nmax_connections = 100\n").await;
+    let (broker, addr, dir) = broker_with("[limits]\nmax_connections = 100\n").await;
     let conn = connect(addr).await;
     let ch = conn.create_channel().await.unwrap();
     ch.queue_declare(
@@ -345,12 +351,11 @@ async fn graceful_shutdown_mid_burst_loses_no_confirmed_message() {
 
     // Drop the broker (writer Drop joins the flusher), reopen the same
     // data dir, and count: every confirmed message must be there.
-    let data_dir = std::env::temp_dir().join(format!("rmq-caps-{}-0", std::process::id()));
     drop(broker);
     let reopened = std::sync::Arc::new(rusty_mq::Broker::open_persistent(
         "guest".into(),
         "guest".into(),
-        &data_dir,
+        &dir,
     ));
     let target_queue = {
         let topo = reopened.topology.lock().unwrap();

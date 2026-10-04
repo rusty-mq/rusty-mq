@@ -139,6 +139,9 @@ impl Projection {
     ) -> Result<(), crate::record::FormatError> {
         for record in records {
             match record {
+                // Vhosts live in the authoritative topology only (no
+                // projection table); the projection is a derived index.
+                Record::VhostDeclare { .. } => {}
                 Record::QueueDeclare(q) => {
                     let payload = Record::QueueDeclare(q.clone()).encode();
                     let mut table = tx.open_table(QUEUES).map_err(io_err)?;

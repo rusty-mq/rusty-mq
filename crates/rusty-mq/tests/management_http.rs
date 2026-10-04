@@ -460,3 +460,61 @@ async fn oversized_requests_get_413_before_handlers() {
     let (status, _, _) = call(&app, "GET", "/v1/status", None, None).await;
     assert_eq!(status, 401, "handler reached (not 413)");
 }
+
+#[tokio::test]
+async fn vhost_create_is_durable_and_listed() {
+    // §12.1 POST /v1/vhosts: journaled (survives reopen) + listed.
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!(
+        "rmq-vhost-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let app = rusty_mq_management::router(broker.clone());
+    let (status_code, _, body) = call(
+        &app,
+        "POST",
+        "/v1/vhosts",
+        Some(("guest", "guest")),
+        Some(serde_json::json!({"name": "tenant-a"})),
+    )
+    .await;
+    assert_eq!(status_code, 201, "create: {body}");
+    let (_, _, list) = call(&app, "GET", "/v1/vhosts", Some(("guest", "guest")), None).await;
+    assert!(list.to_string().contains("tenant-a"), "listed: {list}");
+
+    // Non-admin role refused.
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        "/v1/vhosts",
+        Some(("guest", "wrong")),
+        Some(serde_json::json!({"name": "x"})),
+    )
+    .await;
+    assert_eq!(s, 401);
+
+    // Durability: reopen the same data dir — the vhost and its built-in
+    // exchanges must be there.
+    drop(broker);
+    let reopened = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let topo = reopened.topology.lock().unwrap();
+    let vh = topo.find_vhost("tenant-a").expect("vhost survived restart");
+    assert!(
+        topo.find_exchange(vh, "amq.direct").is_some(),
+        "built-in exchanges restored for the new vhost"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
