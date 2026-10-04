@@ -46,6 +46,9 @@ fn apply_record(
         Record::VhostDeclare { name } => {
             topology.add_vhost(name.clone());
         }
+        Record::VhostDelete { name } => {
+            topology.remove_vhost(name);
+        }
         Record::QueueDeclare(q) => {
             *max_entity_id = (*max_entity_id).max(q.id);
             // Live ownership is session state; restored durable queues are

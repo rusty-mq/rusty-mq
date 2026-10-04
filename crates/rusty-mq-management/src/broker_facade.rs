@@ -16,6 +16,7 @@ pub trait BrokerHandle: Send + Sync + 'static {
     fn status_summary(&self) -> serde_json::Value;
     fn list_vhosts(&self) -> Vec<serde_json::Value>;
     fn create_vhost(&self, name: &str) -> Result<(), String>;
+    fn delete_vhost(&self, name: &str) -> Result<(), String>;
     /// Queue rows with name, ready count, consumer count.
     fn list_queues(&self, vhost: &str) -> Vec<serde_json::Value>;
     fn purge_queue(&self, vhost: &str, queue: &str) -> Result<u64, TopologyError>;
@@ -67,6 +68,9 @@ impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
     }
     fn create_vhost(&self, name: &str) -> Result<(), String> {
         (**self).create_vhost(name)
+    }
+    fn delete_vhost(&self, name: &str) -> Result<(), String> {
+        (**self).delete_vhost(name)
     }
     fn list_vhosts(&self) -> Vec<serde_json::Value> {
         (**self).list_vhosts()

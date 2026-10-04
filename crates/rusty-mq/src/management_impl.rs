@@ -79,6 +79,10 @@ impl BrokerHandle for Broker {
         Broker::create_vhost(self, name)
     }
 
+    fn delete_vhost(&self, name: &str) -> Result<(), String> {
+        Broker::delete_vhost(self, name)
+    }
+
     fn list_vhosts(&self) -> Vec<serde_json::Value> {
         // All known vhosts: "/" plus any created via the management
         // plane (durable VhostDeclare records).

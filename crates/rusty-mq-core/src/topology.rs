@@ -188,6 +188,32 @@ impl Topology {
         self.vhosts.values().cloned()
     }
 
+    /// Exchange names declared in a vhost (§12.1 destructive checks).
+    pub fn exchange_names_of(&self, vhost: VhostId) -> Vec<String> {
+        self.exchange_names
+            .get(&vhost)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Queue count in a vhost by name map size (cheap; §12.1 checks).
+    pub fn queue_name_count(&self, vhost: VhostId) -> usize {
+        self.queue_names.get(&vhost).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Remove a vhost's registry entries (name maps + bindings). Queue/
+    /// exchange records keep their vhost ids; with the name map gone the
+    /// ids are unreachable (deletion is gated upstream on emptiness, so
+    /// nothing live references them).
+    pub fn remove_vhost(&mut self, name: &str) {
+        if let Some(id) = self.find_vhost(name) {
+            self.vhosts.remove(&id);
+            self.exchange_names.remove(&id);
+            self.queue_names.remove(&id);
+            self.bindings.remove(&id);
+        }
+    }
+
     pub fn find_vhost(&self, name: &str) -> Option<VhostId> {
         self.vhosts
             .iter()

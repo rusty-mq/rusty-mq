@@ -367,6 +367,52 @@ impl Broker {
         Ok(())
     }
 
+    /// Journaled vhost deletion (§12.1 DELETE, explicit destructive
+    /// checks): the default vhost "/" is never deletable; a vhost with
+    /// any queue (beyond nothing) or non-builtin exchange refuses —
+    /// operators empty it first (queues deleted, no bindings).
+    pub fn delete_vhost(&self, name: &str) -> Result<(), String> {
+        if name == "/" {
+            return Err("the default vhost '/' cannot be deleted".into());
+        }
+        let (exists, non_builtin_exchanges, queue_count, binding_count) = {
+            let topo = self.topology.lock().unwrap();
+            let Some(id) = topo.find_vhost(name) else {
+                return Err(format!("vhost {name:?} not found"));
+            };
+            let non_builtin = topo
+                .exchange_names_of(id)
+                .iter()
+                .filter(|n| !(n.is_empty() || n.starts_with("amq.")))
+                .count();
+            let queues = topo.queue_name_count(id);
+            let bindings = topo.bindings_total(id);
+            (true, non_builtin, queues, bindings)
+        };
+        debug_assert!(exists);
+        if queue_count > 0 {
+            return Err(format!(
+                "vhost {name:?} still holds {queue_count} queue(s); delete them first"
+            ));
+        }
+        if non_builtin_exchanges > 0 {
+            return Err(format!(
+                "vhost {name:?} still defines {non_builtin_exchanges} non-builtin exchange(s); delete them first"
+            ));
+        }
+        if binding_count > 0 {
+            return Err(format!(
+                "vhost {name:?} still has {binding_count} binding(s); remove them first"
+            ));
+        }
+        let record = rusty_mq_storage::Record::VhostDelete {
+            name: name.to_string(),
+        };
+        self.journal_commit(&[record]).map_err(|e| e.to_string())?;
+        self.topology.lock().unwrap().remove_vhost(name);
+        Ok(())
+    }
+
     /// Journaled permission set (also used at bootstrap).
     pub fn set_permissions(
         &self,

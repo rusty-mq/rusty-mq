@@ -13,6 +13,7 @@ pub mod kind {
     pub const EXCHANGE_DELETE: u8 = 0x13;
     pub const BIND: u8 = 0x14;
     pub const VHOST_DECLARE: u8 = 0x16;
+    pub const VHOST_DELETE: u8 = 0x17;
     pub const UNBIND: u8 = 0x15;
     pub const ENQUEUE: u8 = 0x20;
     pub const SETTLE_ACK: u8 = 0x21;
@@ -42,6 +43,11 @@ pub enum Record {
     /// A vhost created via the management plane (§12.1); rebuilt by
     /// re-adding the name (idempotent by name).
     VhostDeclare {
+        name: String,
+    },
+    /// A vhost deleted via the management plane (§12.1 destructive
+    /// checks live at the Broker layer; the fold removes the name).
+    VhostDelete {
         name: String,
     },
     Enqueue(Enqueue),
@@ -148,6 +154,7 @@ impl Record {
             Record::Bind(_) => kind::BIND,
             Record::Unbind(_) => kind::UNBIND,
             Record::VhostDeclare { .. } => kind::VHOST_DECLARE,
+            Record::VhostDelete { .. } => kind::VHOST_DELETE,
             Record::Enqueue(_) => kind::ENQUEUE,
             Record::SettleAck { .. } => kind::SETTLE_ACK,
             Record::SettleDiscard { .. } => kind::SETTLE_DISCARD,
@@ -188,6 +195,7 @@ impl Record {
                 b.str(&x.routing_key);
             }
             Record::VhostDeclare { name } => b.str(name),
+            Record::VhostDelete { name } => b.str(name),
             Record::Enqueue(e) => {
                 b.u64(e.message_id);
                 b.bytes(&e.property_bytes);
@@ -277,6 +285,9 @@ impl Record {
                 routing_key: r.str()?,
             }),
             kind::VHOST_DECLARE => Record::VhostDeclare {
+                name: r.str()?.to_string(),
+            },
+            kind::VHOST_DELETE => Record::VhostDelete {
                 name: r.str()?.to_string(),
             },
             kind::ENQUEUE => {

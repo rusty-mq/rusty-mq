@@ -518,3 +518,111 @@ async fn vhost_create_is_durable_and_listed() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn vhost_delete_enforces_destructive_checks_and_is_durable() {
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!(
+        "rmq-vhost-del-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let app = rusty_mq_management::router(broker.clone());
+    let auth = Some(("guest", "guest"));
+
+    // Create an empty vhost and a vhost holding a queue.
+    for name in ["tmp-empty", "tmp-full"] {
+        let (s, _, b) = call(
+            &app,
+            "POST",
+            "/v1/vhosts",
+            auth,
+            Some(serde_json::json!({"name": name})),
+        )
+        .await;
+        assert_eq!(s, 201, "{name}: {b}");
+    }
+    // Occupancy via AMQP: grant guest access to tmp-full, connect,
+    // declare a durable queue. (POST /v1/vhosts/{v}/queues is not in the
+    // V1 surface; queues come from the protocol plane.)
+    broker
+        .set_permissions(
+            "guest",
+            "tmp-full",
+            rusty_mq_core::auth::Permissions {
+                configure: ".*".into(),
+                write: ".*".into(),
+                read: ".*".into(),
+            },
+        )
+        .unwrap();
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let laddr = listener.local_addr().unwrap();
+        tokio::spawn(rusty_mq::server::serve_listener_shared(
+            listener,
+            broker.clone(),
+        ));
+        let uri = format!("amqp://guest:guest@{laddr}/tmp-full");
+        let vconn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            lapin::Connection::connect(&uri, lapin::ConnectionProperties::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let vch = vconn.create_channel().await.unwrap();
+        vch.queue_declare(
+            "occupied.q".into(),
+            lapin::options::QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .expect("declare in the new vhost");
+        let _ = vconn.close(200, "bye".into()).await;
+    }
+
+    // "/" is never deletable.
+    let (s, _, b) = call(&app, "DELETE", "/v1/vhosts/%2F", auth, None).await;
+    assert_eq!(s, 409, "default vhost: {s} {b}");
+    // A vhost holding a queue refuses.
+    let (s, _, b) = call(&app, "DELETE", "/v1/vhosts/tmp-full", auth, None).await;
+    assert_eq!(s, 409, "occupied: {s} {b}");
+    assert!(b.to_string().contains("queue"), "reason: {b}");
+    // An empty vhost deletes (204) and disappears from the list.
+    let (s, _, _) = call(&app, "DELETE", "/v1/vhosts/tmp-empty", auth, None).await;
+    assert_eq!(s, 204);
+    let (_, _, list) = call(&app, "GET", "/v1/vhosts", auth, None).await;
+    let list = list.to_string();
+    assert!(!list.contains("tmp-empty"), "gone from list: {list}");
+    assert!(list.contains("tmp-full"), "occupied still listed: {list}");
+
+    // Durable: after reopen, the deleted vhost is absent.
+    drop(broker);
+    let reopened = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let names: Vec<String> = {
+        let topo = reopened.topology.lock().unwrap();
+        topo.vhost_names().collect()
+    };
+    assert!(
+        !names.contains(&"tmp-empty".to_string()),
+        "deleted stayed deleted"
+    );
+    assert!(names.contains(&"tmp-full".to_string()), "occupied survived");
+    let _ = std::fs::remove_dir_all(&dir);
+}
