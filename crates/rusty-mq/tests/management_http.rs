@@ -626,3 +626,84 @@ async fn vhost_delete_enforces_destructive_checks_and_is_durable() {
     assert!(names.contains(&"tmp-full".to_string()), "occupied survived");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn bindings_listing_shows_amqp_created_bindings() {
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!(
+        "rmq-bindings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare(
+        "bind.q".into(),
+        lapin::options::QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    ch.exchange_declare(
+        "bind.ex".into(),
+        lapin::ExchangeKind::Topic,
+        lapin::options::ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    for key in ["a.b.c", "a.*.d"] {
+        ch.queue_bind(
+            "bind.q".into(),
+            "bind.ex".into(),
+            key.into(),
+            lapin::options::QueueBindOptions::default(),
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let _ = conn.close(200, "bye".into()).await;
+
+    let app = rusty_mq_management::router(broker);
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/v1/vhosts/%2F/bindings",
+        Some(("guest", "guest")),
+        None,
+    )
+    .await;
+    let text = body.to_string();
+    assert!(text.contains("\"source\":\"bind.ex\""), "rows: {text}");
+    assert!(text.contains("\"routing_key\":\"a.b.c\""), "rows: {text}");
+    assert!(text.contains("\"routing_key\":\"a.*.d\""), "rows: {text}");
+    assert!(text.contains("bind.ex|bind.q|a.b.c"), "opaque id: {text}");
+    // Role floor: no credentials -> 401.
+    let (s, _, _) = call(&app, "GET", "/v1/vhosts/%2F/bindings", None, None).await;
+    assert_eq!(s, 401);
+    let _ = std::fs::remove_dir_all(&dir);
+}

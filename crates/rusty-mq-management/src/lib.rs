@@ -75,6 +75,7 @@ pub fn router_with_limit<B: crate::broker_facade::BrokerHandle>(
         .route("/v1/vhosts", get(list_vhosts).post(create_vhost))
         .route("/v1/vhosts/{vhost}", delete(delete_vhost))
         .route("/v1/vhosts/{vhost}/queues", get(list_queues))
+        .route("/v1/vhosts/{vhost}/bindings", get(list_bindings_ep))
         .route("/v1/vhosts/{vhost}/queues/{queue}/purge", post(purge_queue))
         .route("/v1/vhosts/{vhost}/queues/{queue}", delete(delete_queue))
         .route("/v1/users", get(list_users).post(create_user))
@@ -697,4 +698,17 @@ async fn delete_vhost<B: crate::broker_facade::BrokerHandle>(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => status(StatusCode::CONFLICT, "conflict", e.as_str()),
     }
+}
+
+/// §12.1 GET /v1/vhosts/{vhost}/bindings: Monitor; named rows with the
+/// (source, destination, key) triple as the opaque id.
+async fn list_bindings_ep<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    Path(vhost): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
+        return e;
+    }
+    Json(json!({ "bindings": broker.list_bindings(&vhost) })).into_response()
 }

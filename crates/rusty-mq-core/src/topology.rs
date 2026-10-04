@@ -188,6 +188,50 @@ impl Topology {
         self.vhosts.values().cloned()
     }
 
+    /// Bindings of a vhost as (exchange-name, queue-name, key) rows
+    /// (§12.1 GET /v1/vhosts/{v}/bindings).
+    pub fn bindings_of_named(&self, vhost: VhostId) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        if let Some(by_exchange) = self.bindings.get(&vhost) {
+            for (ex_id, list) in by_exchange {
+                let Some(ex_name) =
+                    self.exchanges
+                        .get(ex_id)
+                        .map(|r| r.name.clone())
+                        .or_else(|| {
+                            // Built-ins live in exchange_names but may not in
+                            // exchanges records; recover from the name map.
+                            self.exchange_names.get(&vhost).and_then(|m| {
+                                m.iter()
+                                    .find(|(_, id)| *id == ex_id)
+                                    .map(|(n, _)| n.clone())
+                            })
+                        })
+                else {
+                    continue;
+                };
+                for b in list {
+                    if let Some(q_name) =
+                        self.queues
+                            .get(&b.queue)
+                            .map(|r| r.name.clone())
+                            .or_else(|| {
+                                self.queue_names.get(&vhost).and_then(|m| {
+                                    m.iter()
+                                        .find(|(_, id)| **id == b.queue)
+                                        .map(|(n, _)| n.clone())
+                                })
+                            })
+                    {
+                        out.push((ex_name.clone(), q_name, b.key.clone()));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Exchange names declared in a vhost (§12.1 destructive checks).
     pub fn exchange_names_of(&self, vhost: VhostId) -> Vec<String> {
         self.exchange_names
