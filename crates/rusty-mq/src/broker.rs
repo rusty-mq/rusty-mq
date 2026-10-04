@@ -217,6 +217,8 @@ pub struct Broker {
     pub message_budget: usize,
     /// §10 count budgets (limits.*).
     pub admission: AdmissionCaps,
+    /// §12.3: opt-in per-queue metric labels (bounded by the queue cap).
+    pub queue_labels_enabled: bool,
     pub topology: Mutex<Topology>,
     /// In-memory message store (M2); the durable journal augments this in M4.
     pub store: Mutex<MessageStore>,
@@ -272,6 +274,7 @@ impl Broker {
             memory_alarm_bytes: MESSAGE_BYTE_BUDGET as u64,
             message_budget: MESSAGE_BYTE_BUDGET,
             admission: AdmissionCaps::default(),
+            queue_labels_enabled: false,
             topology: Mutex::new(Topology::new(CompatibilitySwitches::default())),
             store: Mutex::new(MessageStore::new(MESSAGE_BYTE_BUDGET)),
             journal: Mutex::new(None),
@@ -440,6 +443,7 @@ impl Broker {
         self.protocol_limits = cfg.protocol_limits();
         self.message_budget = cfg.limits.managed_buffer_bytes as usize;
         self.memory_alarm_bytes = cfg.limits.memory_alarm_bytes;
+        self.queue_labels_enabled = cfg.metrics.queue_labels_enabled;
         self.admission = AdmissionCaps {
             max_connections: cfg.limits.max_connections,
             max_queues_per_vhost: cfg.limits.max_queues_per_vhost,
@@ -549,6 +553,7 @@ impl Broker {
             memory_alarm_bytes: MESSAGE_BYTE_BUDGET as u64,
             message_budget: MESSAGE_BYTE_BUDGET,
             admission: AdmissionCaps::default(),
+            queue_labels_enabled: false,
             auth: Mutex::new(auth),
             topology: Mutex::new(topology),
             store: Mutex::new(store),

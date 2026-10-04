@@ -360,3 +360,86 @@ async fn metrics_live_on_their_own_listener_router() {
     let (status, _, _) = call(&mgmt, "GET", "/metrics", None, None).await;
     assert_eq!(status, 404, "metrics moved off the management plane");
 }
+
+#[tokio::test]
+async fn per_queue_metrics_are_opt_in_and_escaped() {
+    // §12.3: per-queue series exist ONLY with metrics.queue_labels_enabled
+    // (bounded cardinality; queue names are the only labels).
+    let dir = std::env::temp_dir().join(format!(
+        "rmq-qmetrics-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cfg = rusty_mq::config::load_str("[metrics]\nqueue_labels_enabled = true\n").unwrap();
+    let cfg_broker = std::sync::Arc::new(rusty_mq::Broker::open_persistent_from_config(
+        "guest".into(),
+        "guest".into(),
+        &dir,
+        &cfg,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        cfg_broker.clone(),
+    ));
+
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    for (q, n) in [
+        (String::from("alpha.q"), 2u8),
+        (String::from("we\\") + "ird", 1u8),
+    ] {
+        ch.queue_declare(
+            q.clone().into(),
+            lapin::options::QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        for i in 0..n {
+            let _ = ch
+                .basic_publish(
+                    "".into(),
+                    q.clone().into(),
+                    lapin::options::BasicPublishOptions::default(),
+                    &[i],
+                    lapin::BasicProperties::default(),
+                )
+                .await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let app = rusty_mq_management::metrics_router(cfg_broker.clone());
+    let (status, _, text) = call(&app, "GET", "/metrics", None, None).await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("rusty_mq_queue_ready_messages{queue=\"alpha.q\"} 2"),
+        "per-queue series missing: {text}"
+    );
+    assert!(
+        text.contains("queue=\"we\\\\ird\""),
+        "backslash escaping missing: {text}"
+    );
+
+    // OFF by default: a default broker renders no per-queue series.
+    let plain_handle = broker();
+    let app2 = rusty_mq_management::metrics_router(plain_handle);
+    let (_, _, text2) = call(&app2, "GET", "/metrics", None, None).await;
+    assert!(
+        !text2.contains("rusty_mq_queue_ready_messages{"),
+        "per-queue series must be opt-in"
+    );
+    let _ = conn.close(200, "bye".into()).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

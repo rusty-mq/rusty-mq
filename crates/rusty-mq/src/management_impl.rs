@@ -28,19 +28,41 @@ impl BrokerHandle for Broker {
 
     fn render_metrics(&self) -> String {
         let ready = self.store.lock().unwrap().total_ready_entries();
+        // Per-queue series are opt-in (§12.3) and snapshotted under the
+        // store lock with the total.
+        let queue_gauges: Vec<(String, u64)> = if self.queue_labels_enabled {
+            let store = self.store.lock().unwrap();
+            let topo = self.topology.lock().unwrap();
+            topo.iter_queues()
+                .filter_map(|(id, rec)| {
+                    let name = rec.name.clone();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((name, store.len(id)))
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let queues = self.topology.lock().unwrap().iter_queues().count() as u64;
         let journal = self
             .data_dir
             .as_ref()
             .map(|d| rusty_mq_storage::snapshot::journal_bytes(d))
             .unwrap_or(0);
-        metrics::render_prometheus(
+        metrics::render_prometheus_with_queues(
             &self.metrics,
             &[
                 ("rusty_mq_ready_messages", ready),
                 ("rusty_mq_queues", queues),
                 ("rusty_mq_journal_bytes", journal),
             ],
+            &queue_gauges
+                .iter()
+                .map(|(n, v)| (n.as_str(), *v))
+                .collect::<Vec<_>>(),
         )
     }
 

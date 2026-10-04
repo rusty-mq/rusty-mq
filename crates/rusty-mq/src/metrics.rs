@@ -36,6 +36,17 @@ impl Metrics {
 /// Render the registry as Prometheus text (§12.2: documented names, no
 /// unbounded labels). Gauges from broker state are appended by the caller.
 pub fn render_prometheus(m: &Metrics, extra_gauges: &[(&str, u64)]) -> String {
+    render_prometheus_with_queues(m, extra_gauges, &[])
+}
+
+/// `queue_gauges`: opt-in per-queue series (§12.3 — bounded cardinality:
+/// the queue count is itself capped by max_queues_per_vhost; labels are
+/// queue names only, never message ids/headers/tags).
+pub fn render_prometheus_with_queues(
+    m: &Metrics,
+    extra_gauges: &[(&str, u64)],
+    queue_gauges: &[(&str, u64)],
+) -> String {
     let mut out = String::with_capacity(1024);
     let mut counter = |name: &str, help: &str, v: u64| {
         out.push_str(&format!(
@@ -80,6 +91,20 @@ pub fn render_prometheus(m: &Metrics, extra_gauges: &[(&str, u64)]) -> String {
     for (name, value) in extra_gauges {
         out.push_str(&format!(
             "# HELP {name} gauge\n# TYPE {name} gauge\n{name} {value}\n"
+        ));
+    }
+    // Opt-in per-queue series: the label value is escaped for quotes,
+    // backslashes, and newlines (Prometheus text format rules).
+    out.push_str(
+        "# HELP rusty_mq_queue_ready_messages Ready entries per queue (opt-in; metrics.queue_labels_enabled)\n# TYPE rusty_mq_queue_ready_messages gauge\n",
+    );
+    for (queue, value) in queue_gauges {
+        let q = queue
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        out.push_str(&format!(
+            "rusty_mq_queue_ready_messages{{queue=\"{q}\"}} {value}\n"
         ));
     }
     out
