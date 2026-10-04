@@ -277,6 +277,9 @@ impl Connection {
         let handshake_deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.limits.handshake_timeout_seconds as u64);
         let mut reader = FrameReader::new(&self.server_view_limits());
+        // FR-P04: once tune-ok lands, the reader adopts the NEGOTIATED
+        // frame_max (the pre-handshake cap is the server default only).
+        let mut negotiated_applied = false;
         let mut buf = vec![0u8; READ_CHUNK];
 
         // Protocol header: read until one complete frame header is buffered.
@@ -324,6 +327,12 @@ impl Connection {
             loop {
                 match reader.next_frame() {
                     Ok(Some(frame)) => {
+                        if !negotiated_applied {
+                            if let Some(n) = self.negotiated.as_ref() {
+                                reader.set_limits(n);
+                                negotiated_applied = true;
+                            }
+                        }
                         // Raw method-policy violations (fields the codec
                         // drops, e.g. basic.qos prefetch_size != 0) close
                         // the frame's CHANNEL only; the frame itself is

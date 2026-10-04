@@ -126,6 +126,19 @@ async fn handshake(addr: std::net::SocketAddr) -> RawSession {
 /// Handshake negotiating `hb` as the client heartbeat (tune-ok value;
 /// the server applies min(client, server)).
 async fn handshake_with_heartbeat(addr: std::net::SocketAddr, hb: u16) -> RawSession {
+    handshake_tuned(addr, hb, None).await
+}
+
+/// Handshake with explicit tune-ok values (heartbeat AND frame_max).
+async fn handshake_with_frame_max(addr: std::net::SocketAddr, frame_max: u32) -> RawSession {
+    handshake_tuned(addr, 0, Some(frame_max)).await
+}
+
+async fn handshake_tuned(
+    addr: std::net::SocketAddr,
+    hb: u16,
+    frame_max: Option<u32>,
+) -> RawSession {
     use tokio::io::AsyncWriteExt;
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     sock.write_all(&PROTOCOL_HEADER_0_9_1).await.unwrap();
@@ -165,7 +178,7 @@ async fn handshake_with_heartbeat(addr: std::net::SocketAddr, hb: u16) -> RawSes
                         0,
                         AMQPClass::Connection(conn7::AMQPMethod::TuneOk(conn7::TuneOk {
                             channel_max: t.channel_max,
-                            frame_max: t.frame_max,
+                            frame_max: frame_max.unwrap_or(t.frame_max),
                             heartbeat: hb,
                         })),
                     ))
@@ -710,4 +723,55 @@ async fn qos_prefetch_size_nonzero_is_channel_540() {
         other => panic!("expected qos-ok on the fresh channel, got {other:?}"),
     }
     let _ = conn_close(&mut s).await;
+}
+
+/// FR-P04: the NEGOTIATED frame_max is enforced on the read path. The
+/// client tunes frame_max down to 4096; an oversized body frame must be
+/// a fatal frame error, while normal small frames keep flowing.
+#[tokio::test(flavor = "multi_thread")]
+async fn negotiated_frame_max_is_enforced_inbound() {
+    let addr = start_broker().await;
+    // handshake_with_heartbeat sends tune-ok echoing the server's
+    // frame_max; build the negotiation manually for a low cap.
+    let mut s = handshake_with_frame_max(addr, 4096).await;
+
+    // A legal small publish first (content fits well under 4096).
+    s.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Queue(q7::AMQPMethod::Declare(q7::Declare {
+            queue: "fm.q".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        })),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Queue(q7::AMQPMethod::DeclareOk(_))) => {}
+        other => panic!("declare failed under negotiated limits: {other:?}"),
+    }
+
+    // Oversized body frame: payload far beyond the negotiated 4096 —
+    // hand-crafted (the harness respects limits, the attacker does not).
+    let big = vec![0u8; 8192];
+    let mut frame = vec![3u8, 0, 1]; // body frame, channel 1
+    frame.extend_from_slice(&(big.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&big);
+    frame.push(0xCE);
+    use tokio::io::AsyncWriteExt;
+    s.sock.write_all(&frame).await.unwrap();
+
+    // The server must refuse with a fatal frame error (connection
+    // close), not accept the frame.
+    match tokio::time::timeout(Duration::from_secs(5), s.next_method()).await {
+        Ok(AMQPFrame::Method(0, AMQPClass::Connection(conn7::AMQPMethod::Close(c)))) => {
+            assert_eq!(c.reply_code, 501, "FRAME_ERROR expected, got {c:?}");
+            assert!(c.reply_text.as_str().contains("frame size"));
+        }
+        Ok(other) => panic!("expected connection close 501, got {other:?}"),
+        Err(_) => panic!("oversized frame silently accepted (no close)"),
+    }
 }

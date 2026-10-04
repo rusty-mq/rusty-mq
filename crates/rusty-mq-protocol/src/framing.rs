@@ -127,6 +127,14 @@ impl FrameReader {
         Ok(())
     }
 
+    /// Adopt NEGOTIATED limits after tune-ok (FR-P04: frame_max is
+    /// enforced on the read path too — a client that negotiated 4096
+    /// must not have larger frames accepted). In place: the buffered
+    /// partial frame survives the swap.
+    pub fn set_limits(&mut self, limits: &NegotiatedLimits) {
+        self.max_payload = limits.max_frame_payload() as usize;
+    }
+
     /// Take the channel-scoped policy violation detected while decoding
     /// the most recent method frame, if any. The connection must send it
     /// as a channel error and skip dispatching that frame.
