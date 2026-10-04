@@ -814,3 +814,92 @@ async fn server_beats_proactively_while_idle() {
         );
     }
 }
+
+/// FR-P04 negotiation rules at the wire level: a client value ABOVE the
+/// server proposal (and one below the 4096 protocol minimum) are both
+/// refused — the server's ceilings are not advisory.
+#[tokio::test(flavor = "multi_thread")]
+async fn tune_ok_out_of_range_values_are_refused() {
+    for bad in [999_999_999u32, 100] {
+        let addr = start_broker().await;
+        // Hand-crack the handshake: header + start-ok, wait tune, reply
+        // with the out-of-range frame_max.
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        sock.write_all(&PROTOCOL_HEADER_0_9_1).await.unwrap();
+        sock.write_all(&encode_frame(&AMQPFrame::Method(
+            0,
+            AMQPClass::Connection(conn7::AMQPMethod::StartOk(conn7::StartOk {
+                client_properties: Default::default(),
+                mechanism: "PLAIN".into(),
+                response: amq_protocol::types::LongString::from(vec![
+                    0, b'g', b'u', b'e', b's', b't', 0, b'g', b'u', b'e', b's', b't',
+                ]),
+                locale: "en_US".into(),
+            })),
+        )))
+        .await
+        .unwrap();
+
+        // Read until the tune method arrives, then send the bad tune-ok.
+        let limits = ProtocolLimits::default();
+        let negotiated_probe = limits
+            .negotiate(limits.max_channel_max, limits.max_frame_max, 0)
+            .unwrap();
+        let mut probe = FrameReader::new_post_header(&negotiated_probe);
+        let mut got_tune = false;
+        let mut buf = [0u8; 4096];
+        while !got_tune {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "EOF waiting for tune");
+            probe.feed(&buf[..n]).unwrap();
+            while let Ok(Some(f)) = probe.next_frame() {
+                if matches!(
+                    f,
+                    AMQPFrame::Method(0, AMQPClass::Connection(conn7::AMQPMethod::Tune(_)))
+                ) {
+                    got_tune = true;
+                }
+            }
+        }
+        sock.write_all(&encode_frame(&AMQPFrame::Method(
+            0,
+            AMQPClass::Connection(conn7::AMQPMethod::TuneOk(conn7::TuneOk {
+                channel_max: 0,
+                frame_max: bad,
+                heartbeat: 0,
+            })),
+        )))
+        .await
+        .unwrap();
+
+        // Expect a connection close (frame error) naming the violation.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while tokio::time::Instant::now() < deadline {
+            let n = match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    closed = true;
+                    break;
+                }
+                Ok(n) => n,
+            };
+            probe.feed(&buf[..n]).unwrap();
+            while let Ok(Some(f)) = probe.next_frame() {
+                if let AMQPFrame::Method(0, AMQPClass::Connection(conn7::AMQPMethod::Close(c))) = f
+                {
+                    assert_eq!(c.reply_code, 501, "frame_max={bad}: {c:?}");
+                    assert!(
+                        c.reply_text.as_str().contains("frame_max"),
+                        "frame_max={bad} not named: {c:?}"
+                    );
+                    closed = true;
+                }
+            }
+            if closed {
+                break;
+            }
+        }
+        assert!(closed, "frame_max={bad}: no refusal observed");
+    }
+}
