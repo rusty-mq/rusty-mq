@@ -243,3 +243,32 @@ async fn pending_confirms_cap_value_is_config_driven_and_structurally_bounded() 
     // is defense-in-depth if the frame loop ever pipelines — recorded
     // in the ledger as a design note, not a behavioral claim.
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn begin_shutdown_closes_every_live_connection() {
+    // §13 graceful shutdown: the broadcast delivers a 200 close to each
+    // connection; the registry drains as they finish their handshakes.
+    let (broker, addr) = broker_with("[limits]\nmax_connections = 100\n").await;
+    let c1 = connect(addr).await;
+    let c2 = connect(addr).await;
+    assert_eq!(broker.live_connection_count(), 2);
+
+    let notified = broker.begin_shutdown();
+    assert_eq!(notified, 2, "every live connection notified");
+
+    // Both connections close (channel ops fail) within the deadline and
+    // the registry drains — the drain loop main.rs polls.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while (c1.status().connected() || c2.status().connected())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!c1.status().connected(), "conn 1 closed by shutdown");
+    assert!(!c2.status().connected(), "conn 2 closed by shutdown");
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while broker.live_connection_count() > 0 && tokio::time::Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(broker.live_connection_count(), 0, "registry drained");
+}

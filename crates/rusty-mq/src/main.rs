@@ -371,12 +371,44 @@ fn main() {
                     rusty_mq::server::serve_tls_shared(listener, broker, acceptor).await;
                 });
             }
-            if let Err(e) =
-                runtime.block_on(rusty_mq::server::serve_shared(effective_listen, broker))
-            {
-                tracing::error!("server failed: {e}");
-                std::process::exit(1);
-            }
+            // Graceful shutdown (§13): SIGTERM/SIGINT broadcast a 200
+            // close to every live connection, drain bounded by
+            // server.shutdown_grace_seconds (default 5s), then drop the
+            // runtime — the journal writer's Drop flushes in-flight
+            // group commits before exit.
+            let grace_secs = file_cfg
+                .as_ref()
+                .map(|c| c.server.shutdown_grace_seconds)
+                .unwrap_or(5);
+            runtime.block_on(async {
+                let serve = rusty_mq::server::serve_shared(effective_listen, broker.clone());
+                tokio::select! {
+                    res = serve => {
+                        if let Err(e) = res {
+                            tracing::error!("server failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    _ = shutdown_signal() => {
+                        tracing::info!("shutdown signal: closing connections (grace {grace_secs}s)");
+                        broker.begin_shutdown();
+                        let deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(grace_secs as u64);
+                        while broker.live_connection_count() > 0
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        tracing::info!(
+                            remaining = broker.live_connection_count(),
+                            "shutdown drain complete"
+                        );
+                    }
+                }
+            });
+            // Dropping the runtime joins the writer's flusher (fsync of
+            // anything still pending) before process exit.
+            drop(runtime);
         }
         Command::Doctor { data_dir } => {
             let report = rusty_mq_storage::doctor::doctor(&data_dir);
@@ -686,4 +718,14 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Resolve on SIGINT or SIGTERM (graceful shutdown triggers).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }

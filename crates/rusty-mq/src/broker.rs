@@ -792,6 +792,32 @@ impl Broker {
 
     /// Close every live connection authenticated as `username` (FR-S08:
     /// revocation takes effect on the wire, not just for new ops).
+    /// Graceful shutdown (§13 operations): broadcast a server-initiated
+    /// close (200) to every live connection. The connection performs the
+    /// close handshake and ends; in-flight group commits flush on the
+    /// journal writer's Drop. Returns the number of connections notified.
+    pub fn begin_shutdown(&self) -> usize {
+        let live = self.live_connections.lock().unwrap();
+        let mut notified = 0;
+        for c in live.iter() {
+            if c.control
+                .try_send(Control::Close {
+                    reply_code: 200,
+                    reason: "server shutdown".into(),
+                })
+                .is_ok()
+            {
+                notified += 1;
+            }
+        }
+        notified
+    }
+
+    /// Live-connection count (shutdown drain polling).
+    pub fn live_connection_count(&self) -> usize {
+        self.live_connections.lock().unwrap().len()
+    }
+
     pub fn close_connections_of(&self, username: &str) {
         let targets: Vec<ConnectionId> = self
             .live_connections
