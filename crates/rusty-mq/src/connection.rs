@@ -777,10 +777,14 @@ impl Connection {
         match class {
             AMQPClass::Channel(channel::AMQPMethod::Open(_)) => {
                 if self.channels.contains_key(&channel_id) {
+                    // Frozen profile: an unexpected frame sequence is 505
+                    // (channel.open on an open channel) — was 501, which
+                    // the profile reserves for unknown frame types/bad
+                    // frame-end.
                     return self
                         .protocol_error(
                             channel_id,
-                            &ProtocolError::frame_error(format!(
+                            &ProtocolError::unexpected_frame(format!(
                                 "channel {channel_id} already open"
                             )),
                         )

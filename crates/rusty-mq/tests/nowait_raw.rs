@@ -903,3 +903,41 @@ async fn tune_ok_out_of_range_values_are_refused() {
         assert!(closed, "frame_max={bad}: no refusal observed");
     }
 }
+
+/// Frozen profile: channel.open on an ALREADY-OPEN channel is an
+/// unexpected frame sequence — connection close 505 (the profile
+/// reserves 501 for unknown frame types / bad frame-end).
+#[tokio::test(flavor = "multi_thread")]
+async fn reopening_an_open_channel_is_505() {
+    let addr = start_broker().await;
+    let mut s = handshake(addr).await;
+
+    for id in [3u16, 4] {
+        // 1 is left open by handshake()
+        s.send(&AMQPFrame::Method(
+            id,
+            AMQPClass::Channel(ch7::AMQPMethod::Open(ch7::Open {})),
+        ))
+        .await;
+        match s.next_method().await {
+            AMQPFrame::Method(ch, AMQPClass::Channel(ch7::AMQPMethod::OpenOk(_))) => {
+                assert_eq!(ch, id);
+            }
+            other => panic!("channel {id} open failed: {other:?}"),
+        }
+    }
+
+    // Re-open channel 3: connection-scoped 505.
+    s.send(&AMQPFrame::Method(
+        3,
+        AMQPClass::Channel(ch7::AMQPMethod::Open(ch7::Open {})),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(0, AMQPClass::Connection(conn7::AMQPMethod::Close(c))) => {
+            assert_eq!(c.reply_code, 505, "UNEXPECTED_FRAME expected: {c:?}");
+            assert!(c.reply_text.as_str().contains("already open"));
+        }
+        other => panic!("expected connection close 505, got {other:?}"),
+    }
+}
