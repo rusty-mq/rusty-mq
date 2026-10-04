@@ -273,3 +273,98 @@ async fn begin_shutdown_closes_every_live_connection() {
     }
     assert_eq!(broker.live_connection_count(), 0, "registry drained");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graceful_shutdown_mid_burst_loses_no_confirmed_message() {
+    // §13 graceful shutdown durability drill: persistent confirmed
+    // publishes in flight while begin_shutdown() runs; everything the
+    // client SAW confirmed must survive the restart (the writer's Drop
+    // joins the flusher before exit).
+    let (broker, addr) = broker_with("[limits]\nmax_connections = 100\n").await;
+    let conn = connect(addr).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare(
+        "grace-drill.q".into(),
+        lapin::options::QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    ch.confirm_select(lapin::options::ConfirmSelectOptions::default())
+        .await
+        .unwrap();
+
+    // Bounded persistent burst; count only SETTLED (confirmed) messages.
+    let mut confirmed = 0u64;
+    let mut futures = Vec::new();
+    for i in 0..80u8 {
+        let f = ch
+            .basic_publish(
+                "".into(),
+                "grace-drill.q".into(),
+                lapin::options::BasicPublishOptions::default(),
+                &[i],
+                lapin::BasicProperties::default().with_delivery_mode(2),
+            )
+            .await
+            .unwrap();
+        futures.push(f);
+    }
+    for f in futures {
+        if tokio::time::timeout(Duration::from_secs(10), f)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ack()
+        {
+            confirmed += 1;
+        }
+    }
+    assert!(confirmed > 0);
+
+    // Graceful shutdown mid-traffic (a couple more in flight, unsettled
+    // on purpose — those carry no durability claim).
+    let _ = ch
+        .basic_publish(
+            "".into(),
+            "grace-drill.q".into(),
+            lapin::options::BasicPublishOptions::default(),
+            b"tail",
+            lapin::BasicProperties::default().with_delivery_mode(2),
+        )
+        .await;
+    broker.begin_shutdown();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while broker.live_connection_count() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = conn.close(200, "bye".into()).await;
+
+    // Drop the broker (writer Drop joins the flusher), reopen the same
+    // data dir, and count: every confirmed message must be there.
+    let data_dir = std::env::temp_dir().join(format!("rmq-caps-{}-0", std::process::id()));
+    drop(broker);
+    let reopened = std::sync::Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &data_dir,
+    ));
+    let target_queue = {
+        let topo = reopened.topology.lock().unwrap();
+        let found = topo
+            .iter_queues()
+            .find(|(_, rec)| rec.name == "grace-drill.q")
+            .map(|(id, _)| id);
+        found
+    };
+    let store_len = target_queue
+        .map(|qid| reopened.store.lock().unwrap().len(qid))
+        .unwrap_or(0);
+    assert!(
+        store_len >= confirmed,
+        "graceful shutdown lost confirmed messages: recovered {store_len} < confirmed {confirmed}"
+    );
+}
