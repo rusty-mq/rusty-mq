@@ -89,3 +89,24 @@ echo "metrics ok"
 
 kill "$SRV"; wait "$SRV" 2>/dev/null || true; SRV=""
 echo "CONFIG SMOKE OK"
+
+echo "== graceful shutdown (SIGTERM with an open connection) =="
+"$BIN" serve --config "$DIR/config.toml" --user smoke --password smoke-pass >"$DIR/serve2.log" 2>&1 &
+SRV=$!
+for i in $(seq 1 50); do
+  python3 -c "import socket; socket.create_connection(('127.0.0.1',5672),1)" 2>/dev/null && break
+  sleep 0.3
+done
+python3 -c "
+import pika
+c = pika.BlockingConnection(pika.URLParameters('amqp://smoke:smoke-pass@127.0.0.1:5672/%2F'))
+import time; time.sleep(30)  # hold the connection open
+" &
+HOLDER=$!
+sleep 1
+kill -TERM "$SRV"
+wait "$SRV"; RC=$?
+kill "$HOLDER" 2>/dev/null || true
+[ "$RC" -eq 0 ] || { echo "server exit $RC after SIGTERM"; exit 1; }
+grep -q "shutdown drain complete" "$DIR/serve2.log" || { echo "no drain-complete log"; exit 1; }
+echo "graceful shutdown ok (drained, exit 0)"
