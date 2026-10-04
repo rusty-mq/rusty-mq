@@ -66,5 +66,21 @@ on dedicated hardware remain future work.
 | reference (5 s smoke, pre-group-commit) | dev macOS/APFS, temp-dir journal | 39 confirmed/s | 77 s | fsync-per-commit dominates on APFS; dev-shape evidence only, not a target comparison |
 | reference (8 s smoke, group commit + lock-free publish path) | dev macOS/APFS, temp-dir journal | 59 confirmed/s | 52 s | +63% throughput, -39% p99 with §9.5 batching engaged; still dev-shape evidence, not a target comparison |
 
+### §14.1 protocol runs (60 s warmup + 300 s measure ×3) — executed
+
+First full-protocol-shape runs on a quiet dev machine (macOS/APFS,
+temp-dir journal; the 24 h soak had finished, so fsync bandwidth was
+exclusive). NOT target comparisons — §14 targets assume dedicated
+hardware; these numbers are honest dev-shape evidence:
+
+| Run | Throughput | p50 confirm | p99 confirm | p999 confirm |
+| --- | --- | --- | --- | --- |
+| 1 | 55.3 conf/s | 34.6 s | 62.5 s | 65.9 s |
+| 2 | 55.9 conf/s | 34.4 s | 63.5 s | 66.8 s |
+| 3 | 57.3 conf/s | 37.5 s | 63.6 s | 66.8 s |
+
+Tight clustering across runs (±2%); fsync-per-commit on APFS remains
+the limiter (see operations.md). Raw JSONs in `results/`.
+
 Raw results land in `results/` — publish them unmodified; §14 forbids
 presenting adjusted numbers as measurements.

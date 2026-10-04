@@ -144,7 +144,10 @@ async fn reference_profile_benchmark() {
     }
 
     // Warm-up (§14.1: 60s full, scaled here for short runs).
-    let warmup = Duration::from_secs((secs / 6).max(1));
+    // §14.1 protocol shape: 60s warmup before the 5min measure (RMQ_BENCH_WARMUP
+    // overrides; the historical default was secs/6 for short smokes).
+    let warmup_secs = env_num("RMQ_BENCH_WARMUP").unwrap_or((secs / 6).max(1));
+    let warmup = Duration::from_secs(warmup_secs);
     run_publishers(&uri, warmup, &confirmed, None).await;
     let warm_confirmed = confirmed.load(Ordering::Relaxed);
 
@@ -176,7 +179,7 @@ async fn reference_profile_benchmark() {
         "consumers": 4,
         "prefetch": PREFETCH,
         "mode": "persistent+confirms",
-        "warmup_seconds": warmup.as_secs(),
+        "warmup_seconds": warmup_secs,
         "measure_seconds": elapsed.as_secs_f64(),
         "confirmed_total": measured_confirmed,
         "consumed_total": consumed.load(Ordering::Relaxed),
@@ -187,7 +190,7 @@ async fn reference_profile_benchmark() {
             "p999": percentile(&latencies_us, 0.999),
             "max": latencies_us.last().copied().unwrap_or(0),
         },
-        "note": "short-run harness; §14.1 full runs (60s warmup, 5min measure, x3) execute in nightly CI",
+        "note": "RMQ_BENCH_WARMUP/RMQ_BENCH_SECS control the §14.1 shape (60s warmup, 300s measure, x3)",
     });
 
     let out_dir =

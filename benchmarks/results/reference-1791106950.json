@@ -1,0 +1,20 @@
+{
+  "confirm_latency_us": {
+    "max": 63548041,
+    "p50": 34375489,
+    "p99": 63536669,
+    "p999": 63547939
+  },
+  "confirmed_total": 19164,
+  "consumed_total": 12196,
+  "consumers": 4,
+  "measure_seconds": 342.973477291,
+  "mode": "persistent+confirms",
+  "note": "RMQ_BENCH_WARMUP/RMQ_BENCH_SECS control the §14.1 shape (60s warmup, 300s measure, x3)",
+  "payload_bytes": 1024,
+  "prefetch": 100,
+  "profile": "reference-14.1",
+  "publishers": 4,
+  "throughput_confirmed_per_sec": 55.8760407695901,
+  "warmup_seconds": 60
+}
