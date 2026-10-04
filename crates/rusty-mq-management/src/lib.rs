@@ -76,6 +76,7 @@ pub fn router_with_limit<B: crate::broker_facade::BrokerHandle>(
         .route("/v1/vhosts/{vhost}", delete(delete_vhost))
         .route("/v1/vhosts/{vhost}/queues", get(list_queues))
         .route("/v1/vhosts/{vhost}/bindings", get(list_bindings_ep))
+        .route("/v1/vhosts/{vhost}/exchanges", get(list_exchanges_ep))
         .route("/v1/vhosts/{vhost}/queues/{queue}/purge", post(purge_queue))
         .route("/v1/vhosts/{vhost}/queues/{queue}", delete(delete_queue))
         .route("/v1/users", get(list_users).post(create_user))
@@ -723,4 +724,16 @@ async fn list_channels_ep<B: crate::broker_facade::BrokerHandle>(
         return e;
     }
     Json(json!({ "channels": broker.list_channels() })).into_response()
+}
+
+/// §12.1 GET /v1/vhosts/{vhost}/exchanges: Monitor; built-ins included.
+async fn list_exchanges_ep<B: crate::broker_facade::BrokerHandle>(
+    State(broker): State<std::sync::Arc<B>>,
+    Path(vhost): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
+        return e;
+    }
+    Json(json!({ "exchanges": broker.list_exchanges(&vhost) })).into_response()
 }

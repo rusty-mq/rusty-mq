@@ -768,3 +768,68 @@ async fn channels_listing_tracks_lifecycle() {
     );
     let _ = ch2; // keep alive until here
 }
+
+#[tokio::test]
+async fn exchanges_listing_includes_builtins_and_amqp_created() {
+    use std::sync::Arc;
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &std::env::temp_dir().join(format!(
+            "rmq-exch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    ch.exchange_declare(
+        "custom.fanout".into(),
+        lapin::ExchangeKind::Fanout,
+        lapin::options::ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    let _ = conn.close(200, "bye".into()).await;
+
+    let app = rusty_mq_management::router(broker);
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/v1/vhosts/%2F/exchanges",
+        Some(("guest", "guest")),
+        None,
+    )
+    .await;
+    let text = body.to_string();
+    // Built-ins with their canonical properties.
+    assert!(
+        text.contains(r#""name":"" "#.trim()) || text.contains("\"name\":\"\""),
+        "default ex: {text}"
+    );
+    assert!(text.contains("amq.direct"), "built-in direct: {text}");
+    assert!(text.contains("amq.fanout"), "built-in fanout: {text}");
+    assert!(text.contains("amq.topic"), "built-in topic: {text}");
+    // The AMQP-created exchange with its declared kind.
+    assert!(text.contains(r#""name":"custom.fanout""#), "custom: {text}");
+    assert!(text.contains(r#""type":"fanout""#), "kind: {text}");
+    // Role floor.
+    let (s, _, _) = call(&app, "GET", "/v1/vhosts/%2F/exchanges", None, None).await;
+    assert_eq!(s, 401);
+}

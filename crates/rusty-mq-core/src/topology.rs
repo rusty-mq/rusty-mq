@@ -232,6 +232,30 @@ impl Topology {
         out
     }
 
+    /// Exchanges of a vhost as (name, type, durable, auto_delete) rows
+    /// (§12.1 GET /v1/vhosts/{v}/exchanges). Built-ins included with
+    /// their canonical properties.
+    pub fn exchanges_of_named(&self, vhost: VhostId) -> Vec<(String, String, bool, bool)> {
+        let mut out = Vec::new();
+        if let Some(names) = self.exchange_names.get(&vhost) {
+            for (name, id) in names {
+                let (kind, durable, auto_delete) = self
+                    .exchanges
+                    .get(id)
+                    .map(|r| (r.kind, r.durable, r.auto_delete))
+                    .unwrap_or((ExchangeType::Direct, true, false)); // built-ins
+                let kind = match kind {
+                    ExchangeType::Direct => "direct",
+                    ExchangeType::Fanout => "fanout",
+                    ExchangeType::Topic => "topic",
+                };
+                out.push((name.clone(), kind.to_string(), durable, auto_delete));
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Exchange names declared in a vhost (§12.1 destructive checks).
     pub fn exchange_names_of(&self, vhost: VhostId) -> Vec<String> {
         self.exchange_names

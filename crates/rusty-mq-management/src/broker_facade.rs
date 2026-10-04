@@ -20,6 +20,7 @@ pub trait BrokerHandle: Send + Sync + 'static {
     /// Queue rows with name, ready count, consumer count.
     fn list_queues(&self, vhost: &str) -> Vec<serde_json::Value>;
     fn list_bindings(&self, vhost: &str) -> Vec<serde_json::Value>;
+    fn list_exchanges(&self, vhost: &str) -> Vec<serde_json::Value>;
     fn purge_queue(&self, vhost: &str, queue: &str) -> Result<u64, TopologyError>;
     fn delete_queue(&self, vhost: &str, queue: &str) -> Result<(), TopologyError>;
     fn create_user(&self, username: &str, password: &str, role: Role) -> Result<(), String>;
@@ -82,6 +83,9 @@ impl<T: BrokerHandle> BrokerHandle for std::sync::Arc<T> {
     }
     fn list_bindings(&self, vhost: &str) -> Vec<serde_json::Value> {
         (**self).list_bindings(vhost)
+    }
+    fn list_exchanges(&self, vhost: &str) -> Vec<serde_json::Value> {
+        (**self).list_exchanges(vhost)
     }
     fn purge_queue(&self, vhost: &str, queue: &str) -> Result<u64, TopologyError> {
         (**self).purge_queue(vhost, queue)

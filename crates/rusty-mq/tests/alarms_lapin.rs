@@ -104,7 +104,11 @@ async fn memory_alarm_stops_admissions_and_notifies_blocked() {
     assert!(broker.memory_alarm(), "budget hit raises the memory alarm");
 
     // The next publish is refused with 506 — never a fabricated success.
-    let _publish = ch
+    // The WRITE itself is racy under load (the refusal may reach lapin
+    // before the publish flush completes — ConnectionAborted seen once in
+    // ~8 full-suite runs); either outcome is the refusal surfacing, so
+    // accept Ok or Err here and assert on the CHANNEL state via a probe.
+    let _ = ch
         .basic_publish(
             "".into(),
             "big.q".into(),
@@ -112,20 +116,22 @@ async fn memory_alarm_stops_admissions_and_notifies_blocked() {
             b"over-budget".as_ref(),
             BasicProperties::default(),
         )
-        .await
-        .expect("write accepted");
-    // The refusal closes the channel: the next op fails.
-    let err = ch
-        .queue_declare(
+        .await;
+    // The refusal closes the channel: the probe fails within a deadline.
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        ch.queue_declare(
             "probe.q".into(),
             QueueDeclareOptions {
                 durable: true,
                 ..Default::default()
             },
             FieldTable::default(),
-        )
-        .await
-        .expect_err("admissions paused under the memory alarm");
+        ),
+    )
+    .await
+    .expect("probe completes within the deadline")
+    .expect_err("admissions paused under the memory alarm");
     let text = err.to_string().to_lowercase();
     assert!(
         text.contains("resource") || text.contains("memory alarm") || text.contains("closed"),

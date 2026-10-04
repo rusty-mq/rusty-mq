@@ -96,6 +96,24 @@ impl BrokerHandle for Broker {
             .collect()
     }
 
+    fn list_exchanges(&self, vhost: &str) -> Vec<serde_json::Value> {
+        let topo = self.topology.lock().unwrap();
+        let Some(id) = topo.find_vhost(vhost) else {
+            return Vec::new();
+        };
+        topo.exchanges_of_named(id)
+            .into_iter()
+            .map(|(name, kind, durable, auto_delete)| {
+                serde_json::json!({
+                    "name": name,
+                    "type": kind,
+                    "durable": durable,
+                    "auto_delete": auto_delete,
+                })
+            })
+            .collect()
+    }
+
     fn list_bindings(&self, vhost: &str) -> Vec<serde_json::Value> {
         let topo = self.topology.lock().unwrap();
         let Some(id) = topo.find_vhost(vhost) else {
