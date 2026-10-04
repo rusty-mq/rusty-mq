@@ -833,3 +833,108 @@ async fn exchanges_listing_includes_builtins_and_amqp_created() {
     let (s, _, _) = call(&app, "GET", "/v1/vhosts/%2F/exchanges", None, None).await;
     assert_eq!(s, 401);
 }
+
+#[tokio::test]
+async fn list_pagination_window_and_headers() {
+    // §12.1: list endpoints paginate — default 100, max 1,000, plus
+    // window headers. Exercises via the vhosts list with a tiny broker
+    // (page 1 of a 1-row set) and via queues with per_page=1.
+    use std::sync::Arc;
+    let broker = Arc::new(rusty_mq::Broker::open_persistent(
+        "guest".into(),
+        "guest".into(),
+        &std::env::temp_dir().join(format!(
+            "rmq-page-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+    ));
+    // Two queues via AMQP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rusty_mq::server::serve_listener_shared(
+        listener,
+        broker.clone(),
+    ));
+    let uri = format!("amqp://guest:guest@{addr}/%2F");
+    let conn = lapin::Connection::connect(&uri, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    for q in ["pg.a", "pg.b"] {
+        ch.queue_declare(
+            q.into(),
+            lapin::options::QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let _ = conn.close(200, "bye".into()).await;
+
+    let app = rusty_mq_management::router(broker);
+    // per_page=1, page=1: exactly one row; headers carry total=2.
+    let resp = call_raw(
+        &app,
+        "GET",
+        "/v1/vhosts/%2F/queues?per_page=1&page=1",
+        Some(("guest", "guest")),
+    )
+    .await;
+    let total = resp
+        .headers()
+        .get("x-total-count")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-total-count header")
+        .to_string();
+    assert_eq!(total, "2");
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let rows = body["queues"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "windowed: {body}");
+    // page=2 returns the other row (also 1).
+    let resp2 = call_raw(
+        &app,
+        "GET",
+        "/v1/vhosts/%2F/queues?per_page=1&page=2",
+        Some(("guest", "guest")),
+    )
+    .await;
+    let body2: serde_json::Value =
+        serde_json::from_slice(&resp2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body2["queues"].as_array().unwrap().len(), 1);
+    // per_page beyond 1,000 clamps (no error).
+    let resp3 = call_raw(
+        &app,
+        "GET",
+        "/v1/vhosts/%2F/queues?per_page=99999",
+        Some(("guest", "guest")),
+    )
+    .await;
+    assert_eq!(resp3.status(), 200);
+}
+
+async fn call_raw(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    auth: Option<(&str, &str)>,
+) -> axum::response::Response {
+    use tower::util::ServiceExt;
+    let mut req = http::Request::builder().method(method).uri(path);
+    if let Some((u, p)) = auth {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+        req = req.header("authorization", format!("Basic {encoded}"));
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}

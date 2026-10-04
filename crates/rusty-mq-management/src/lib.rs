@@ -40,6 +40,64 @@ fn error_body(code: &str, message: impl Into<String>) -> Json<serde_json::Value>
     Json(json!({ "error": { "code": code, "message": message.into() } }))
 }
 
+/// §12.1 pagination: default page size 100, maximum 1,000 (1-based).
+/// Returns (page, per_page, total) for slicing + headers.
+#[derive(Clone, Copy, Debug)]
+pub struct Page {
+    pub page: usize,
+    pub per_page: usize,
+    pub total: usize,
+}
+
+impl Page {
+    pub fn from_query(query: Option<&str>, total: usize) -> Self {
+        let mut page = 1usize;
+        let mut per_page = 100usize;
+        if let Some(q) = query {
+            for pair in q.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                match k {
+                    "page" => {
+                        if let Ok(n) = v.parse::<usize>() {
+                            if n >= 1 {
+                                page = n;
+                            }
+                        }
+                    }
+                    "per_page" | "perpage" => {
+                        if let Ok(n) = v.parse::<usize>() {
+                            per_page = n.clamp(1, 1_000);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Page {
+            page,
+            per_page,
+            total,
+        }
+    }
+
+    pub fn slice<'a, T>(&self, rows: &'a [T]) -> &'a [T] {
+        let start = self.page.saturating_sub(1) * self.per_page;
+        let end = start.saturating_add(self.per_page).min(rows.len());
+        rows.get(start..end).unwrap_or(&[])
+    }
+
+    /// Response headers carrying the pagination window.
+    pub fn headers(&self) -> [(&'static str, String); 3] {
+        [
+            ("x-total-count", self.total.to_string()),
+            ("x-page", self.page.to_string()),
+            ("x-per-page", self.per_page.to_string()),
+        ]
+    }
+}
+
 fn status(code: StatusCode, code_str: &str, message: impl Into<String>) -> Response {
     (code, error_body(code_str, message)).into_response()
 }
@@ -264,11 +322,18 @@ async fn status_ep<B: crate::broker_facade::BrokerHandle>(
 async fn list_vhosts<B: crate::broker_facade::BrokerHandle>(
     State(broker): State<std::sync::Arc<B>>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
         return e;
     }
-    Json(json!({ "vhosts": broker.list_vhosts() })).into_response()
+    let rows = broker.list_vhosts();
+    let page = Page::from_query(uri.query(), rows.len());
+    let mut resp = Json(json!({ "vhosts": page.slice(&rows) })).into_response();
+    for (k, v) in page.headers() {
+        resp.headers_mut().insert(k, v.parse().unwrap());
+    }
+    resp
 }
 
 async fn create_vhost<B: crate::broker_facade::BrokerHandle>(
@@ -316,11 +381,18 @@ async fn list_queues<B: crate::broker_facade::BrokerHandle>(
     State(broker): State<std::sync::Arc<B>>,
     Path(vhost): Path<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
         return e;
     }
-    Json(json!({ "queues": broker.list_queues(&vhost) })).into_response()
+    let rows = broker.list_queues(&vhost);
+    let page = Page::from_query(uri.query(), rows.len());
+    let mut resp = Json(json!({ "queues": page.slice(&rows) })).into_response();
+    for (k, v) in page.headers() {
+        resp.headers_mut().insert(k, v.parse().unwrap());
+    }
+    resp
 }
 
 async fn purge_queue<B: crate::broker_facade::BrokerHandle>(
@@ -708,22 +780,36 @@ async fn list_bindings_ep<B: crate::broker_facade::BrokerHandle>(
     State(broker): State<std::sync::Arc<B>>,
     Path(vhost): Path<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
         return e;
     }
-    Json(json!({ "bindings": broker.list_bindings(&vhost) })).into_response()
+    let rows = broker.list_bindings(&vhost);
+    let page = Page::from_query(uri.query(), rows.len());
+    let mut resp = Json(json!({ "bindings": page.slice(&rows) })).into_response();
+    for (k, v) in page.headers() {
+        resp.headers_mut().insert(k, v.parse().unwrap());
+    }
+    resp
 }
 
 /// §12.1 GET /v1/channels: Monitor; session inspection rows.
 async fn list_channels_ep<B: crate::broker_facade::BrokerHandle>(
     State(broker): State<std::sync::Arc<B>>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
         return e;
     }
-    Json(json!({ "channels": broker.list_channels() })).into_response()
+    let rows = broker.list_channels();
+    let page = Page::from_query(uri.query(), rows.len());
+    let mut resp = Json(json!({ "channels": page.slice(&rows) })).into_response();
+    for (k, v) in page.headers() {
+        resp.headers_mut().insert(k, v.parse().unwrap());
+    }
+    resp
 }
 
 /// §12.1 GET /v1/vhosts/{vhost}/exchanges: Monitor; built-ins included.
@@ -731,9 +817,16 @@ async fn list_exchanges_ep<B: crate::broker_facade::BrokerHandle>(
     State(broker): State<std::sync::Arc<B>>,
     Path(vhost): Path<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Err(e) = require_role(broker.as_ref(), &headers, MinRole::Monitor) {
         return e;
     }
-    Json(json!({ "exchanges": broker.list_exchanges(&vhost) })).into_response()
+    let rows = broker.list_exchanges(&vhost);
+    let page = Page::from_query(uri.query(), rows.len());
+    let mut resp = Json(json!({ "exchanges": page.slice(&rows) })).into_response();
+    for (k, v) in page.headers() {
+        resp.headers_mut().insert(k, v.parse().unwrap());
+    }
+    resp
 }
