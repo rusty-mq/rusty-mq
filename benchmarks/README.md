@@ -44,6 +44,21 @@ RMQ_SOAK_CYCLES=100 cargo test -p rusty-mq --test bench_reference churn_soak -- 
 The full 24-hour soak (publish/consume churn with RSS/FD/task/disk-growth
 assertions) runs in nightly CI; see `.github/workflows/nightly.yaml`.
 
+### 24-hour soak — executed (T28, gate 6 evidence)
+
+One full run executed locally on this dev machine (release build,
+RMQ_SOAK_CYCLES=80000 cap / RMQ_SOAK_MIN_SECS=86400 floor):
+
+| Attempt | Cycles | Wall clock | Journal at checkpoints | Result |
+| --- | --- | --- | --- | --- |
+| 1 | 2,000 (fail-fast) | 56 min | 4.5→18.2 MB, monotonic growth | FAILED — caught the unbounded-journal bug (M9-13); fix: seal covered active segments |
+| 2 | 35,187 | 24h 00m 02s (86,402 s; floor met) | 32 bytes at ALL 70 checkpoints | PASS — journal bounded end-to-end; RSS MB-flat (8.6→16.7 MB), FDs 18–19 |
+
+Evidence: `results/soak-attempt2-FINAL.json` (+ the mid-flight 20 h
+snapshot and attempt 1's failure record). Single-machine dev-shape
+evidence on macOS/APFS — not a §14 target comparison; §14.1-grade runs
+on dedicated hardware remain future work.
+
 ## Known local-machine results
 
 | Run | Machine | Throughput | p99 confirm | Note |

@@ -1,0 +1,361 @@
+{
+ "log": "benchmarks/results/soak-24h-attempt2-20261003.log",
+ "process": null,
+ "checkpoints": [
+  {
+   "cycles": 500,
+   "elapsed_seconds": 1188.069300375,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 1000,
+   "elapsed_seconds": 2404.885153459,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 1500,
+   "elapsed_seconds": 3714.346623667,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 2000,
+   "elapsed_seconds": 4934.352947834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 2500,
+   "elapsed_seconds": 6148.107012625,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 3000,
+   "elapsed_seconds": 7334.119072834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 3500,
+   "elapsed_seconds": 8524.425885084,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 4000,
+   "elapsed_seconds": 10086.255585084,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 4500,
+   "elapsed_seconds": 12334.259168709,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 5000,
+   "elapsed_seconds": 13522.845195875,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 5500,
+   "elapsed_seconds": 14769.805080959,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 6000,
+   "elapsed_seconds": 16024.135842334,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 6500,
+   "elapsed_seconds": 17190.508197625,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 7000,
+   "elapsed_seconds": 18393.259104584,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 7500,
+   "elapsed_seconds": 19561.528178834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 8000,
+   "elapsed_seconds": 20764.05475,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 8500,
+   "elapsed_seconds": 21947.352654125,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 9000,
+   "elapsed_seconds": 23109.294556417,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 9500,
+   "elapsed_seconds": 24328.045640167,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 10000,
+   "elapsed_seconds": 25497.611437167,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 10500,
+   "elapsed_seconds": 26688.0941905,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 11000,
+   "elapsed_seconds": 27858.362668875,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 11500,
+   "elapsed_seconds": 29087.199920417,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 12000,
+   "elapsed_seconds": 30251.911434792,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 12500,
+   "elapsed_seconds": 31441.776562292,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 13000,
+   "elapsed_seconds": 32620.763506292,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 13500,
+   "elapsed_seconds": 33805.309020834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 14000,
+   "elapsed_seconds": 34980.027948584,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 14500,
+   "elapsed_seconds": 36167.276071625,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 15000,
+   "elapsed_seconds": 37337.993988375,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 15500,
+   "elapsed_seconds": 38507.344727209,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 16000,
+   "elapsed_seconds": 39670.9583945,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 16500,
+   "elapsed_seconds": 40905.653659834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 17000,
+   "elapsed_seconds": 42073.347528459,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 17500,
+   "elapsed_seconds": 43275.574321584,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 18000,
+   "elapsed_seconds": 44464.345697667,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 18500,
+   "elapsed_seconds": 45645.76566875,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 19000,
+   "elapsed_seconds": 46846.128902709,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 19500,
+   "elapsed_seconds": 48017.510072,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 20000,
+   "elapsed_seconds": 49214.3442305,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 20500,
+   "elapsed_seconds": 50392.01925075,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 21000,
+   "elapsed_seconds": 51570.151095584,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 21500,
+   "elapsed_seconds": 52744.778292334,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 22000,
+   "elapsed_seconds": 54062.980964959,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 22500,
+   "elapsed_seconds": 55255.725879,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 23000,
+   "elapsed_seconds": 56444.561651084,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 23500,
+   "elapsed_seconds": 57650.680249834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 24000,
+   "elapsed_seconds": 58850.970299417,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 24500,
+   "elapsed_seconds": 60029.35621975,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 25000,
+   "elapsed_seconds": 61880.924917334,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 25500,
+   "elapsed_seconds": 63172.831092375,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 26000,
+   "elapsed_seconds": 64373.128066209,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 26500,
+   "elapsed_seconds": 65580.93445525,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 27000,
+   "elapsed_seconds": 66783.362884375,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 27500,
+   "elapsed_seconds": 67990.726816459,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 28000,
+   "elapsed_seconds": 69178.471968084,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 28500,
+   "elapsed_seconds": 70394.173217167,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 29000,
+   "elapsed_seconds": 71584.693817834,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 29500,
+   "elapsed_seconds": 72747.529756084,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 30000,
+   "elapsed_seconds": 73950.439557209,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 30500,
+   "elapsed_seconds": 75135.964260209,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 31000,
+   "elapsed_seconds": 76322.751721917,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 31500,
+   "elapsed_seconds": 77491.828789792,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 32000,
+   "elapsed_seconds": 78740.732336584,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 32500,
+   "elapsed_seconds": 79913.020801959,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 33000,
+   "elapsed_seconds": 81106.803878542,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 33500,
+   "elapsed_seconds": 82292.037586167,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 34000,
+   "elapsed_seconds": 83493.138954667,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 34500,
+   "elapsed_seconds": 84677.184014292,
+   "journal_bytes": 32
+  },
+  {
+   "cycles": 35000,
+   "elapsed_seconds": 85950.9689135,
+   "journal_bytes": 32
+  }
+ ],
+ "cycles": 35187,
+ "floor_seconds": 86400,
+ "max_journal_bytes_at_checkpoints": 32,
+ "test_result": "ok",
+ "in_progress": false
+}
