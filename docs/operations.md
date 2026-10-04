@@ -56,6 +56,7 @@ after abort).
 | `rusty_mq_ready_messages` | gauge | Ready entries across queues |
 | `rusty_mq_queues` | gauge | Queue count |
 | `rusty_mq_journal_bytes` | gauge | Live journal bytes on disk |
+| `rusty_mq_queue_ready_messages{queue}` | gauge (opt-in) | Ready entries per queue — rendered ONLY with `metrics.queue_labels_enabled = true`; cardinality bounded by the queue cap, labels are queue names only |
 
 The metrics plane is a SEPARATE listener (`--metrics-listen`, config
 `metrics.listen`, default `127.0.0.1:15692`; `--metrics-listen disabled`

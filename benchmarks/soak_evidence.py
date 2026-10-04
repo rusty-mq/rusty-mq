@@ -6,7 +6,11 @@ Parses the harness's own output lines:
   SOAK finished <n> cycles in <dur> (floor was Some(<s>)s)
   test result: ok/FAILED ...
 
-Usage: soak_evidence.py <log> <out.json>
+Usage: soak_evidence.py [--pid=N] <log> <out.json>
+
+  --pid=N attach live process accounting (RSS via ps; FD count via
+           lsof where available) to the evidence — the §14.1-style
+           sampling for a running soak.
 """
 
 import json
@@ -14,11 +18,37 @@ import re
 import sys
 
 
+def process_accounting(pid):
+    """Best-effort RSS/FD sampling for a live pid (macOS has no /proc)."""
+    import subprocess
+    acct = {"pid": pid}
+    try:
+        rss = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+        acct["rss_kb"] = int(rss) if rss else None
+    except Exception:
+        acct["rss_kb"] = None
+    try:
+        fds = subprocess.run(
+            ["lsof", "-p", str(pid)], capture_output=True, text=True
+        ).stdout
+        acct["open_fds"] = max(0, len(fds.splitlines()) - 1) if fds else None
+    except Exception:
+        acct["open_fds"] = None
+    return acct
+
+
 def main():
-    if len(sys.argv) != 3:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    pid = None
+    for a in sys.argv[1:]:
+        if a.startswith("--pid="):
+            pid = int(a.split("=", 1)[1])
+    if len(args) != 2:
         print(__doc__)
         sys.exit(2)
-    log, out = sys.argv[1], sys.argv[2]
+    log, out = args
     checkpoints = []
     finished = None
     result = None
@@ -53,6 +83,7 @@ def main():
         sys.exit(1)
     evidence = {
         "log": log,
+        "process": process_accounting(pid) if pid else None,
         "checkpoints": checkpoints,
         "cycles": (finished or checkpoints[-1] if checkpoints else {}).get("cycles"),
         "floor_seconds": (finished or {}).get("floor_seconds"),
