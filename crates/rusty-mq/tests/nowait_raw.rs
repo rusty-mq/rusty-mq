@@ -941,3 +941,84 @@ async fn reopening_an_open_channel_is_505() {
         other => panic!("expected connection close 505, got {other:?}"),
     }
 }
+
+/// T10 detail: error closes must carry the ORIGINATING class/method ids
+/// (frozen profile: "exact documented reply code, scope, and originating
+/// class/method"). tx.select is 90/10; basic.consume no_local is 60/20.
+#[tokio::test(flavor = "multi_thread")]
+async fn error_closes_name_the_originating_class_and_method() {
+    let addr = start_broker().await;
+
+    // tx.select -> 540, class 90, method 10. (handshake() leaves
+    // channel 1 open; use channel 2 — re-opening 1 is itself a 505.)
+    let mut s = handshake(addr).await;
+    s.send(&AMQPFrame::Method(
+        2,
+        AMQPClass::Channel(ch7::AMQPMethod::Open(ch7::Open {})),
+    ))
+    .await;
+    let _ = s.next_method().await; // open-ok
+    s.send(&AMQPFrame::Method(
+        2,
+        AMQPClass::Tx(amq_protocol::protocol::tx::AMQPMethod::Select(
+            amq_protocol::protocol::tx::Select {},
+        )),
+    ))
+    .await;
+    match s.next_method().await {
+        AMQPFrame::Method(2, AMQPClass::Channel(ch7::AMQPMethod::Close(c))) => {
+            assert_eq!(c.reply_code, 540);
+            assert_eq!((c.class_id, c.method_id), (90, 10), "tx.select ids: {c:?}");
+        }
+        other => panic!("expected channel close for tx.select, got {other:?}"),
+    }
+
+    // basic.consume with an unsupported argument (SAC) -> 540, 60/20.
+    // (Declare the queue first: a missing queue would 404 before the
+    // argument check.)
+    let mut s2 = handshake(addr).await;
+    s2.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Queue(q7::AMQPMethod::Declare(q7::Declare {
+            queue: "ids.q".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        })),
+    ))
+    .await;
+    match s2.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Queue(q7::AMQPMethod::DeclareOk(_))) => {}
+        other => panic!("declare failed: {other:?}"),
+    }
+    s2.send(&AMQPFrame::Method(
+        1,
+        AMQPClass::Basic(basic7::AMQPMethod::Consume(basic7::Consume {
+            queue: "ids.q".into(),
+            consumer_tag: "t".into(),
+            no_local: false,
+            no_ack: true,
+            exclusive: false,
+            nowait: false,
+            arguments: {
+                let mut t = amq_protocol::types::FieldTable::default();
+                t.insert(
+                    "x-single-active-consumer".into(),
+                    amq_protocol::types::AMQPValue::Boolean(true),
+                );
+                t
+            },
+        })),
+    ))
+    .await;
+    match s2.next_method().await {
+        AMQPFrame::Method(1, AMQPClass::Channel(ch7::AMQPMethod::Close(c))) => {
+            assert_eq!(c.reply_code, 540);
+            assert_eq!((c.class_id, c.method_id), (60, 20), "consume ids: {c:?}");
+        }
+        other => panic!("expected channel close for SAC consume, got {other:?}"),
+    }
+}
