@@ -55,6 +55,18 @@ pub fn metrics_router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Route
 
 /// Build the management router over a broker handle.
 pub fn router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Router {
+    router_with_limit(broker, DEFAULT_MAX_REQUEST_BYTES)
+}
+
+/// §13.2 management.max_request_bytes enforced as an axum body limit;
+/// over-limit requests get 413 before any handler allocates.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
+
+/// Router with an explicit request-body limit.
+pub fn router_with_limit<B: crate::broker_facade::BrokerHandle>(
+    broker: B,
+    max_request_bytes: usize,
+) -> Router {
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -80,6 +92,7 @@ pub fn router<B: crate::broker_facade::BrokerHandle>(broker: B) -> Router {
         )
         .route("/v1/connections", get(list_connections))
         .route("/v1/connections/{id}/close", post(close_connection))
+        .layer(axum::extract::DefaultBodyLimit::max(max_request_bytes))
         .with_state(std::sync::Arc::new(broker))
 }
 

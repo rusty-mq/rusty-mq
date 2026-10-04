@@ -443,3 +443,20 @@ async fn per_queue_metrics_are_opt_in_and_escaped() {
     let _ = conn.close(200, "bye".into()).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn oversized_requests_get_413_before_handlers() {
+    // §13.2 management.max_request_bytes: enforced by an axum body
+    // limit — over-limit requests never reach a handler.
+    let broker_handle = broker();
+    let app = rusty_mq_management::router_with_limit(broker_handle, 64);
+    // A definitions payload far over 64 bytes.
+    let big = "x".repeat(2048);
+    let body = serde_json::json!({ "blob": big });
+    let (status, _, _) = call(&app, "POST", "/v1/definitions", None, Some(body)).await;
+    assert_eq!(status, 413, "over-limit request must be refused");
+    // Under the limit the request reaches the handler (the auth check
+    // answers 401 without credentials — proof it got past the limit).
+    let (status, _, _) = call(&app, "GET", "/v1/status", None, None).await;
+    assert_eq!(status, 401, "handler reached (not 413)");
+}

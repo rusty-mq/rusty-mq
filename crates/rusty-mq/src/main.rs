@@ -256,6 +256,10 @@ fn main() {
                 });
             // Single precedence authority: flag > file > default
             // (serve_settings::resolve, unit-tested).
+            let mgmt_request_limit = file_cfg
+                .as_ref()
+                .map(|c| c.management.max_request_bytes as usize)
+                .unwrap_or(rusty_mq_management::DEFAULT_MAX_REQUEST_BYTES);
             let settings = rusty_mq::serve_settings::resolve(
                 rusty_mq::serve_settings::ServeFlags {
                     listen,
@@ -320,7 +324,7 @@ fn main() {
                     .management_tls
                     .map(|(cert, key)| rusty_mq::tls::load(&cert, &key));
                 runtime.spawn(async move {
-                    let app = rusty_mq_management::router(broker);
+                    let app = rusty_mq_management::router_with_limit(broker, mgmt_request_limit);
                     let listener = match tokio::net::TcpListener::bind(addr).await {
                         Ok(l) => l,
                         Err(e) => {
