@@ -133,8 +133,15 @@ async fn memory_alarm_stops_admissions_and_notifies_blocked() {
     .expect("probe completes within the deadline")
     .expect_err("admissions paused under the memory alarm");
     let text = err.to_string().to_lowercase();
+    // Accepted surfaces: the 506 itself ("resource"/"memory alarm"), or
+    // any lapin wording for "the channel the refusal closed" — both
+    // "closed" and "invalid channel state" (lapin's message when the
+    // close has already landed before the probe call).
     assert!(
-        text.contains("resource") || text.contains("memory alarm") || text.contains("closed"),
+        text.contains("resource")
+            || text.contains("memory alarm")
+            || text.contains("closed")
+            || text.contains("invalid channel state"),
         "got: {err}"
     );
 
