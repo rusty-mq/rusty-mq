@@ -213,7 +213,14 @@ async fn rejected_publish_is_nacked_in_confirm_mode() {
         matches!(confirmation, lapin::Confirmation::Nack(_)),
         "rejected publish nacked: {confirmation:?}"
     );
-    let _ = conn.close(200, "bye".into()).await;
+    // Bounded close: under extreme host load this close-ok wait once
+    // stalled indefinitely (all assertions above had already passed);
+    // fail fast with a clear message instead of wedging the suite.
+    // The inner close result is discarded as before — close-ok arrival
+    // is the requirement, and lapin can still surface Err afterwards.
+    let _ = tokio::time::timeout(Duration::from_secs(30), conn.close(200, "bye".into()))
+        .await
+        .expect("close-ok within timeout");
 }
 
 /// The confirmation payload type exists to force compilation of the
