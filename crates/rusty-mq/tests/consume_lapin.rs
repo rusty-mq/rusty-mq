@@ -39,6 +39,17 @@ async fn connect(addr: std::net::SocketAddr) -> Connection {
     .expect("handshake")
 }
 
+/// Bounded connection close (M9-75/M9-77 finding): lapin's close future
+/// has no internal deadline, and under host-load spikes the close-ok wait
+/// has stalled indefinitely twice (all assertions had already passed).
+/// Fail fast with a clear message instead of wedging the suite; the
+/// returned result preserves each call site's discard/unwrap semantics.
+async fn close_bounded(conn: &Connection) -> lapin::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), conn.close(200, "bye".into()))
+        .await
+        .expect("close-ok within timeout")
+}
+
 fn durable_queue() -> QueueDeclareOptions {
     QueueDeclareOptions {
         durable: true,
@@ -133,8 +144,8 @@ async fn push_delivery_with_prefetch_and_ack_flow() {
     d2.acker.ack(BasicAckOptions::default()).await.unwrap();
     d3.acker.ack(BasicAckOptions::default()).await.unwrap();
 
-    consumer_conn.close(200, "bye".into()).await.unwrap();
-    publisher.close(200, "bye".into()).await.unwrap();
+    close_bounded(&consumer_conn).await.unwrap();
+    close_bounded(&publisher).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -173,8 +184,8 @@ async fn no_ack_consumer_receives_all() {
     }
     assert_no_delivery(&mut consumer).await;
 
-    let _ = consumer_conn.close(200, "bye".into()).await;
-    let _ = publisher.close(200, "bye".into()).await;
+    let _ = close_bounded(&consumer_conn).await;
+    let _ = close_bounded(&publisher).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -228,8 +239,8 @@ async fn round_robin_across_two_consumers() {
     assert_no_delivery(&mut c1).await;
     assert_no_delivery(&mut c2).await;
 
-    let _ = consumer_conn.close(200, "bye".into()).await;
-    let _ = publisher.close(200, "bye".into()).await;
+    let _ = close_bounded(&consumer_conn).await;
+    let _ = close_bounded(&publisher).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -268,7 +279,7 @@ async fn exclusive_consumer_conflict_is_403() {
         err.to_string().to_lowercase().contains("refused"),
         "expected ACCESS_REFUSED, got: {err}"
     );
-    let _ = conn.close(200, "bye".into()).await;
+    let _ = close_bounded(&conn).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -336,7 +347,7 @@ async fn auto_delete_queue_dies_after_last_consumer() {
         err.to_string().to_lowercase().contains("not_found"),
         "expected NOT_FOUND, got: {err}"
     );
-    let _ = conn.close(200, "bye".into()).await;
+    let _ = close_bounded(&conn).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -382,7 +393,7 @@ async fn queue_delete_cancels_consumers() {
         }
         other => panic!("consumer should terminate after queue delete, got: {other:?}"),
     }
-    let _ = conn.close(200, "bye".into()).await;
+    let _ = close_bounded(&conn).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -413,7 +424,7 @@ async fn unacked_redelivers_to_new_consumer_after_connection_loss() {
         assert_eq!(d.data, b"payload".to_vec());
         // Drop without acking (FR-C06: requeue on connection loss).
         drop(vch);
-        let _ = victim.close(200, "bye".into()).await;
+        let _ = close_bounded(&victim).await;
     }
 
     let survivor = connect(addr).await;
@@ -432,8 +443,8 @@ async fn unacked_redelivers_to_new_consumer_after_connection_loss() {
     assert!(d.redelivered, "redelivered hint set after requeue");
     d.acker.ack(BasicAckOptions::default()).await.unwrap();
 
-    let _ = survivor.close(200, "bye".into()).await;
-    let _ = publisher.close(200, "bye".into()).await;
+    let _ = close_bounded(&survivor).await;
+    let _ = close_bounded(&publisher).await;
 }
 
 /// FR-Q06 completion: delete with `if_unused` refuses while a consumer is
@@ -493,7 +504,7 @@ async fn delete_if_unused_respects_live_consumers() {
     )
     .await
     .expect("delete(if_unused) succeeds once unused");
-    let _ = conn.close(200, "bye".into()).await;
+    let _ = close_bounded(&conn).await;
 }
 
 /// Soft-window delivery poll for drain loops: None when nothing arrives
@@ -624,7 +635,7 @@ async fn qos_changes_and_zero_apply_to_active_rules() {
         "unlimited prefetch delivers the whole backlog unacked"
     );
 
-    let _ = conn.close(200, "bye".into()).await;
+    let _ = close_bounded(&conn).await;
 }
 
 /// FR-Q01's counters at the integration level: declare-ok carries REAL
@@ -670,5 +681,5 @@ async fn declare_ok_reports_real_message_and_consumer_counts() {
         .unwrap();
     assert_eq!(q2.consumer_count(), 1, "live consumer counted");
     assert_eq!(q2.message_count(), 0, "acked entries cleared the count");
-    let _ = conn.close(200, "bye".into()).await;
+    let _ = close_bounded(&conn).await;
 }
